@@ -5,15 +5,15 @@ from typing import List, Union
 import ddddocr
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
-from pydantic import BaseModel, Field  # <--- Вот это обязательно должно быть вверху!
+from pydantic import BaseModel, Field
 from PIL import Image
 import numpy as np
 import cv2
 import uvicorn
 
-app = FastAPI(title="Digit OCR Service with Preprocessing", version="1.1")
+app = FastAPI(title="Digit OCR Service with Preprocessing", version="1.2")
 
-# Инициализируем только ddddocr — он очень легкий и отлично помещается в лимит 512 МБ
+# Инициализируем ddddocr (легкий, полностью помещается в лимит 512 МБ на Render)
 ocr_dddd = ddddocr.DdddOcr(show_ad=False)
 
 class OCRRequest(BaseModel):
@@ -33,24 +33,22 @@ def clean_base64(b64: str) -> bytes:
 def preprocess_image(image_bytes: bytes) -> bytes:
     """Улучшаем качество изображения: увеличиваем размер, делаем контрастным черно-белым"""
     try:
-        # Читаем картинку через OpenCV из байтов
         nparr = np.frombuffer(image_bytes, np.uint8)
         img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
         
         if img is None:
             return image_bytes
 
-        # 1. Увеличиваем в 2 раза (интерполяция кубическая для сглаживания)
+        # 1. Увеличиваем в 2 раза для сглаживания мелких пикселей
         height, width = img.shape[:2]
         img_resized = cv2.resize(img, (width * 2, height * 2), interpolation=cv2.INTER_CUBIC)
 
         # 2. Переводим в оттенки серого
         gray = cv2.cvtColor(img_resized, cv2.COLOR_BGR2GRAY)
 
-        # 3. Бинаризация (порог Оцу) — убирает фоновый шум и делает цифры черными на белом фоне
+        # 3. Бинаризация (порог Оцу) — убирает фоновый шум и тени
         _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
 
-        # Кодируем обратно в PNG байты
         success, encoded_img = cv2.imencode('.png', thresh)
         if success:
             return encoded_img.tobytes()
@@ -65,17 +63,19 @@ def recognize_one(image_bytes: bytes) -> str:
         result_1 = ocr_dddd.classification(image_bytes)
         digits_1 = "".join(c for c in result_1 if c.isdigit())
 
-        # Если нашли 3 или более цифр — сразу отдаем результат
-        if len(digits_1) >= 3:
-            return digits_1
-
-        # Попытка 2: Если цифр мало, применяем умную предобработку и гоним снова
+        # Попытка 2: Распознаем после предобработки OpenCV
         processed_bytes = preprocess_image(image_bytes)
         result_2 = ocr_dddd.classification(processed_bytes)
         digits_2 = "".join(c for c in result_2 if c.isdigit())
 
-        # Возвращаем тот вариант, где нашлось больше цифр
-        return digits_2 if len(digits_2) > len(digits_1) else digits_1
+        # Выбираем тот вариант, где нашлось больше цифр
+        best_digits = digits_2 if len(digits_2) > len(digits_1) else digits_1
+
+        # Если цифр вообще не нашлось, возвращаем сырой результат первой попытки
+        if not best_digits and result_1:
+            return result_1
+
+        return best_digits if best_digits else "0"
 
     except Exception as e:
         return f"ERROR:{str(e)}"
@@ -84,7 +84,7 @@ def recognize_one(image_bytes: bytes) -> str:
 async def ocr_endpoint(req: OCRRequest):
     images = req.images if isinstance(req.images, list) else [req.images]
     if not images:
-        raise HTTPException(status_code=400, detail="Empty images list")
+        raise HTTPException(status_count=400, detail="Empty images list")
 
     results = []
     for b64 in images:
