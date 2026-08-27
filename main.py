@@ -5,7 +5,8 @@ from typing import List, Union
 import ddddocr
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
-from PIL import Image, ImageOps
+from pydantic import BaseModel, Field  # <--- Вот это обязательно должно быть вверху!
+from PIL import Image
 import numpy as np
 import cv2
 import uvicorn
