@@ -3,4 +3,5 @@ uvicorn[standard]>=0.30.0
 ddddocr>=1.5.6
 Pillow>=10.0.0
 pydantic>=2.0.0
-easyocr
+opencv-python-headless
+numpy
