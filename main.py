@@ -1,6 +1,10 @@
 import base64
 import gc
+import itertools
+import json
 import os
+import threading
+import time
 from pathlib import Path
 from typing import List, Union, Optional
 from collections import Counter
@@ -14,14 +18,40 @@ import cv2
 import uvicorn
 import google.generativeai as genai
 
-app = FastAPI(title="Digit OCR Service", version="2.7")
+# ---------------------------------------------------------------------------
+# Замер времени старта: фиксируем момент, когда процесс начал загружаться
+# (импорт модуля — самое раннее, что можно поймать изнутри Python).
+# После того как FastAPI полностью поднимется (startup event), посчитаем
+# сколько прошло секунд и запишем в лог + локальный файл.
+# ---------------------------------------------------------------------------
+PROCESS_START_TIME = time.time()
+STARTUP_TIMING_FILE = Path("/tmp/startup_timing.json")
+
+app = FastAPI(title="Digit OCR Service", version="3.0")
 
 ocr_dddd = ddddocr.DdddOcr(show_ad=False)
 
-# Gemini
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-gemini_model = None
-gemini_model_name = None
+
+# ---------------------------------------------------------------------------
+# Ротация Gemini API ключей.
+# Ключи задаются переменными окружения с общим префиксом GEMINI_API_KEY,
+# например: GEMINI_API_KEY_skukolka0, GEMINI_API_KEY_skukolka01, ...,
+# GEMINI_API_KEY_ittlefairybox — сколько угодно штук, любые суффиксы.
+# Каждый вызов Gemini берёт следующий ключ по кругу (round-robin).
+# Если запрос с текущим ключом падает (квота/ошибка) — автоматически
+# пробуем следующий ключ, пока не переберём все или не получим успех.
+# ---------------------------------------------------------------------------
+def _collect_gemini_keys() -> List[str]:
+    keys = []
+    for name, value in sorted(os.environ.items()):
+        if name.startswith("GEMINI_API_KEY") and value:
+            keys.append(value)
+    return keys
+
+
+GEMINI_KEYS = _collect_gemini_keys()
+_gemini_key_cycle = itertools.cycle(GEMINI_KEYS) if GEMINI_KEYS else None
+_gemini_lock = threading.Lock()  # genai.configure — глобальное состояние, сериализуем доступ
 
 GEMINI_MODELS = [
     "gemini-3.1-flash-lite",
@@ -29,26 +59,33 @@ GEMINI_MODELS = [
     "gemini-2.5-flash",
 ]
 
-if GEMINI_API_KEY:
-    try:
-        genai.configure(api_key=GEMINI_API_KEY)
+gemini_model_name = None
 
+
+def _pick_working_model_name() -> Optional[str]:
+    """Проверяем один раз при старте, какая модель из списка вообще доступна."""
+    if not GEMINI_KEYS:
+        return None
+    try:
+        genai.configure(api_key=GEMINI_KEYS[0])
         for model_name in GEMINI_MODELS:
             try:
-                test_model = genai.GenerativeModel(model_name)
-                gemini_model = test_model
-                gemini_model_name = model_name
-                print(f"Gemini подключен: {model_name}")
-                break
+                genai.GenerativeModel(model_name)
+                print(f"Gemini модель выбрана: {model_name}")
+                return model_name
             except Exception as e:
                 print(f"Модель {model_name} недоступна: {e}")
                 continue
-
-        if gemini_model is None:
-            print("Ни одна из указанных моделей Gemini не доступна")
-
     except Exception as e:
         print(f"Gemini не удалось инициализировать: {e}")
+    return None
+
+
+if GEMINI_KEYS:
+    gemini_model_name = _pick_working_model_name()
+    print(f"Gemini ключей найдено: {len(GEMINI_KEYS)}")
+else:
+    print("Gemini ключи не найдены (переменные GEMINI_API_KEY* отсутствуют)")
 
 
 class OCRRequest(BaseModel):
@@ -74,9 +111,9 @@ def clean_base64(b64: str) -> bytes:
 
 
 # ---------------------------------------------------------------------------
-# TIER 1: быстрый набор вариантов (покрывает все ключевые цветовые каналы,
-# но без дублирования нескольких масштабов — этого обычно достаточно, чтобы
-# уверенно распознать 3-значное число на цветном фоне).
+# TIER 1: быстрый набор вариантов (один масштаб, LINEAR-ресайз).
+# Покрывает все ключевые цветовые каналы, обычно этого достаточно, чтобы
+# уверенно распознать 3-значное число на цветном фоне.
 # ---------------------------------------------------------------------------
 def make_variants_fast(img_bgr: np.ndarray, scale: int = 4) -> list[np.ndarray]:
     h, w = img_bgr.shape[:2]
@@ -121,9 +158,8 @@ def make_variants_fast(img_bgr: np.ndarray, scale: int = 4) -> list[np.ndarray]:
 
 
 # ---------------------------------------------------------------------------
-# TIER 2: полный (тяжёлый) набор вариантов — используется только когда Tier 1
-# не дал уверенного консенсуса. Это твоя исходная функция, без изменений в
-# логике, только используется как фоллбэк, а не всегда.
+# TIER 2: полный (тяжёлый) набор вариантов — фоллбэк, если Tier 1 не дал
+# уверенного консенсуса. Исходная логика без изменений.
 # ---------------------------------------------------------------------------
 def make_variants_full(img_bgr: np.ndarray) -> list[np.ndarray]:
     h, w = img_bgr.shape[:2]
@@ -185,8 +221,15 @@ def make_variants_full(img_bgr: np.ndarray) -> list[np.ndarray]:
     return variants
 
 
+def _next_gemini_key() -> Optional[str]:
+    if _gemini_key_cycle is None:
+        return None
+    with _gemini_lock:
+        return next(_gemini_key_cycle)
+
+
 def recognize_with_gemini(image_bytes: bytes) -> str:
-    if gemini_model is None:
+    if not GEMINI_KEYS or gemini_model_name is None:
         return "0"
 
     try:
@@ -207,23 +250,40 @@ def recognize_with_gemini(image_bytes: bytes) -> str:
             "Пример правильного ответа: 678 или 700."
         )
 
-        response = gemini_model.generate_content(
-            [
-                prompt,
-                {
-                    "mime_type": "image/png",
-                    "data": png_bytes
-                }
-            ],
-            generation_config={
-                "temperature": 0.0,
-                "max_output_tokens": 10
-            }
-        )
+        # Пробуем ключи по кругу: если текущий упал (квота/ошибка) —
+        # переходим к следующему, максимум по разу на каждый доступный ключ.
+        attempts = len(GEMINI_KEYS)
+        last_error = None
 
-        text = response.text.strip()
-        digits = "".join(c for c in text if c.isdigit())
-        return digits if digits else "0"
+        for _ in range(attempts):
+            key = _next_gemini_key()
+            try:
+                with _gemini_lock:
+                    genai.configure(api_key=key)
+                    model = genai.GenerativeModel(gemini_model_name)
+                    response = model.generate_content(
+                        [
+                            prompt,
+                            {"mime_type": "image/png", "data": png_bytes},
+                        ],
+                        generation_config={
+                            "temperature": 0.0,
+                            "max_output_tokens": 10,
+                        },
+                    )
+
+                text = response.text.strip()
+                digits = "".join(c for c in text if c.isdigit())
+                if digits:
+                    return digits
+            except Exception as e:
+                last_error = e
+                print(f"Gemini key failed, trying next: {e}")
+                continue
+
+        if last_error:
+            print(f"Gemini error (all keys exhausted): {last_error}")
+        return "0"
 
     except Exception as e:
         print(f"Gemini error: {e}")
@@ -242,10 +302,10 @@ def recognize_dddd(image_bytes: bytes) -> str:
       Tier 1 — быстрый набор из ~14 вариантов (1 масштаб, LINEAR-ресайз).
                Если один и тот же 3-значный ответ набрал consensus >= 3 —
                сразу возвращаем его, не считая ничего больше.
-      Tier 2 — фоллбэк на полный (тяжёлый) перебор, как в исходной версии,
-               если Tier 1 не дал уверенного результата. Срабатывает редко
-               (сложные / нестандартные случаи), поэтому не бьёт по средней
-               скорости, но сохраняет прежнее качество на трудных картинках.
+      Tier 2 — фоллбэк на полный (тяжёлый) перебор, если Tier 1 не дал
+               уверенного результата. Срабатывает редко, поэтому не бьёт
+               по средней скорости, но сохраняет качество на трудных
+               картинках.
     """
     try:
         nparr = np.frombuffer(image_bytes, np.uint8)
@@ -306,7 +366,7 @@ def recognize_one(image_bytes: bytes, mode: str = "combo") -> dict:
 
     # Только Gemini
     if mode == "gemini":
-        if gemini_model is None:
+        if not GEMINI_KEYS:
             return {"text": "0", "source": "gemini_unavailable"}
         result = recognize_with_gemini(image_bytes)
         return {"text": result, "source": "gemini"}
@@ -319,7 +379,7 @@ def recognize_one(image_bytes: bytes, mode: str = "combo") -> dict:
     # Комбо (по умолчанию)
     dddd_result = recognize_dddd(image_bytes)
 
-    if len(dddd_result) < 3 and gemini_model is not None:
+    if len(dddd_result) < 3 and GEMINI_KEYS:
         gemini_result = recognize_with_gemini(image_bytes)
         if len(gemini_result) >= 3:
             return {"text": gemini_result, "source": "gemini"}
@@ -344,8 +404,6 @@ async def ocr_endpoint(
         result = recognize_one(clean_base64(b64), mode=mode)
         results.append(result)
 
-    # gc.collect() убран из цикла — вызывается один раз на весь запрос,
-    # этого достаточно и не тормозит обработку каждой картинки
     gc.collect()
 
     return OCRResponse(results=results)
@@ -353,10 +411,18 @@ async def ocr_endpoint(
 
 @app.get("/health")
 async def health():
+    startup_info = None
+    if STARTUP_TIMING_FILE.exists():
+        try:
+            startup_info = json.loads(STARTUP_TIMING_FILE.read_text())
+        except Exception:
+            startup_info = None
+
     return {
         "status": "ok",
-        "gemini": gemini_model is not None,
-        "gemini_model": gemini_model_name
+        "gemini_keys_count": len(GEMINI_KEYS),
+        "gemini_model": gemini_model_name,
+        "startup_timing": startup_info,
     }
 
 
@@ -366,6 +432,28 @@ async def favicon():
     if not favicon_path.exists():
         raise HTTPException(status_code=404, detail="Favicon not found")
     return FileResponse(favicon_path)
+
+
+@app.on_event("startup")
+async def on_startup():
+    """
+    Разовый замер: сколько секунд прошло с момента запуска процесса
+    (импорта модуля) до момента, когда FastAPI полностью готов принимать
+    запросы. Пишем и в лог (видно в Render Logs сразу после деплоя),
+    и в локальный файл — можно потом прочитать через GET /health.
+    """
+    elapsed = time.time() - PROCESS_START_TIME
+    payload = {
+        "process_start_time": PROCESS_START_TIME,
+        "ready_time": time.time(),
+        "elapsed_seconds": round(elapsed, 3),
+    }
+    print(f"[startup_timing] Приложение готово через {elapsed:.3f} сек после старта процесса")
+
+    try:
+        STARTUP_TIMING_FILE.write_text(json.dumps(payload, ensure_ascii=False, indent=2))
+    except Exception as e:
+        print(f"[startup_timing] Не удалось записать файл замера: {e}")
 
 
 if __name__ == "__main__":
