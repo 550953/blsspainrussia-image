@@ -41,16 +41,21 @@ ocr_dddd = ddddocr.DdddOcr(show_ad=False)
 # Если запрос с текущим ключом падает (квота/ошибка) — автоматически
 # пробуем следующий ключ, пока не переберём все или не получим успех.
 # ---------------------------------------------------------------------------
-def _collect_gemini_keys() -> List[str]:
+def _collect_gemini_keys() -> List[tuple[str, str]]:
+    """Возвращает список (имя_переменной, значение_ключа), чтобы можно было
+    логировать КАКИМ именно ключом (по имени, не по секрету) обрабатывалась
+    картинка — это нужно, чтобы честно проверить, реально ли идёт ротация
+    по разным ключам/аккаунтам, или квота почему-то общая на всех."""
     keys = []
     for name, value in sorted(os.environ.items()):
         if name.startswith("GEMINI_API_KEY") and value:
-            keys.append(value)
+            keys.append((name, value))
     return keys
 
 
-GEMINI_KEYS = _collect_gemini_keys()
-_gemini_key_cycle = itertools.cycle(GEMINI_KEYS) if GEMINI_KEYS else None
+GEMINI_KEYS_NAMED = _collect_gemini_keys()
+GEMINI_KEYS = [v for _, v in GEMINI_KEYS_NAMED]
+_gemini_key_cycle = itertools.cycle(GEMINI_KEYS_NAMED) if GEMINI_KEYS_NAMED else None
 _gemini_lock = threading.Lock()  # genai.configure — глобальное состояние, сериализуем доступ
 
 GEMINI_MODELS = [
@@ -221,7 +226,8 @@ def make_variants_full(img_bgr: np.ndarray) -> list[np.ndarray]:
     return variants
 
 
-def _next_gemini_key() -> Optional[str]:
+def _next_gemini_key() -> Optional[tuple[str, str]]:
+    """Возвращает (имя_переменной, значение_ключа) следующего в очереди."""
     if _gemini_key_cycle is None:
         return None
     with _gemini_lock:
@@ -256,10 +262,10 @@ def recognize_with_gemini(image_bytes: bytes) -> str:
         last_error = None
 
         for _ in range(attempts):
-            key = _next_gemini_key()
+            key_name, key_value = _next_gemini_key()
             try:
                 with _gemini_lock:
-                    genai.configure(api_key=key)
+                    genai.configure(api_key=key_value)
                     model = genai.GenerativeModel(gemini_model_name)
                     response = model.generate_content(
                         [
@@ -275,10 +281,12 @@ def recognize_with_gemini(image_bytes: bytes) -> str:
                 text = response.text.strip()
                 digits = "".join(c for c in text if c.isdigit())
                 if digits:
+                    print(f"[gemini_key] OK  key={key_name}")
                     return digits
             except Exception as e:
                 last_error = e
-                print(f"Gemini key failed, trying next: {e}")
+                is_quota = "429" in str(e) or "quota" in str(e).lower()
+                print(f"[gemini_key] FAIL key={key_name} quota_hit={is_quota} err={e}")
                 continue
 
         if last_error:
@@ -421,6 +429,7 @@ async def health():
     return {
         "status": "ok",
         "gemini_keys_count": len(GEMINI_KEYS),
+        "gemini_key_names": [name for name, _ in GEMINI_KEYS_NAMED],
         "gemini_model": gemini_model_name,
         "startup_timing": startup_info,
     }
