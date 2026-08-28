@@ -14,7 +14,7 @@ import cv2
 import uvicorn
 import google.generativeai as genai
 
-app = FastAPI(title="Digit OCR Service", version="2.3")
+app = FastAPI(title="Digit OCR Service", version="2.4")
 
 ocr_dddd = ddddocr.DdddOcr(show_ad=False)
 
@@ -35,8 +35,13 @@ class OCRRequest(BaseModel):
     images: Union[str, List[str]] = Field(..., description="Один base64 или список (рекомендуется 1)")
 
 
+class OCRResultItem(BaseModel):
+    text: str
+    source: str  # "ddddocr" или "gemini"
+
+
 class OCRResponse(BaseModel):
-    results: List[str]
+    results: List[OCRResultItem]
 
 
 def clean_base64(b64: str) -> bytes:
@@ -56,38 +61,32 @@ def make_variants(img_bgr: np.ndarray) -> list[np.ndarray]:
         img = cv2.resize(img_bgr, (w * scale, h * scale), interpolation=cv2.INTER_CUBIC)
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
 
-        # Otsu
         _, th = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
         variants.append(th)
         variants.append(255 - th)
 
-        # Adaptive
         th_a = cv2.adaptiveThreshold(
             gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 31, 5
         )
         variants.append(th_a)
         variants.append(255 - th_a)
 
-        # CLAHE
         clahe = cv2.createCLAHE(clipLimit=4.0, tileGridSize=(8, 8))
         enhanced = clahe.apply(gray)
         _, th_c = cv2.threshold(enhanced, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
         variants.append(th_c)
         variants.append(255 - th_c)
 
-        # Unsharp
         blur = cv2.GaussianBlur(gray, (0, 0), 1.5)
         sharp = cv2.addWeighted(gray, 2.2, blur, -1.2, 0)
         _, th_s = cv2.threshold(sharp, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
         variants.append(th_s)
         variants.append(255 - th_s)
 
-        # Утолщение
         kernel = np.ones((2, 2), np.uint8)
         variants.append(cv2.dilate(th_s, kernel, iterations=1))
         variants.append(cv2.dilate(th_s, kernel, iterations=2))
 
-        # Цветовые каналы
         lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
         l, a, b = cv2.split(lab)
 
@@ -115,12 +114,10 @@ def make_variants(img_bgr: np.ndarray) -> list[np.ndarray]:
 
 
 def recognize_with_gemini(image_bytes: bytes) -> str:
-    """Запасной вариант через Gemini Vision"""
     if gemini_model is None:
         return "0"
 
     try:
-        # Всегда отправляем как PNG
         nparr = np.frombuffer(image_bytes, np.uint8)
         img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
         if img is None:
@@ -161,18 +158,18 @@ def recognize_with_gemini(image_bytes: bytes) -> str:
         return "0"
 
 
-def recognize_one(image_bytes: bytes) -> str:
+def recognize_one(image_bytes: bytes) -> dict:
     try:
         nparr = np.frombuffer(image_bytes, np.uint8)
         img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
 
         if img is None:
             res = ocr_dddd.classification(image_bytes)
-            return "".join(c for c in res if c.isdigit()) or "0"
+            text = "".join(c for c in res if c.isdigit()) or "0"
+            return {"text": text, "source": "ddddocr"}
 
         candidates = []
 
-        # Оригинал
         res0 = ocr_dddd.classification(image_bytes)
         dig0 = "".join(c for c in res0 if c.isdigit())
         if dig0:
@@ -202,20 +199,18 @@ def recognize_one(image_bytes: bytes) -> str:
 
             best = sorted(cnt.items(), key=score, reverse=True)[0][0]
 
-        # === Умный fallback на Gemini ===
-        # Если результат короче 3 цифр — пробуем Gemini
+        # Fallback на Gemini
         if len(best) < 3 and gemini_model is not None:
             gemini_result = recognize_with_gemini(image_bytes)
             if len(gemini_result) >= 3:
-                return gemini_result
-            # Если Gemini тоже короткий, но лучше чем best — берём его
+                return {"text": gemini_result, "source": "gemini"}
             if len(gemini_result) > len(best):
-                return gemini_result
+                return {"text": gemini_result, "source": "gemini"}
 
-        return best
+        return {"text": best, "source": "ddddocr"}
 
     except Exception as e:
-        return f"ERROR:{str(e)}"
+        return {"text": f"ERROR:{str(e)}", "source": "error"}
 
 
 @app.post("/ocr", response_model=OCRResponse)
