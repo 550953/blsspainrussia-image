@@ -1,4 +1,5 @@
 import base64
+import gc
 from pathlib import Path
 from typing import List, Union
 from collections import Counter
@@ -11,13 +12,13 @@ import numpy as np
 import cv2
 import uvicorn
 
-app = FastAPI(title="Digit OCR Service", version="1.8")
+app = FastAPI(title="Digit OCR Service", version="1.9")
 
 ocr_dddd = ddddocr.DdddOcr(show_ad=False)
 
 
 class OCRRequest(BaseModel):
-    images: Union[str, List[str]] = Field(..., description="Один base64 или список base64")
+    images: Union[str, List[str]] = Field(..., description="Один base64 или список (рекомендуется 1)")
 
 
 class OCRResponse(BaseModel):
@@ -34,11 +35,10 @@ def clean_base64(b64: str) -> bytes:
 
 
 def make_variants(img_bgr: np.ndarray) -> list[np.ndarray]:
-    """Минимальный набор вариантов — стабильно по памяти."""
+    """Очень лёгкий набор вариантов"""
     h, w = img_bgr.shape[:2]
     variants = []
 
-    # Только 4x и 5x
     for scale in (4, 5):
         img = cv2.resize(img_bgr, (w * scale, h * scale), interpolation=cv2.INTER_CUBIC)
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
@@ -55,7 +55,7 @@ def make_variants(img_bgr: np.ndarray) -> list[np.ndarray]:
         variants.append(th_a)
         variants.append(255 - th_a)
 
-        # Unsharp + лёгкое утолщение (для нулей)
+        # Unsharp + утолщение (для нулей)
         blur = cv2.GaussianBlur(gray, (0, 0), 1.0)
         sharp = cv2.addWeighted(gray, 1.7, blur, -0.7, 0)
         _, th_s = cv2.threshold(sharp, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
@@ -93,6 +93,10 @@ def recognize_one(image_bytes: bytes) -> str:
             if dig:
                 candidates.append(dig)
 
+        # Чистим память сразу
+        del img, nparr
+        gc.collect()
+
         if not candidates:
             return "0"
 
@@ -100,7 +104,7 @@ def recognize_one(image_bytes: bytes) -> str:
 
         def score(item):
             text, freq = item
-            bonus = 60 if len(text) == 3 else (10 if len(text) == 2 else 0)
+            bonus = 50 if len(text) == 3 else 0
             return (freq + bonus, len(text))
 
         best = sorted(cnt.items(), key=score, reverse=True)[0][0]
@@ -113,10 +117,19 @@ def recognize_one(image_bytes: bytes) -> str:
 @app.post("/ocr", response_model=OCRResponse)
 async def ocr_endpoint(req: OCRRequest):
     images = req.images if isinstance(req.images, list) else [req.images]
-    if not images:
-        raise HTTPException(status_code=400, detail="Empty images list")
 
-    results = [recognize_one(clean_base64(b64)) for b64 in images]
+    # Жёстко ограничиваем — максимум 3 картинки за раз
+    if len(images) > 3:
+        raise HTTPException(status_code=400, detail="Максимум 3 изображения за один запрос")
+
+    results = []
+    for b64 in images:
+        img_bytes = clean_base64(b64)
+        result = recognize_one(img_bytes)
+        results.append(result)
+        # Принудительно чистим после каждой картинки
+        gc.collect()
+
     return OCRResponse(results=results)
 
 
