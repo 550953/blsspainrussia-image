@@ -1,5 +1,6 @@
 import base64
 import gc
+import os
 from pathlib import Path
 from typing import List, Union
 from collections import Counter
@@ -12,9 +13,24 @@ import numpy as np
 import cv2
 import uvicorn
 
-app = FastAPI(title="Digit OCR Service", version="2.1")
+# Gemini
+import google.generativeai as genai
+
+app = FastAPI(title="Digit OCR Service", version="2.2")
 
 ocr_dddd = ddddocr.DdddOcr(show_ad=False)
+
+# Инициализация Gemini
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+gemini_model = None
+
+if GEMINI_API_KEY:
+    try:
+        genai.configure(api_key=GEMINI_API_KEY)
+        gemini_model = genai.GenerativeModel("gemini-1.5-flash")
+        print("Gemini подключен")
+    except Exception as e:
+        print(f"Gemini не удалось инициализировать: {e}")
 
 
 class OCRRequest(BaseModel):
@@ -42,59 +58,52 @@ def make_variants(img_bgr: np.ndarray) -> list[np.ndarray]:
         img = cv2.resize(img_bgr, (w * scale, h * scale), interpolation=cv2.INTER_CUBIC)
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
 
-        # 1. Otsu
+        # Otsu
         _, th = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
         variants.append(th)
         variants.append(255 - th)
 
-        # 2. Adaptive
+        # Adaptive
         th_a = cv2.adaptiveThreshold(
             gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 31, 5
         )
         variants.append(th_a)
         variants.append(255 - th_a)
 
-        # 3. Сильный CLAHE
+        # CLAHE
         clahe = cv2.createCLAHE(clipLimit=4.0, tileGridSize=(8, 8))
         enhanced = clahe.apply(gray)
         _, th_c = cv2.threshold(enhanced, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
         variants.append(th_c)
         variants.append(255 - th_c)
 
-        # 4. Unsharp
+        # Unsharp
         blur = cv2.GaussianBlur(gray, (0, 0), 1.5)
         sharp = cv2.addWeighted(gray, 2.2, blur, -1.2, 0)
         _, th_s = cv2.threshold(sharp, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
         variants.append(th_s)
         variants.append(255 - th_s)
 
-        # 5. Утолщение
+        # Утолщение
         kernel = np.ones((2, 2), np.uint8)
-        thick = cv2.dilate(th_s, kernel, iterations=1)
-        variants.append(thick)
-        variants.append(255 - thick)
+        variants.append(cv2.dilate(th_s, kernel, iterations=1))
+        variants.append(cv2.dilate(th_s, kernel, iterations=2))
 
-        thick2 = cv2.dilate(th_s, kernel, iterations=2)
-        variants.append(thick2)
-
-        # 6. Цветовые варианты (самое важное для 678 и похожих)
+        # Цветовые каналы
         lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
         l, a, b = cv2.split(lab)
 
-        # a-канал (зелёно-красный)
         _, th_a_ch = cv2.threshold(a, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
         variants.append(th_a_ch)
         variants.append(255 - th_a_ch)
 
-        # Комбинация L + a
         color1 = cv2.addWeighted(l, 0.4, a, 0.6, 0)
         _, th_col1 = cv2.threshold(color1, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
         variants.append(th_col1)
         variants.append(255 - th_col1)
 
-        # HSV — берём канал S или V
         hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
-        h_ch, s_ch, v_ch = cv2.split(hsv)
+        _, s_ch, v_ch = cv2.split(hsv)
 
         _, th_s_ch = cv2.threshold(s_ch, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
         variants.append(th_s_ch)
@@ -105,6 +114,31 @@ def make_variants(img_bgr: np.ndarray) -> list[np.ndarray]:
         variants.append(255 - th_v)
 
     return variants
+
+
+def recognize_with_gemini(image_bytes: bytes) -> str:
+    """Запасной вариант через Gemini Vision"""
+    if gemini_model is None:
+        return "0"
+
+    try:
+        prompt = (
+            "Это изображение с тремя цифрами. "
+            "Распознай только цифры, ничего больше не пиши. "
+            "Ответ должен содержать только цифры, например 678 или 700."
+        )
+
+        response = gemini_model.generate_content(
+            [prompt, {"mime_type": "image/png", "data": image_bytes}]
+        )
+
+        text = response.text.strip()
+        digits = "".join(c for c in text if c.isdigit())
+        return digits if digits else "0"
+
+    except Exception as e:
+        print(f"Gemini error: {e}")
+        return "0"
 
 
 def recognize_one(image_bytes: bytes) -> str:
@@ -141,13 +175,20 @@ def recognize_one(image_bytes: bytes) -> str:
 
         cnt = Counter(candidates)
 
-        # Очень сильный приоритет 3-значным
         def score(item):
             text, freq = item
             bonus = 120 if len(text) == 3 else (25 if len(text) == 2 else 0)
             return (freq + bonus, len(text))
 
         best = sorted(cnt.items(), key=score, reverse=True)[0][0]
+
+        # === Умный fallback на Gemini ===
+        # Если результат слишком короткий — пробуем Gemini
+        if len(best) < 3 and gemini_model is not None:
+            gemini_result = recognize_with_gemini(image_bytes)
+            if len(gemini_result) == 3:
+                return gemini_result
+
         return best
 
     except Exception as e:
@@ -172,7 +213,10 @@ async def ocr_endpoint(req: OCRRequest):
 
 @app.get("/health")
 async def health():
-    return {"status": "ok"}
+    return {
+        "status": "ok",
+        "gemini": gemini_model is not None
+    }
 
 
 @app.get("/favicon.ico", include_in_schema=False)
