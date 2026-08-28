@@ -1,8 +1,9 @@
 import base64
 import gc
-import itertools
 import json
+import math
 import os
+import re
 import threading
 import time
 from pathlib import Path
@@ -33,30 +34,114 @@ ocr_dddd = ddddocr.DdddOcr(show_ad=False)
 
 
 # ---------------------------------------------------------------------------
-# Ротация Gemini API ключей.
+# Пул Gemini API ключей — паттерн взят из проверенной реализации
+# (key_pool.py / llm.py, vk-pet-care-assistant-zoo-mentor):
+#   - Round-Robin по ключам, но с ПЕР-КЛЮЧЕВЫМ cooldown (не общий счётчик)
+#   - при 429 парсим реальный retry_delay из текста ошибки Google и ставим
+#     cooldown = max(30, retry_delay) именно на этот ключ
+#   - если ВСЕ ключи оказались на cooldown одновременно — выставляем
+#     глобальный blackout до момента, когда освободится САМЫЙ БЛИЗКИЙ ключ
+#     (не константа, а честный max() по фактическим cooldown-таймерам)
+#   - 401/403 (невалидный/забаненный ключ) — cooldown на час, это не про
+#     квоту, повторять чаще нет смысла
 # Ключи задаются переменными окружения с общим префиксом GEMINI_API_KEY,
-# например: GEMINI_API_KEY_skukolka0, GEMINI_API_KEY_skukolka01, ...,
-# GEMINI_API_KEY_ittlefairybox — сколько угодно штук, любые суффиксы.
-# Каждый вызов Gemini берёт следующий ключ по кругу (round-robin).
-# Если запрос с текущим ключом падает (квота/ошибка) — автоматически
-# пробуем следующий ключ, пока не переберём все или не получим успех.
+# например: GEMINI_API_KEY_skukolka0, ..., GEMINI_API_KEY_ittlefairybox —
+# сколько угодно штук, любые суффиксы, собираются автоматически.
 # ---------------------------------------------------------------------------
-def _collect_gemini_keys() -> List[tuple[str, str]]:
-    """Возвращает список (имя_переменной, значение_ключа), чтобы можно было
-    логировать КАКИМ именно ключом (по имени, не по секрету) обрабатывалась
-    картинка — это нужно, чтобы честно проверить, реально ли идёт ротация
-    по разным ключам/аккаунтам, или квота почему-то общая на всех."""
-    keys = []
-    for name, value in sorted(os.environ.items()):
-        if name.startswith("GEMINI_API_KEY") and value:
-            keys.append((name, value))
-    return keys
+_RETRY_DELAY_RE = re.compile(r'retry[_\s\-]?delay[^0-9]*(\d+(?:\.\d+)?)', re.IGNORECASE)
 
 
-GEMINI_KEYS_NAMED = _collect_gemini_keys()
-GEMINI_KEYS = [v for _, v in GEMINI_KEYS_NAMED]
-_gemini_key_cycle = itertools.cycle(GEMINI_KEYS_NAMED) if GEMINI_KEYS_NAMED else None
-_gemini_lock = threading.Lock()  # genai.configure — глобальное состояние, сериализуем доступ
+def _parse_retry_delay(err_text: str) -> float:
+    """Достаёт число секунд из 'retry_delay { seconds: 33 }' в тексте ошибки."""
+    m = _RETRY_DELAY_RE.search(err_text)
+    return float(m.group(1)) if m else 0.0
+
+
+class GeminiKeyPool:
+    _BLACKOUT_MULT = 1.0
+    _BLACKOUT_MIN = 30.0  # минимум cooldown при 429, если retry_delay не найден
+
+    def __init__(self):
+        self.keys: List[str] = []
+        self.key_names: List[str] = []
+        self.blocked: List[float] = []  # monotonic-время, до которого ключ на cooldown
+        self.blackout_until: float = 0.0
+        self.rr_index: int = 0
+        self.lock = threading.Lock()
+
+    def init_from_env(self, prefix: str = "GEMINI_API_KEY") -> None:
+        seen = set()
+        keys, names = [], []
+        for name, value in sorted(os.environ.items()):
+            if name.startswith(prefix) and value:
+                v = value.strip()
+                if v and v not in seen:
+                    seen.add(v)
+                    keys.append(v)
+                    names.append(name)
+        self.keys = keys
+        self.key_names = names
+        self.blocked = [0.0] * len(keys)
+        self.blackout_until = 0.0
+        self.rr_index = 0
+        print(f"Gemini pool: инициализирован, {len(keys)} ключ(ей)")
+
+    def is_overloaded(self) -> tuple[bool, float]:
+        now = time.monotonic()
+        if now < self.blackout_until:
+            return True, self.blackout_until - now
+        return False, 0.0
+
+    def get_next(self) -> tuple[Optional[int], Optional[str], Optional[str]]:
+        """Возвращает (idx, key_name, key_value) следующего доступного ключа
+        по кругу, пропуская те, что сейчас на cooldown. (None, None, None),
+        если все заняты."""
+        if not self.keys:
+            return None, None, None
+        n = len(self.keys)
+        now = time.monotonic()
+        with self.lock:
+            for _ in range(n):
+                idx = self.rr_index % n
+                self.rr_index += 1
+                if now >= self.blocked[idx]:
+                    return idx, self.key_names[idx], self.keys[idx]
+        return None, None, None
+
+    def mark_error(self, idx: int, err_text: str) -> None:
+        """Регистрирует ошибку ключа idx и выставляет ему персональный
+        cooldown в зависимости от типа ошибки (429 vs 401/403 vs прочее)."""
+        key_name = self.key_names[idx] if idx < len(self.key_names) else f"key_{idx}"
+        err_up = err_text.upper()
+
+        if "429" in err_up or "RESOURCE_EXHAUSTED" in err_up or "QUOTA" in err_up:
+            base = _parse_retry_delay(err_text)
+            cooldown = max(self._BLACKOUT_MIN, base * self._BLACKOUT_MULT)
+            print(f"[gemini_key] {key_name} → 429, cooldown {cooldown:.0f} сек")
+        elif "401" in err_up or "403" in err_up or "UNAUTHENTICATED" in err_up or "API_KEY_INVALID" in err_up:
+            cooldown = 3600.0  # ключ битый/забанен — час не трогаем
+            print(f"[gemini_key] {key_name} → ошибка авторизации (401/403), cooldown 1ч")
+        else:
+            cooldown = 15.0  # неизвестная ошибка — короткий cooldown на всякий случай
+            print(f"[gemini_key] {key_name} → прочая ошибка, cooldown 15 сек: {err_text[:200]}")
+
+        with self.lock:
+            self.blocked[idx] = time.monotonic() + cooldown
+            now = time.monotonic()
+            if all(now < t for t in self.blocked):
+                # Все ключи разом на cooldown — глобальный blackout до
+                # момента освобождения самого быстрого из них.
+                new_blackout = max(self.blocked)
+                if new_blackout > self.blackout_until:
+                    self.blackout_until = new_blackout
+                    wait = self.blackout_until - now
+                    print(f"[gemini_key] ВСЕ ключи заняты → blackout {wait:.0f} сек")
+
+
+gemini_pool = GeminiKeyPool()
+gemini_pool.init_from_env()
+
+GEMINI_KEYS = gemini_pool.keys  # для обратной совместимости (проверки "if GEMINI_KEYS")
 
 GEMINI_MODELS = [
     "gemini-3.1-flash-lite",
@@ -226,16 +311,14 @@ def make_variants_full(img_bgr: np.ndarray) -> list[np.ndarray]:
     return variants
 
 
-def _next_gemini_key() -> Optional[tuple[str, str]]:
-    """Возвращает (имя_переменной, значение_ключа) следующего в очереди."""
-    if _gemini_key_cycle is None:
-        return None
-    with _gemini_lock:
-        return next(_gemini_key_cycle)
-
-
 def recognize_with_gemini(image_bytes: bytes) -> str:
     if not GEMINI_KEYS or gemini_model_name is None:
+        return "0"
+
+    # Глобальный blackout — все ключи заняты, честно посчитанный как
+    # max() реальных cooldown-таймеров (не константа).
+    overloaded, remaining = gemini_pool.is_overloaded()
+    if overloaded:
         return "0"
 
     try:
@@ -256,15 +339,20 @@ def recognize_with_gemini(image_bytes: bytes) -> str:
             "Пример правильного ответа: 678 или 700."
         )
 
-        # Пробуем ключи по кругу: если текущий упал (квота/ошибка) —
-        # переходим к следующему, максимум по разу на каждый доступный ключ.
-        attempts = len(GEMINI_KEYS)
+        n = len(GEMINI_KEYS)
+        tried_idx = set()
         last_error = None
 
-        for _ in range(attempts):
-            key_name, key_value = _next_gemini_key()
+        for _ in range(n):
+            idx, key_name, key_value = gemini_pool.get_next()
+            if idx is None or idx in tried_idx:
+                # Либо все ключи на cooldown, либо уже пробовали этот в
+                # рамках текущей картинки — прекращаем перебор.
+                break
+            tried_idx.add(idx)
+
             try:
-                with _gemini_lock:
+                with gemini_pool.lock:
                     genai.configure(api_key=key_value)
                     model = genai.GenerativeModel(gemini_model_name)
                     response = model.generate_content(
@@ -285,12 +373,11 @@ def recognize_with_gemini(image_bytes: bytes) -> str:
                     return digits
             except Exception as e:
                 last_error = e
-                is_quota = "429" in str(e) or "quota" in str(e).lower()
-                print(f"[gemini_key] FAIL key={key_name} quota_hit={is_quota} err={e}")
+                gemini_pool.mark_error(idx, str(e))
                 continue
 
         if last_error:
-            print(f"Gemini error (all keys exhausted): {last_error}")
+            print(f"Gemini error (перебор завершён, попыток={len(tried_idx)}): {last_error}")
         return "0"
 
     except Exception as e:
@@ -372,11 +459,16 @@ def recognize_dddd(image_bytes: bytes) -> str:
 def recognize_one(image_bytes: bytes, mode: str = "combo") -> dict:
     mode = mode.lower().strip()
 
-    # Только Gemini
+    # Только Gemini (с автоматическим фоллбэком на ddddocr, если Gemini
+    # временно недоступен из-за исчерпанной квоты — иначе просто "0")
     if mode == "gemini":
         if not GEMINI_KEYS:
             return {"text": "0", "source": "gemini_unavailable"}
         result = recognize_with_gemini(image_bytes)
+        if result == "0":
+            fallback = recognize_dddd(image_bytes)
+            if fallback and fallback != "0":
+                return {"text": fallback, "source": "ddddocr_fallback"}
         return {"text": result, "source": "gemini"}
 
     # Только ddddocr
@@ -426,11 +518,21 @@ async def health():
         except Exception:
             startup_info = None
 
+    overloaded, remaining = gemini_pool.is_overloaded()
+    now = time.monotonic()
+
     return {
         "status": "ok",
         "gemini_keys_count": len(GEMINI_KEYS),
-        "gemini_key_names": [name for name, _ in GEMINI_KEYS_NAMED],
+        "gemini_key_names": gemini_pool.key_names,
         "gemini_model": gemini_model_name,
+        "gemini_pool_overloaded": overloaded,
+        "gemini_pool_overloaded_seconds_left": round(remaining, 1) if overloaded else 0,
+        "gemini_keys_on_cooldown": [
+            gemini_pool.key_names[i]
+            for i, t in enumerate(gemini_pool.blocked)
+            if now < t
+        ],
         "startup_timing": startup_info,
     }
 
