@@ -2,6 +2,8 @@ import base64
 import io
 from pathlib import Path
 from typing import List, Union
+from collections import Counter
+
 import ddddocr
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
@@ -11,15 +13,18 @@ import numpy as np
 import cv2
 import uvicorn
 
-app = FastAPI(title="Digit OCR Service with Preprocessing", version="1.3")
+app = FastAPI(title="Digit OCR Service with Preprocessing", version="1.4")
 
 ocr_dddd = ddddocr.DdddOcr(show_ad=False)
+
 
 class OCRRequest(BaseModel):
     images: Union[str, List[str]] = Field(..., description="Один base64 или список base64")
 
+
 class OCRResponse(BaseModel):
     results: List[str]
+
 
 def clean_base64(b64: str) -> bytes:
     if b64.startswith("data:image"):
@@ -29,61 +34,66 @@ def clean_base64(b64: str) -> bytes:
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Invalid base64: {e}")
 
+
 def make_variants(img_bgr: np.ndarray) -> list[np.ndarray]:
     """Генерируем несколько вариантов изображения для OCR."""
     h, w = img_bgr.shape[:2]
-    # Сильный апскейл — критично для тонких цифр
-    scale = 4
-    img = cv2.resize(img_bgr, (w * scale, h * scale), interpolation=cv2.INTER_CUBIC)
-
     variants = []
 
-    # 1. Классический grayscale + Otsu
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    _, th1 = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    variants.append(th1)
+    # Два масштаба: 4x (быстрый) и 6x (для тонких цифр)
+    for scale in (4, 6):
+        img = cv2.resize(img_bgr, (w * scale, h * scale), interpolation=cv2.INTER_CUBIC)
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
 
-    # 2. Инверсия Otsu (на случай светлых цифр)
-    variants.append(255 - th1)
+        # 1. Классический Otsu
+        _, th1 = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        variants.append(th1)
+        variants.append(255 - th1)
 
-    # 3. Adaptive threshold (лучше держит тонкие линии)
-    th_adapt = cv2.adaptiveThreshold(
-        gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 31, 10
-    )
-    variants.append(th_adapt)
-    variants.append(255 - th_adapt)
+        # 2. Adaptive threshold
+        th_adapt = cv2.adaptiveThreshold(
+            gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 31, 8
+        )
+        variants.append(th_adapt)
+        variants.append(255 - th_adapt)
 
-    # 4. Работа с цветом: выделяем "насыщенный" канал
-    # Фиолетовый/цветной текст часто лучше видно в LAB или после max-канала
-    lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
+        # 3. CLAHE + Otsu
+        clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
+        enhanced = clahe.apply(gray)
+        _, th_clahe = cv2.threshold(enhanced, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        variants.append(th_clahe)
+        variants.append(255 - th_clahe)
+
+        # 4. Unsharp mask (хорошо поднимает тонкие линии 1/7/0)
+        blur = cv2.GaussianBlur(gray, (0, 0), 1.5)
+        sharp = cv2.addWeighted(gray, 1.8, blur, -0.8, 0)
+        _, th_sharp = cv2.threshold(sharp, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        variants.append(th_sharp)
+        variants.append(255 - th_sharp)
+
+    # 5. Цветовой вариант (LAB) — только на 4x, чтобы не раздувать
+    img4 = cv2.resize(img_bgr, (w * 4, h * 4), interpolation=cv2.INTER_CUBIC)
+    lab = cv2.cvtColor(img4, cv2.COLOR_BGR2LAB)
     l, a, b = cv2.split(lab)
-    # Берём канал a (красно-зелёный) + L
-    color_enh = cv2.addWeighted(l, 0.6, a, 0.4, 0)
+    color_enh = cv2.addWeighted(l, 0.55, a, 0.45, 0)
     _, th_color = cv2.threshold(color_enh, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
     variants.append(th_color)
     variants.append(255 - th_color)
 
-    # 5. Утолщение линий (morphology) — спасает тонкий "0"
+    # 6. Утолщение линий (только на первых вариантах)
     kernel = np.ones((2, 2), np.uint8)
-    for v in list(variants):
-        thick = cv2.dilate(v, kernel, iterations=1)
-        variants.append(thick)
-
-    # 6. Ещё один вариант: просто сильный контраст + CLAHE
-    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
-    enhanced = clahe.apply(gray)
-    _, th_clahe = cv2.threshold(enhanced, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    variants.append(th_clahe)
-    variants.append(255 - th_clahe)
+    for v in variants[:10]:
+        variants.append(cv2.dilate(v, kernel, iterations=1))
 
     return variants
+
 
 def recognize_one(image_bytes: bytes) -> str:
     try:
         nparr = np.frombuffer(image_bytes, np.uint8)
         img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+
         if img is None:
-            # fallback на оригинал
             res = ocr_dddd.classification(image_bytes)
             return "".join(c for c in res if c.isdigit()) or "0"
 
@@ -108,17 +118,21 @@ def recognize_one(image_bytes: bytes) -> str:
         if not candidates:
             return "0"
 
-        # Выбираем самый частый результат.
-        # Если частоты равны — берём самый длинный (чаще всего правильный "320" длиннее "32")
-        from collections import Counter
+        # Выбор лучшего: частота → длина → бонус за 3 цифры
         cnt = Counter(candidates)
-        # Сортируем: сначала по частоте ↓, потом по длине ↓
-        best = sorted(cnt.items(), key=lambda x: (x[1], len(x[0])), reverse=True)[0][0]
 
+        def score(item):
+            text, freq = item
+            length_score = len(text) * 10
+            three_digit_bonus = 40 if len(text) == 3 else 0
+            return (freq, length_score + three_digit_bonus)
+
+        best = sorted(cnt.items(), key=score, reverse=True)[0][0]
         return best
 
     except Exception as e:
         return f"ERROR:{str(e)}"
+
 
 @app.post("/ocr", response_model=OCRResponse)
 async def ocr_endpoint(req: OCRRequest):
@@ -133,9 +147,11 @@ async def ocr_endpoint(req: OCRRequest):
 
     return OCRResponse(results=results)
 
+
 @app.get("/health")
 async def health():
     return {"status": "ok"}
+
 
 @app.get("/favicon.ico", include_in_schema=False)
 async def favicon():
@@ -143,6 +159,7 @@ async def favicon():
     if not favicon_path.exists():
         raise HTTPException(status_code=404, detail="Favicon not found")
     return FileResponse(favicon_path)
+
 
 if __name__ == "__main__":
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=False)
