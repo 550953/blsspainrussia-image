@@ -89,6 +89,12 @@ class GeminiKeyPool:
         self.blocked: List[float] = []   # monotonic-время, до которого ключ на cooldown
         self.reserved: List[bool] = []   # НОВОЕ: ключ сейчас используется одной задачей
         self.dead: List[bool] = []       # ключ получил 401/403 — считаем нерабочим навсегда
+        self.last_used: List[float] = []  # НОВОЕ: monotonic-время последней ВЫДАЧИ ключа —
+        # используется для упреждающего пейсинга в acquire(), а не только реактивного
+        # cooldown после ошибки. Наблюдение из продакшн-логов: у бесплатного тира
+        # квота настолько мала, что ключ ловит 429 уже на ВТОРОМ подряд запросе —
+        # ждать реальной ошибки слишком поздно, разумнее не давать ключ повторно
+        # раньше GEMINI_MIN_INTERVAL_SEC после предыдущей выдачи.
         self.blackout_until: float = 0.0
         self.rr_index: int = 0
         # Важно: acquire()/release() вызываются только из корутин, которые
@@ -112,9 +118,10 @@ class GeminiKeyPool:
         self.blocked = [0.0] * len(keys)
         self.reserved = [False] * len(keys)
         self.dead = [False] * len(keys)
+        self.last_used = [0.0] * len(keys)
         self.blackout_until = 0.0
         self.rr_index = 0
-        print(f"Gemini pool: инициализирован, {len(keys)} ключ(ей)")
+        print(f"[pid={os.getpid()}] Gemini pool: инициализирован, {len(keys)} ключ(ей)")
 
     def _client(self, idx: int) -> genai.Client:
         if self.clients[idx] is None:
@@ -128,9 +135,12 @@ class GeminiKeyPool:
         return False, 0.0
 
     def acquire(self) -> tuple[Optional[int], Optional[str], Optional[genai.Client]]:
-        """Резервирует и возвращает следующий свободный (не в cooldown, не
-        занятый другой задачей) ключ по кругу. (None, None, None), если
-        свободных сейчас нет — вызывающий код должен подождать и повторить."""
+        """Резервирует и возвращает следующий свободный ключ по кругу.
+        Свободный = не в cooldown, не занят другой задачей И не использовался
+        последние GEMINI_MIN_INTERVAL_SEC секунд (упреждающий пейсинг —
+        не дожидаемся 429, чтобы понять, что квота ключа мала).
+        (None, None, None), если свободных сейчас нет — вызывающий код должен
+        подождать и повторить."""
         if not self.keys:
             return None, None, None
         n = len(self.keys)
@@ -138,8 +148,13 @@ class GeminiKeyPool:
         for _ in range(n):
             idx = self.rr_index % n
             self.rr_index += 1
-            if not self.reserved[idx] and now >= self.blocked[idx]:
+            if (
+                not self.reserved[idx]
+                and now >= self.blocked[idx]
+                and now - self.last_used[idx] >= GEMINI_MIN_INTERVAL_SEC
+            ):
                 self.reserved[idx] = True
+                self.last_used[idx] = now
                 return idx, self.key_names[idx], self._client(idx)
         return None, None, None
 
@@ -156,21 +171,21 @@ class GeminiKeyPool:
         if "429" in err_up or "RESOURCE_EXHAUSTED" in err_up or "QUOTA" in err_up:
             base = _parse_retry_delay(error_text)
             cooldown = max(self._BLACKOUT_MIN, base * self._BLACKOUT_MULT) + random.uniform(0, self._JITTER_MAX)
-            print(f"[gemini_key] {key_name} → 429, cooldown {cooldown:.0f} сек")
+            print(f"[pid={os.getpid()}][gemini_key] {key_name} → 429, cooldown {cooldown:.0f} сек")
         elif "401" in err_up or "403" in err_up or "UNAUTHENTICATED" in err_up or "API_KEY_INVALID" in err_up or "PERMISSION_DENIED" in err_up:
             cooldown = 3600.0
             self.dead[idx] = True  # ВАЖНО: помечаем отдельно, см. ниже — не даём этому
             # ключу влиять на расчёт общего blackout наравне с временно занятыми.
-            print(f"[gemini_key] {key_name} → ошибка авторизации (401/403), похоже ключ мёртв, cooldown 1ч")
+            print(f"[pid={os.getpid()}][gemini_key] {key_name} → ошибка авторизации (401/403), похоже ключ мёртв, cooldown 1ч")
         elif "503" in err_up or "UNAVAILABLE" in err_up:
             # Модель перегружена НА СТОРОНЕ GOOGLE — это не проблема конкретного
             # ключа, поэтому cooldown короче, чем для прочих ошибок: ключ скорее
             # всего рабочий, просто сейчас не повезло с моделью/таймингом.
             cooldown = 10.0 + random.uniform(0, self._JITTER_MAX)
-            print(f"[gemini_key] {key_name} → 503 (модель перегружена), cooldown {cooldown:.0f} сек")
+            print(f"[pid={os.getpid()}][gemini_key] {key_name} → 503 (модель перегружена), cooldown {cooldown:.0f} сек")
         else:
             cooldown = 15.0
-            print(f"[gemini_key] {key_name} → прочая ошибка, cooldown 15 сек: {error_text[:200]}")
+            print(f"[pid={os.getpid()}][gemini_key] {key_name} → прочая ошибка, cooldown 15 сек: {error_text[:200]}")
 
         self.blocked[idx] = time.monotonic() + cooldown
         now = time.monotonic()
@@ -191,7 +206,7 @@ class GeminiKeyPool:
                 self.blackout_until = soonest
                 wait = soonest - now
                 label = "живые " if live_idx else ""
-                print(f"[gemini_key] ВСЕ {label}ключи заняты → blackout {wait:.0f} сек (ближайшее освобождение)")
+                print(f"[pid={os.getpid()}][gemini_key] ВСЕ {label}ключи заняты → blackout {wait:.0f} сек (ближайшее освобождение)")
 
 
 gemini_pool = GeminiKeyPool()
@@ -213,12 +228,16 @@ GEMINI_KEYS = gemini_pool.keys  # для обратной совместимос
 # если понадобится другая.
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.1-flash-lite")
 gemini_model_name = GEMINI_MODEL if GEMINI_KEYS else None
-print(f"Gemini ключей найдено: {len(GEMINI_KEYS)}, модель: {gemini_model_name}")
+print(f"[pid={os.getpid()}] Gemini ключей найдено: {len(GEMINI_KEYS)}, модель: {gemini_model_name}")
 
-# --- ИЗМЕНЕНИЕ 3: сколько ждать освобождения ключа, если все заняты ---------
-# При concurrency > числа ключей часть задач будет вежливо ждать здесь, а не
-# сразу проваливаться в ddddocr fallback.
-GEMINI_ACQUIRE_TIMEOUT = float(os.getenv("GEMINI_ACQUIRE_TIMEOUT", "8.0"))
+# --- ИЗМЕНЕНИЕ: упреждающий пейсинг ключа + больше терпения при ожидании ---
+# По логам: свободный тир текущей модели даёт квоту ~1 запрос за GEMINI_MIN_INTERVAL_SEC
+# секунд НА КЛЮЧ — второй подряд запрос почти гарантированно ловит 429 с
+# retry_delay ~30 сек. GEMINI_MIN_INTERVAL_SEC не даёт ключу уйти в реальный 429
+# заранее. GEMINI_ACQUIRE_TIMEOUT увеличен с 8 до 40 сек — раньше задачи сдавались
+# в ddddocr fallback быстрее, чем успевал освободиться хоть один ключ (30+ сек).
+GEMINI_MIN_INTERVAL_SEC = float(os.getenv("GEMINI_MIN_INTERVAL_SEC", "21.0"))
+GEMINI_ACQUIRE_TIMEOUT = float(os.getenv("GEMINI_ACQUIRE_TIMEOUT", "40.0"))
 GEMINI_ACQUIRE_POLL = 0.15
 
 
@@ -475,7 +494,7 @@ async def recognize_with_gemini_async(image_bytes: bytes) -> str:
             text = (response.text or "").strip()
             digits = "".join(c for c in text if c.isdigit())
             if digits:
-                print(f"[gemini_key] OK  key={key_name}")
+                print(f"[pid={os.getpid()}][gemini_key] OK  key={key_name}")
                 return digits
         except Exception as e:
             error_text = str(e)
@@ -596,6 +615,7 @@ async def health():
 
     return {
         "status": "ok",
+        "pid": os.getpid(),
         "gemini_keys_count": len(GEMINI_KEYS),
         "gemini_key_names": gemini_pool.key_names,
         "gemini_model": gemini_model_name,
