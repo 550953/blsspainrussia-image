@@ -236,7 +236,7 @@ print(f"[pid={os.getpid()}] Gemini ключей найдено: {len(GEMINI_KEYS
 # retry_delay ~30 сек. GEMINI_MIN_INTERVAL_SEC не даёт ключу уйти в реальный 429
 # заранее. GEMINI_ACQUIRE_TIMEOUT увеличен с 8 до 40 сек — раньше задачи сдавались
 # в ddddocr fallback быстрее, чем успевал освободиться хоть один ключ (30+ сек).
-GEMINI_MIN_INTERVAL_SEC = float(os.getenv("GEMINI_MIN_INTERVAL_SEC", "21.0"))
+GEMINI_MIN_INTERVAL_SEC = float(os.getenv("GEMINI_MIN_INTERVAL_SEC", "34.0"))
 GEMINI_ACQUIRE_TIMEOUT = float(os.getenv("GEMINI_ACQUIRE_TIMEOUT", "40.0"))
 GEMINI_ACQUIRE_POLL = 0.15
 
@@ -426,7 +426,15 @@ def recognize_dddd(image_bytes: bytes) -> str:
         return sorted(cnt_full.items(), key=_score, reverse=True)[0][0]
 
     except Exception as e:
-        return f"ERROR:{str(e)}"
+        # ИСПРАВЛЕНО: раньше здесь возвращался текст ошибки ("ERROR:...") как
+        # будто это распознанный номер — а вызывающий код (recognize_one_async)
+        # проверяет только `!= "0"`, так что мусор из except принимался как
+        # валидный fallback-результат (см. картинку 01 в тесте пользователя:
+        # "ERROR:OCR识别失败..." попала в ответ API как text). Логируем причину
+        # на сервере, а наружу отдаём тот же "0", что и при обычном "не смогли
+        # распознать" — единый контракт для вызывающей стороны.
+        print(f"[pid={os.getpid()}][dddd] Ошибка распознавания: {e}")
+        return "0"
 
 
 # ---------------------------------------------------------------------------
