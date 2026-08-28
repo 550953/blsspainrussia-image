@@ -1,5 +1,4 @@
 import base64
-import io
 from pathlib import Path
 from typing import List, Union
 from collections import Counter
@@ -8,12 +7,11 @@ import ddddocr
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
-from PIL import Image
 import numpy as np
 import cv2
 import uvicorn
 
-app = FastAPI(title="Digit OCR Service with Preprocessing", version="1.4")
+app = FastAPI(title="Digit OCR Service with Preprocessing", version="1.5")
 
 ocr_dddd = ddddocr.DdddOcr(show_ad=False)
 
@@ -36,54 +34,65 @@ def clean_base64(b64: str) -> bytes:
 
 
 def make_variants(img_bgr: np.ndarray) -> list[np.ndarray]:
-    """Генерируем несколько вариантов изображения для OCR."""
     h, w = img_bgr.shape[:2]
     variants = []
 
-    # Два масштаба: 4x (быстрый) и 6x (для тонких цифр)
-    for scale in (4, 6):
+    # Два масштаба
+    for scale in (4, 7):  # 7x специально для тонких нулей
         img = cv2.resize(img_bgr, (w * scale, h * scale), interpolation=cv2.INTER_CUBIC)
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
 
-        # 1. Классический Otsu
-        _, th1 = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-        variants.append(th1)
-        variants.append(255 - th1)
+        # --- 1. Otsu ---
+        _, th = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        variants.append(th)
+        variants.append(255 - th)
 
-        # 2. Adaptive threshold
-        th_adapt = cv2.adaptiveThreshold(
-            gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 31, 8
+        # --- 2. Adaptive ---
+        th_a = cv2.adaptiveThreshold(
+            gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 25, 6
         )
-        variants.append(th_adapt)
-        variants.append(255 - th_adapt)
+        variants.append(th_a)
+        variants.append(255 - th_a)
 
-        # 3. CLAHE + Otsu
-        clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
+        # --- 3. CLAHE ---
+        clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
         enhanced = clahe.apply(gray)
-        _, th_clahe = cv2.threshold(enhanced, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-        variants.append(th_clahe)
-        variants.append(255 - th_clahe)
+        _, th_c = cv2.threshold(enhanced, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        variants.append(th_c)
+        variants.append(255 - th_c)
 
-        # 4. Unsharp mask (хорошо поднимает тонкие линии 1/7/0)
-        blur = cv2.GaussianBlur(gray, (0, 0), 1.5)
-        sharp = cv2.addWeighted(gray, 1.8, blur, -0.8, 0)
-        _, th_sharp = cv2.threshold(sharp, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-        variants.append(th_sharp)
-        variants.append(255 - th_sharp)
+        # --- 4. Unsharp (критично для тонких линий) ---
+        blur = cv2.GaussianBlur(gray, (0, 0), 1.2)
+        sharp = cv2.addWeighted(gray, 2.0, blur, -1.0, 0)
+        _, th_s = cv2.threshold(sharp, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        variants.append(th_s)
+        variants.append(255 - th_s)
 
-    # 5. Цветовой вариант (LAB) — только на 4x, чтобы не раздувать
+        # --- 5. Сильное утолщение после unsharp (спасает нули) ---
+        kernel = np.ones((3, 3), np.uint8)
+        thick = cv2.dilate(th_s, kernel, iterations=1)
+        variants.append(thick)
+        variants.append(255 - thick)
+
+        # --- 6. Ещё более агрессивное утолщение ---
+        kernel2 = np.ones((2, 2), np.uint8)
+        thick2 = cv2.dilate(th_s, kernel2, iterations=2)
+        variants.append(thick2)
+        variants.append(255 - thick2)
+
+    # Цветовой канал (только 4x)
     img4 = cv2.resize(img_bgr, (w * 4, h * 4), interpolation=cv2.INTER_CUBIC)
     lab = cv2.cvtColor(img4, cv2.COLOR_BGR2LAB)
     l, a, b = cv2.split(lab)
-    color_enh = cv2.addWeighted(l, 0.55, a, 0.45, 0)
-    _, th_color = cv2.threshold(color_enh, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    variants.append(th_color)
-    variants.append(255 - th_color)
+    color_enh = cv2.addWeighted(l, 0.5, a, 0.5, 0)
+    _, th_col = cv2.threshold(color_enh, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    variants.append(th_col)
+    variants.append(255 - th_col)
 
-    # 6. Утолщение линий (только на первых вариантах)
+    # Дополнительное утолщение цветового
     kernel = np.ones((2, 2), np.uint8)
-    for v in variants[:10]:
-        variants.append(cv2.dilate(v, kernel, iterations=1))
+    variants.append(cv2.dilate(th_col, kernel, iterations=1))
+    variants.append(cv2.dilate(255 - th_col, kernel, iterations=1))
 
     return variants
 
@@ -99,13 +108,13 @@ def recognize_one(image_bytes: bytes) -> str:
 
         candidates = []
 
-        # Оригинал без обработки
+        # Оригинал
         res0 = ocr_dddd.classification(image_bytes)
         dig0 = "".join(c for c in res0 if c.isdigit())
         if dig0:
             candidates.append(dig0)
 
-        # Все варианты препроцессинга
+        # Все варианты
         for var in make_variants(img):
             success, buf = cv2.imencode(".png", var)
             if not success:
@@ -118,14 +127,14 @@ def recognize_one(image_bytes: bytes) -> str:
         if not candidates:
             return "0"
 
-        # Выбор лучшего: частота → длина → бонус за 3 цифры
         cnt = Counter(candidates)
 
+        # Предпочитаем 3-значные числа + частоту
         def score(item):
             text, freq = item
-            length_score = len(text) * 10
-            three_digit_bonus = 40 if len(text) == 3 else 0
-            return (freq, length_score + three_digit_bonus)
+            # сильный бонус за 3 цифры
+            length_bonus = 100 if len(text) == 3 else (30 if len(text) == 2 else 0)
+            return (freq + length_bonus, len(text))
 
         best = sorted(cnt.items(), key=score, reverse=True)[0][0]
         return best
