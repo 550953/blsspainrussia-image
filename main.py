@@ -14,19 +14,40 @@ import cv2
 import uvicorn
 import google.generativeai as genai
 
-app = FastAPI(title="Digit OCR Service", version="2.4")
+app = FastAPI(title="Digit OCR Service", version="2.5")
 
 ocr_dddd = ddddocr.DdddOcr(show_ad=False)
 
 # Gemini
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 gemini_model = None
+gemini_model_name = None
+
+# Твои модели в порядке приоритета
+GEMINI_MODELS = [
+    "gemini-3.1-flash-lite",
+    "gemini-flash-latest",
+    "gemini-2.5-flash",
+]
 
 if GEMINI_API_KEY:
     try:
         genai.configure(api_key=GEMINI_API_KEY)
-        gemini_model = genai.GenerativeModel("gemini-1.5-flash")
-        print("Gemini подключен")
+        
+        for model_name in GEMINI_MODELS:
+            try:
+                test_model = genai.GenerativeModel(model_name)
+                gemini_model = test_model
+                gemini_model_name = model_name
+                print(f"Gemini подключен: {model_name}")
+                break
+            except Exception as e:
+                print(f"Модель {model_name} недоступна: {e}")
+                continue
+                
+        if gemini_model is None:
+            print("Ни одна из указанных моделей Gemini не доступна")
+            
     except Exception as e:
         print(f"Gemini не удалось инициализировать: {e}")
 
@@ -233,7 +254,8 @@ async def ocr_endpoint(req: OCRRequest):
 async def health():
     return {
         "status": "ok",
-        "gemini": gemini_model is not None
+        "gemini": gemini_model is not None,
+        "gemini_model": gemini_model_name
     }
 
 
