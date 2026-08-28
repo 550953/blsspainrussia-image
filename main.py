@@ -12,15 +12,13 @@ from pydantic import BaseModel, Field
 import numpy as np
 import cv2
 import uvicorn
-
-# Gemini
 import google.generativeai as genai
 
-app = FastAPI(title="Digit OCR Service", version="2.2")
+app = FastAPI(title="Digit OCR Service", version="2.3")
 
 ocr_dddd = ddddocr.DdddOcr(show_ad=False)
 
-# Инициализация Gemini
+# Gemini
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 gemini_model = None
 
@@ -122,14 +120,36 @@ def recognize_with_gemini(image_bytes: bytes) -> str:
         return "0"
 
     try:
+        # Всегда отправляем как PNG
+        nparr = np.frombuffer(image_bytes, np.uint8)
+        img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+        if img is None:
+            return "0"
+
+        success, buf = cv2.imencode(".png", img)
+        if not success:
+            return "0"
+        png_bytes = buf.tobytes()
+
         prompt = (
-            "Это изображение с тремя цифрами. "
-            "Распознай только цифры, ничего больше не пиши. "
-            "Ответ должен содержать только цифры, например 678 или 700."
+            "На изображении написано трёхзначное число. "
+            "Распознай только это число. "
+            "Ответь строго только цифрами, ничего больше. "
+            "Пример правильного ответа: 678 или 700."
         )
 
         response = gemini_model.generate_content(
-            [prompt, {"mime_type": "image/png", "data": image_bytes}]
+            [
+                prompt,
+                {
+                    "mime_type": "image/png",
+                    "data": png_bytes
+                }
+            ],
+            generation_config={
+                "temperature": 0.0,
+                "max_output_tokens": 10
+            }
         )
 
         text = response.text.strip()
@@ -171,22 +191,25 @@ def recognize_one(image_bytes: bytes) -> str:
         gc.collect()
 
         if not candidates:
-            return "0"
+            best = "0"
+        else:
+            cnt = Counter(candidates)
 
-        cnt = Counter(candidates)
+            def score(item):
+                text, freq = item
+                bonus = 120 if len(text) == 3 else (25 if len(text) == 2 else 0)
+                return (freq + bonus, len(text))
 
-        def score(item):
-            text, freq = item
-            bonus = 120 if len(text) == 3 else (25 if len(text) == 2 else 0)
-            return (freq + bonus, len(text))
-
-        best = sorted(cnt.items(), key=score, reverse=True)[0][0]
+            best = sorted(cnt.items(), key=score, reverse=True)[0][0]
 
         # === Умный fallback на Gemini ===
-        # Если результат слишком короткий — пробуем Gemini
+        # Если результат короче 3 цифр — пробуем Gemini
         if len(best) < 3 and gemini_model is not None:
             gemini_result = recognize_with_gemini(image_bytes)
-            if len(gemini_result) == 3:
+            if len(gemini_result) >= 3:
+                return gemini_result
+            # Если Gemini тоже короткий, но лучше чем best — берём его
+            if len(gemini_result) > len(best):
                 return gemini_result
 
         return best
