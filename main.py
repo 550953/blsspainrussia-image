@@ -88,6 +88,7 @@ class GeminiKeyPool:
         self.clients: List[Optional[genai.Client]] = []  # lazy-init, см. _client()
         self.blocked: List[float] = []   # monotonic-время, до которого ключ на cooldown
         self.reserved: List[bool] = []   # НОВОЕ: ключ сейчас используется одной задачей
+        self.dead: List[bool] = []       # ключ получил 401/403 — считаем нерабочим навсегда
         self.blackout_until: float = 0.0
         self.rr_index: int = 0
         # Важно: acquire()/release() вызываются только из корутин, которые
@@ -110,6 +111,7 @@ class GeminiKeyPool:
         self.clients = [None] * len(keys)
         self.blocked = [0.0] * len(keys)
         self.reserved = [False] * len(keys)
+        self.dead = [False] * len(keys)
         self.blackout_until = 0.0
         self.rr_index = 0
         print(f"Gemini pool: инициализирован, {len(keys)} ключ(ей)")
@@ -155,21 +157,41 @@ class GeminiKeyPool:
             base = _parse_retry_delay(error_text)
             cooldown = max(self._BLACKOUT_MIN, base * self._BLACKOUT_MULT) + random.uniform(0, self._JITTER_MAX)
             print(f"[gemini_key] {key_name} → 429, cooldown {cooldown:.0f} сек")
-        elif "401" in err_up or "403" in err_up or "UNAUTHENTICATED" in err_up or "API_KEY_INVALID" in err_up:
+        elif "401" in err_up or "403" in err_up or "UNAUTHENTICATED" in err_up or "API_KEY_INVALID" in err_up or "PERMISSION_DENIED" in err_up:
             cooldown = 3600.0
-            print(f"[gemini_key] {key_name} → ошибка авторизации (401/403), cooldown 1ч")
+            self.dead[idx] = True  # ВАЖНО: помечаем отдельно, см. ниже — не даём этому
+            # ключу влиять на расчёт общего blackout наравне с временно занятыми.
+            print(f"[gemini_key] {key_name} → ошибка авторизации (401/403), похоже ключ мёртв, cooldown 1ч")
+        elif "503" in err_up or "UNAVAILABLE" in err_up:
+            # Модель перегружена НА СТОРОНЕ GOOGLE — это не проблема конкретного
+            # ключа, поэтому cooldown короче, чем для прочих ошибок: ключ скорее
+            # всего рабочий, просто сейчас не повезло с моделью/таймингом.
+            cooldown = 10.0 + random.uniform(0, self._JITTER_MAX)
+            print(f"[gemini_key] {key_name} → 503 (модель перегружена), cooldown {cooldown:.0f} сек")
         else:
             cooldown = 15.0
             print(f"[gemini_key] {key_name} → прочая ошибка, cooldown 15 сек: {error_text[:200]}")
 
         self.blocked[idx] = time.monotonic() + cooldown
         now = time.monotonic()
-        if all(now < t for t in self.blocked):
-            new_blackout = max(self.blocked)
-            if new_blackout > self.blackout_until:
-                self.blackout_until = new_blackout
-                wait = self.blackout_until - now
-                print(f"[gemini_key] ВСЕ ключи заняты → blackout {wait:.0f} сек")
+
+        # --- ИСПРАВЛЕНО: раньше здесь стоял max(self.blocked) — это брало
+        # САМЫЙ ДОЛГИЙ cooldown среди ВСЕХ ключей (включая мёртвые с 1-часовым
+        # cooldown) и делало blackout на час, хотя живые ключи освобождались
+        # уже через 15-30 сек. Правильно — min(): момент, когда освободится
+        # БЛИЖАЙШИЙ ключ. Дополнительно исключаем заведомо мёртвые (401/403)
+        # ключи из этого расчёта — они не должны участвовать ни в "все ли
+        # заняты", ни тем более задавать длительность blackout.
+        live_idx = [i for i in range(len(self.keys)) if not self.dead[i]]
+        check_idx = live_idx if live_idx else list(range(len(self.keys)))  # если все мертвы — уже без разницы
+
+        if all(now < self.blocked[i] for i in check_idx):
+            soonest = min(self.blocked[i] for i in check_idx)
+            if soonest > self.blackout_until:
+                self.blackout_until = soonest
+                wait = soonest - now
+                label = "живые " if live_idx else ""
+                print(f"[gemini_key] ВСЕ {label}ключи заняты → blackout {wait:.0f} сек (ближайшее освобождение)")
 
 
 gemini_pool = GeminiKeyPool()
@@ -182,7 +204,14 @@ GEMINI_KEYS = gemini_pool.keys  # для обратной совместимос
 # проверка всё равно ничего не стоила (GenerativeModel() — локальный
 # конструктор без сетевого вызова), а в новом SDK бесплатной проверки без
 # реального запроса нет. Если понадобится сменить модель — через env.
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-flash-latest")
+#
+# ВАЖНО: "gemini-flash-latest" по вашим логам массово отдаёт 503 UNAVAILABLE
+# ("high demand") — это перегрузка модели на стороне Google, не проблема
+# ключей. Ваш же диагностический скрипт (key_diag.py) подтвердил, что
+# "gemini-3.1-flash-lite" отвечает без единой ошибки на 15 из 18 ключей —
+# переключаю дефолт на неё. Смените через переменную окружения GEMINI_MODEL,
+# если понадобится другая.
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.1-flash-lite")
 gemini_model_name = GEMINI_MODEL if GEMINI_KEYS else None
 print(f"Gemini ключей найдено: {len(GEMINI_KEYS)}, модель: {gemini_model_name}")
 
@@ -581,6 +610,11 @@ async def health():
             gemini_pool.key_names[i]
             for i, busy in enumerate(gemini_pool.reserved)
             if busy
+        ],
+        "gemini_keys_dead": [
+            gemini_pool.key_names[i]
+            for i, dead in enumerate(gemini_pool.dead)
+            if dead
         ],
         "ocr_concurrency": OCR_CONCURRENCY,
         "ocr_max_workers": OCR_MAX_WORKERS,
