@@ -2,11 +2,11 @@ import base64
 import gc
 import os
 from pathlib import Path
-from typing import List, Union
+from typing import List, Union, Optional
 from collections import Counter
 
 import ddddocr
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 import numpy as np
@@ -14,7 +14,7 @@ import cv2
 import uvicorn
 import google.generativeai as genai
 
-app = FastAPI(title="Digit OCR Service", version="2.5")
+app = FastAPI(title="Digit OCR Service", version="2.6")
 
 ocr_dddd = ddddocr.DdddOcr(show_ad=False)
 
@@ -23,7 +23,6 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 gemini_model = None
 gemini_model_name = None
 
-# Твои модели в порядке приоритета
 GEMINI_MODELS = [
     "gemini-3.1-flash-lite",
     "gemini-flash-latest",
@@ -58,7 +57,7 @@ class OCRRequest(BaseModel):
 
 class OCRResultItem(BaseModel):
     text: str
-    source: str  # "ddddocr" или "gemini"
+    source: str
 
 
 class OCRResponse(BaseModel):
@@ -179,15 +178,14 @@ def recognize_with_gemini(image_bytes: bytes) -> str:
         return "0"
 
 
-def recognize_one(image_bytes: bytes) -> dict:
+def recognize_dddd(image_bytes: bytes) -> str:
     try:
         nparr = np.frombuffer(image_bytes, np.uint8)
         img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
 
         if img is None:
             res = ocr_dddd.classification(image_bytes)
-            text = "".join(c for c in res if c.isdigit()) or "0"
-            return {"text": text, "source": "ddddocr"}
+            return "".join(c for c in res if c.isdigit()) or "0"
 
         candidates = []
 
@@ -209,33 +207,54 @@ def recognize_one(image_bytes: bytes) -> dict:
         gc.collect()
 
         if not candidates:
-            best = "0"
-        else:
-            cnt = Counter(candidates)
+            return "0"
 
-            def score(item):
-                text, freq = item
-                bonus = 120 if len(text) == 3 else (25 if len(text) == 2 else 0)
-                return (freq + bonus, len(text))
+        cnt = Counter(candidates)
 
-            best = sorted(cnt.items(), key=score, reverse=True)[0][0]
+        def score(item):
+            text, freq = item
+            bonus = 120 if len(text) == 3 else (25 if len(text) == 2 else 0)
+            return (freq + bonus, len(text))
 
-        # Fallback на Gemini
-        if len(best) < 3 and gemini_model is not None:
-            gemini_result = recognize_with_gemini(image_bytes)
-            if len(gemini_result) >= 3:
-                return {"text": gemini_result, "source": "gemini"}
-            if len(gemini_result) > len(best):
-                return {"text": gemini_result, "source": "gemini"}
-
-        return {"text": best, "source": "ddddocr"}
+        return sorted(cnt.items(), key=score, reverse=True)[0][0]
 
     except Exception as e:
-        return {"text": f"ERROR:{str(e)}", "source": "error"}
+        return f"ERROR:{str(e)}"
+
+
+def recognize_one(image_bytes: bytes, mode: str = "combo") -> dict:
+    mode = mode.lower().strip()
+
+    # Только Gemini
+    if mode == "gemini":
+        if gemini_model is None:
+            return {"text": "0", "source": "gemini_unavailable"}
+        result = recognize_with_gemini(image_bytes)
+        return {"text": result, "source": "gemini"}
+
+    # Только ddddocr
+    if mode == "dddd":
+        result = recognize_dddd(image_bytes)
+        return {"text": result, "source": "ddddocr"}
+
+    # Комбо (по умолчанию)
+    dddd_result = recognize_dddd(image_bytes)
+
+    if len(dddd_result) < 3 and gemini_model is not None:
+        gemini_result = recognize_with_gemini(image_bytes)
+        if len(gemini_result) >= 3:
+            return {"text": gemini_result, "source": "gemini"}
+        if len(gemini_result) > len(dddd_result):
+            return {"text": gemini_result, "source": "gemini"}
+
+    return {"text": dddd_result, "source": "ddddocr"}
 
 
 @app.post("/ocr", response_model=OCRResponse)
-async def ocr_endpoint(req: OCRRequest):
+async def ocr_endpoint(
+    req: OCRRequest,
+    mode: Optional[str] = Query("combo", description="combo | gemini | dddd")
+):
     images = req.images if isinstance(req.images, list) else [req.images]
 
     if len(images) > 3:
@@ -243,7 +262,7 @@ async def ocr_endpoint(req: OCRRequest):
 
     results = []
     for b64 in images:
-        result = recognize_one(clean_base64(b64))
+        result = recognize_one(clean_base64(b64), mode=mode)
         results.append(result)
         gc.collect()
 
