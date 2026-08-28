@@ -12,7 +12,7 @@ import numpy as np
 import cv2
 import uvicorn
 
-app = FastAPI(title="Digit OCR Service", version="2.0")
+app = FastAPI(title="Digit OCR Service", version="2.1")
 
 ocr_dddd = ddddocr.DdddOcr(show_ad=False)
 
@@ -35,58 +35,74 @@ def clean_base64(b64: str) -> bytes:
 
 
 def make_variants(img_bgr: np.ndarray) -> list[np.ndarray]:
-    """Более сильный набор вариантов под тонкие цветные цифры"""
     h, w = img_bgr.shape[:2]
     variants = []
 
-    for scale in (4, 6, 7):  # 7x особенно помогает тонким нулям
+    for scale in (5, 7):
         img = cv2.resize(img_bgr, (w * scale, h * scale), interpolation=cv2.INTER_CUBIC)
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
 
-        # 1. Классический Otsu
+        # 1. Otsu
         _, th = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
         variants.append(th)
         variants.append(255 - th)
 
         # 2. Adaptive
         th_a = cv2.adaptiveThreshold(
-            gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 25, 6
+            gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 31, 5
         )
         variants.append(th_a)
         variants.append(255 - th_a)
 
-        # 3. CLAHE
-        clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+        # 3. Сильный CLAHE
+        clahe = cv2.createCLAHE(clipLimit=4.0, tileGridSize=(8, 8))
         enhanced = clahe.apply(gray)
         _, th_c = cv2.threshold(enhanced, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
         variants.append(th_c)
         variants.append(255 - th_c)
 
-        # 4. Unsharp (критично)
-        blur = cv2.GaussianBlur(gray, (0, 0), 1.3)
-        sharp = cv2.addWeighted(gray, 2.0, blur, -1.0, 0)
+        # 4. Unsharp
+        blur = cv2.GaussianBlur(gray, (0, 0), 1.5)
+        sharp = cv2.addWeighted(gray, 2.2, blur, -1.2, 0)
         _, th_s = cv2.threshold(sharp, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
         variants.append(th_s)
         variants.append(255 - th_s)
 
-        # 5. Утолщение после unsharp
+        # 5. Утолщение
         kernel = np.ones((2, 2), np.uint8)
         thick = cv2.dilate(th_s, kernel, iterations=1)
         variants.append(thick)
         variants.append(255 - thick)
 
-        # 6. Ещё сильнее утолщение
         thick2 = cv2.dilate(th_s, kernel, iterations=2)
         variants.append(thick2)
 
-    # Цветовой вариант (LAB)
-    img4 = cv2.resize(img_bgr, (w * 5, h * 5), interpolation=cv2.INTER_CUBIC)
-    lab = cv2.cvtColor(img4, cv2.COLOR_BGR2LAB)
-    l, a, _ = cv2.split(lab)
-    color_enh = cv2.addWeighted(l, 0.5, a, 0.5, 0)
-    _, th_col = cv2.threshold(color_enh, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    variants.append(th_col)
-    variants.append(255 - th_col)
+        # 6. Цветовые варианты (самое важное для 678 и похожих)
+        lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
+        l, a, b = cv2.split(lab)
+
+        # a-канал (зелёно-красный)
+        _, th_a_ch = cv2.threshold(a, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        variants.append(th_a_ch)
+        variants.append(255 - th_a_ch)
+
+        # Комбинация L + a
+        color1 = cv2.addWeighted(l, 0.4, a, 0.6, 0)
+        _, th_col1 = cv2.threshold(color1, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        variants.append(th_col1)
+        variants.append(255 - th_col1)
+
+        # HSV — берём канал S или V
+        hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+        h_ch, s_ch, v_ch = cv2.split(hsv)
+
+        _, th_s_ch = cv2.threshold(s_ch, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        variants.append(th_s_ch)
+        variants.append(255 - th_s_ch)
+
+        _, th_v = cv2.threshold(v_ch, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        variants.append(th_v)
+        variants.append(255 - th_v)
 
     return variants
 
@@ -125,10 +141,10 @@ def recognize_one(image_bytes: bytes) -> str:
 
         cnt = Counter(candidates)
 
-        # Очень сильный приоритет 3-значным числам
+        # Очень сильный приоритет 3-значным
         def score(item):
             text, freq = item
-            bonus = 100 if len(text) == 3 else (20 if len(text) == 2 else 0)
+            bonus = 120 if len(text) == 3 else (25 if len(text) == 2 else 0)
             return (freq + bonus, len(text))
 
         best = sorted(cnt.items(), key=score, reverse=True)[0][0]
