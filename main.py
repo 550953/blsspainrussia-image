@@ -313,6 +313,15 @@ def _next_proxy() -> Optional[str]:
 GEMINI_REST_URL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={key}"
 
 
+class ProxyUnavailable(Exception):
+    """Прокси не смог быть использован (не установлен socksio, обрыв
+    соединения, таймаут подключения и т.п.) — это ошибка КАНАЛА, а не
+    конкретного ключа. Ключ в этом не виноват и не должен уходить в
+    cooldown — иначе один нерабочий прокси-канал может по цепочке
+    остановить весь пул ключей, как это только что произошло на проде."""
+    pass
+
+
 async def _call_gemini_rest(png_bytes: bytes, prompt: str, model: str, api_key: str, proxy_url: Optional[str]) -> str:
     """Прямой REST-вызов к Gemini вместо genai SDK. Позволяет задавать
     прокси НА КАЖДУЮ попытку отдельно (httpx.AsyncClient создаётся заново
@@ -331,8 +340,19 @@ async def _call_gemini_rest(png_bytes: bytes, prompt: str, model: str, api_key: 
     }
     url = GEMINI_REST_URL.format(model=model, key=api_key)
 
-    async with httpx.AsyncClient(proxy=proxy_url, timeout=20.0) as http_client:
-        response = await http_client.post(url, json=payload)
+    try:
+        async with httpx.AsyncClient(proxy=proxy_url, timeout=20.0) as http_client:
+            response = await http_client.post(url, json=payload)
+    except (httpx.ProxyError, httpx.ConnectError, httpx.ConnectTimeout) as e:
+        raise ProxyUnavailable(f"{type(e).__name__}: {e}") from e
+    except Exception as e:
+        # httpx поднимает отсутствие 'socksio' как обычное исключение ДО
+        # попытки соединения — тип не гарантирован между версиями httpx,
+        # поэтому дополнительно матчим по тексту сообщения.
+        msg = str(e).lower()
+        if "socksio" in msg or "unsupported proxy" in msg or "sockshandler" in msg:
+            raise ProxyUnavailable(f"{type(e).__name__}: {e}") from e
+        raise
 
     if response.status_code != 200:
         # Текст ответа отдаём как есть — GeminiKeyPool.release() уже умеет
@@ -576,20 +596,28 @@ async def recognize_with_gemini_async(image_bytes: bytes) -> str:
 
         tried_idx.add(idx)
         proxy_url = _next_proxy()
-        error_text: Optional[str] = None
         try:
             async with _gemini_network_semaphore:
                 text = await _call_gemini_rest(
                     png_bytes, prompt, gemini_model_name, gemini_pool.keys[idx], proxy_url
                 )
+            gemini_pool.release(idx, None)
             digits = "".join(c for c in text if c.isdigit())
             if digits:
                 print(f"[pid={os.getpid()}][gemini_key] OK key={key_name} proxy={proxy_url or 'DIRECT'}")
                 return digits
+        except ProxyUnavailable as e:
+            # Ошибка канала (прокси), не ключа: возвращаем ключ БЕЗ cooldown
+            # и разрешаем попробовать его снова со следующим прокси —
+            # иначе один сломанный прокси-канал вырубит по цепочке весь пул.
+            gemini_pool.release(idx, None)
+            tried_idx.discard(idx)
+            last_error = f"[proxy={proxy_url or 'DIRECT'}] {e}"
+            print(f"[pid={os.getpid()}][gemini_proxy] канал {proxy_url or 'DIRECT'} недоступен: {e}")
+            await asyncio.sleep(GEMINI_ACQUIRE_POLL)
         except Exception as e:
-            error_text = str(e)
+            error_text = f"{type(e).__name__}: {e}" if str(e) else type(e).__name__
             last_error = error_text
-        finally:
             gemini_pool.release(idx, error_text)
 
     if last_error:
