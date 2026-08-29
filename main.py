@@ -1,8 +1,8 @@
 import asyncio
 import base64
 import gc
+import itertools
 import json
-import math
 import os
 import random
 import re
@@ -13,6 +13,7 @@ from typing import List, Union, Optional
 from collections import Counter
 
 import ddddocr
+import httpx
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
@@ -20,13 +21,10 @@ import numpy as np
 import cv2
 import uvicorn
 
-from google import genai
-from google.genai import types
-
 PROCESS_START_TIME = time.time()
 STARTUP_TIMING_FILE = Path("/tmp/startup_timing.json")
 
-app = FastAPI(title="Digit OCR Service", version="4.0")
+app = FastAPI(title="Digit OCR Service", version="4.1")
 
 ocr_dddd = ddddocr.DdddOcr(show_ad=False)
 
@@ -43,6 +41,13 @@ def _parse_retry_delay(err_text: str) -> float:
 
 
 class GeminiKeyPool:
+    """Пул ключей: round-robin + per-key cooldown + глобальный blackout.
+    ИЗМЕНЕНИЕ: класс больше не хранит genai.Client — вызовы теперь идут
+    напрямую через REST (см. _call_gemini_rest), потому что прокси нужно
+    прокидывать НА КАЖДУЮ попытку отдельно, а SDK берёт прокси только из
+    env-переменных в момент создания клиента (гонка при параллельных
+    корутинах в event loop)."""
+
     _BLACKOUT_MULT = 1.0
     _BLACKOUT_MIN = 30.0
     _JITTER_MAX = 3.0
@@ -50,7 +55,6 @@ class GeminiKeyPool:
     def __init__(self):
         self.keys: List[str] = []
         self.key_names: List[str] = []
-        self.clients: List[Optional[genai.Client]] = []
         self.blocked: List[float] = []
         self.reserved: List[bool] = []
         self.dead: List[bool] = []
@@ -80,7 +84,6 @@ class GeminiKeyPool:
 
         self.keys = keys
         self.key_names = names
-        self.clients = [None] * len(keys)
         self.blocked = [0.0] * len(keys)
         self.reserved = [False] * len(keys)
         self.dead = [False] * len(keys)
@@ -131,20 +134,17 @@ class GeminiKeyPool:
                     names.append(name)
         return keys, names
 
-    def _client(self, idx: int) -> genai.Client:
-        if self.clients[idx] is None:
-            self.clients[idx] = genai.Client(api_key=self.keys[idx])
-        return self.clients[idx]
-
     def is_overloaded(self) -> tuple[bool, float]:
         now = time.monotonic()
         if now < self.blackout_until:
             return True, self.blackout_until - now
         return False, 0.0
 
-    def acquire(self) -> tuple[Optional[int], Optional[str], Optional[genai.Client]]:
+    def acquire(self) -> tuple[Optional[int], Optional[str]]:
+        """Резервирует и возвращает следующий свободный ключ по кругу.
+        (None, None), если свободных сейчас нет."""
         if not self.keys:
-            return None, None, None
+            return None, None
         n = len(self.keys)
         now = time.monotonic()
         for _ in range(n):
@@ -157,8 +157,8 @@ class GeminiKeyPool:
             ):
                 self.reserved[idx] = True
                 self.last_used[idx] = now
-                return idx, self.key_names[idx], self._client(idx)
-        return None, None, None
+                return idx, self.key_names[idx]
+        return None, None
 
     def release(self, idx: int, error_text: Optional[str] = None) -> None:
         self.reserved[idx] = False
@@ -213,6 +213,78 @@ GEMINI_ACQUIRE_POLL = 0.15
 
 GEMINI_CONCURRENT_LIMIT = int(os.getenv("GEMINI_CONCURRENT_LIMIT", "5"))
 _gemini_network_semaphore = asyncio.Semaphore(GEMINI_CONCURRENT_LIMIT)
+
+# ---------------------------------------------------------------------------
+# ИЗМЕНЕНИЕ: прокси-пул для исходящих запросов к Gemini.
+#
+# Причина: сервис хостится на Render. Диагностика показала, что 429 сыпется
+# НЕ из-за реальной нехватки квоты у ключей — на shared outbound IP Render
+# буквально ПЕРВЫЙ запрос почти каждого ключа (включая ни разу не
+# использованные) сразу получает 429. Тот же набор ключей и та же модель
+# на локальном мультипоточном тесте прошли 54/54 картинки без единой
+# ошибки, потому что запросы шли либо с домашнего IP, либо через сторонние
+# прокси — то есть НЕ с адреса из известного датацентр-диапазона Render.
+# (Render сам предупреждает: shared outbound IP используется многими их
+# клиентами одновременно, и если кто-то другой на этом IP словил бан от
+# стороннего сервиса — вы получаете его "по наследству".)
+#
+# GEMINI_PROXIES — список прокси через запятую в переменной окружения:
+#   GEMINI_PROXIES=socks5://user:pass@ip1:port1,http://user:pass@ip2:port2
+# Если не задана — сервис работает как раньше (DIRECT), это осознанный
+# fallback, а не тихая деградация: в /health сразу видно текущий режим.
+# ---------------------------------------------------------------------------
+_raw_proxies = os.getenv("GEMINI_PROXIES", "").strip()
+_configured_proxies: List[str] = [p.strip() for p in _raw_proxies.split(",") if p.strip()] if _raw_proxies else []
+
+# DIRECT добавляем ПОСЛЕДНИМ резервным вариантом, а не первым — именно
+# DIRECT с Render почти гарантированно ловит 429 по диагностике выше.
+GEMINI_PROXIES: List[Optional[str]] = (_configured_proxies + [None]) if _configured_proxies else [None]
+_proxy_cycle = itertools.cycle(range(len(GEMINI_PROXIES)))
+
+print(
+    f"[pid={os.getpid()}] Gemini proxy pool: {len(GEMINI_PROXIES)} канал(ов) "
+    f"({'прокси + DIRECT как fallback' if _configured_proxies else 'ТОЛЬКО DIRECT — GEMINI_PROXIES не задана!'})"
+)
+
+
+def _next_proxy() -> Optional[str]:
+    return GEMINI_PROXIES[next(_proxy_cycle)]
+
+
+GEMINI_REST_URL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={key}"
+
+
+async def _call_gemini_rest(png_bytes: bytes, prompt: str, model: str, api_key: str, proxy_url: Optional[str]) -> str:
+    """Прямой REST-вызов к Gemini вместо genai SDK. Позволяет задавать
+    прокси НА КАЖДУЮ попытку отдельно (httpx.AsyncClient создаётся заново
+    под конкретный proxy_url, без общего мутируемого состояния между
+    параллельными корутинами)."""
+    payload = {
+        "contents": [
+            {
+                "parts": [
+                    {"inline_data": {"mime_type": "image/png", "data": base64.b64encode(png_bytes).decode("utf-8")}},
+                    {"text": prompt},
+                ]
+            }
+        ],
+        "generationConfig": {"temperature": 0.0, "maxOutputTokens": 10},
+    }
+    url = GEMINI_REST_URL.format(model=model, key=api_key)
+
+    async with httpx.AsyncClient(proxy=proxy_url, timeout=20.0) as http_client:
+        response = await http_client.post(url, json=payload)
+
+    if response.status_code != 200:
+        # Текст ответа отдаём как есть — GeminiKeyPool.release() уже умеет
+        # классифицировать 429/401/403/503 по подстрокам внутри него.
+        raise RuntimeError(f"{response.status_code} {response.text}")
+
+    data = response.json()
+    try:
+        return data["candidates"][0]["content"]["parts"][0]["text"].strip()
+    except (KeyError, IndexError):
+        return ""
 
 
 class OCRRequest(BaseModel):
@@ -422,7 +494,6 @@ async def recognize_with_gemini_async(image_bytes: bytes) -> str:
         "Ответь строго только цифрами, ничего больше. "
         "Пример правильного ответа: 678 или 700."
     )
-    config = types.GenerateContentConfig(temperature=0.0, max_output_tokens=10)
 
     n = len(GEMINI_KEYS)
     tried_idx: set[int] = set()
@@ -430,7 +501,7 @@ async def recognize_with_gemini_async(image_bytes: bytes) -> str:
     deadline = time.monotonic() + GEMINI_ACQUIRE_TIMEOUT
 
     while len(tried_idx) < n:
-        idx, key_name, client = gemini_pool.acquire()
+        idx, key_name = gemini_pool.acquire()
 
         if idx is None:
             overloaded, _ = gemini_pool.is_overloaded()
@@ -445,18 +516,16 @@ async def recognize_with_gemini_async(image_bytes: bytes) -> str:
             continue
 
         tried_idx.add(idx)
+        proxy_url = _next_proxy()
         error_text: Optional[str] = None
         try:
             async with _gemini_network_semaphore:
-                response = await client.aio.models.generate_content(
-                    model=gemini_model_name,
-                    contents=[prompt, types.Part.from_bytes(data=png_bytes, mime_type="image/png")],
-                    config=config,
+                text = await _call_gemini_rest(
+                    png_bytes, prompt, gemini_model_name, gemini_pool.keys[idx], proxy_url
                 )
-            text = (response.text or "").strip()
             digits = "".join(c for c in text if c.isdigit())
             if digits:
-                print(f"[pid={os.getpid()}][gemini_key] OK  key={key_name}")
+                print(f"[pid={os.getpid()}][gemini_key] OK key={key_name} proxy={proxy_url or 'DIRECT'}")
                 return digits
         except Exception as e:
             error_text = str(e)
@@ -569,6 +638,8 @@ async def health():
         "gemini_pool_overloaded": overloaded,
         "gemini_pool_overloaded_seconds_left": round(remaining, 1) if overloaded else 0,
         "gemini_concurrent_limit": GEMINI_CONCURRENT_LIMIT,
+        "gemini_proxy_channels": len(GEMINI_PROXIES),
+        "gemini_proxy_mode": "proxied+direct_fallback" if _configured_proxies else "direct_only",
         "gemini_keys_on_cooldown": [
             gemini_pool.key_names[i]
             for i, t in enumerate(gemini_pool.blocked)
