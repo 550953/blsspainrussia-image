@@ -20,22 +20,6 @@ import numpy as np
 import cv2
 import uvicorn
 
-# --- ИЗМЕНЕНИЕ 1: google-genai вместо google.generativeai --------------------
-# Старый google.generativeai держит текущий API-ключ в ГЛОБАЛЬНОМ состоянии
-# модуля (genai.configure()). Это и есть причина проблем 2 и 3:
-#   - параллельные запросы физически невозможны без гонки ключей, поэтому
-#     вызов был обёрнут в один общий Lock -> вся Gemini-обработка де-факто
-#     последовательна, сколько бы ключей ни было в пуле;
-#   - т.к. запросы шли быстро друг за другом без паузы, весь пул из N ключей
-#     упирался в rate limit (RPM) за первые секунды, и все уходили в cooldown
-#     почти синхронно.
-# google-genai (пакет "google-genai", импорт "from google import genai")
-# хранит ключ в экземпляре genai.Client(api_key=...) — ключ живёт в объекте,
-# не в модуле. Это даёт: (а) настоящую параллельность без блокировок,
-# (б) нативный async через client.aio.models.generate_content — не нужен
-# ThreadPoolExecutor для самого сетевого вызова.
-# pip install google-genai  (google-generativeai можно оставить закоммитированным
-# в requirements, но лучше убрать во избежание путаницы двух SDK).
 from google import genai
 from google.genai import types
 
@@ -46,29 +30,10 @@ app = FastAPI(title="Digit OCR Service", version="4.0")
 
 ocr_dddd = ddddocr.DdddOcr(show_ad=False)
 
-# --- ИЗМЕНЕНИЕ 2: пул потоков для CPU-bound работы ---------------------------
-# ddddocr.classification() и cv2-препроцессинг — синхронные блокирующие вызовы.
-# Чтобы не блокировать event loop и не сериализовать обработку картинок,
-# выполняем их в отдельных потоках через run_in_executor. Размер пула — не
-# про Gemini-ключи (там своя параллельность через клиенты), а про то, сколько
-# картинок одновременно можно грузить на CPU (ocr_dddd основан на onnxruntime,
-# сессии потокобезопасны для одновременных Run()).
 OCR_MAX_WORKERS = int(os.getenv("OCR_MAX_WORKERS", "8"))
 EXECUTOR = ThreadPoolExecutor(max_workers=OCR_MAX_WORKERS, thread_name_prefix="ocr-worker")
 
 
-# ---------------------------------------------------------------------------
-# Пул Gemini-ключей: round-robin + per-key cooldown + глобальный blackout —
-# логика 1:1 перенесена из vk-pet-care-assistant-zoo-mentor (key_pool.py /
-# llm.py). Отличие от той реализации: там честно стоит asyncio.Semaphore(1)
-# ("ключи никогда не бьются параллельно" — сознательный выбор для чат-бота
-# с одним диалогом за раз). Здесь вместо глобального семафора — флаг
-# `reserved` НА КАЖДЫЙ КЛЮЧ: пока ключ используется одной задачей, другая
-# параллельная задача его не возьмёт (round-robin пропустит), но КЛЮЧИ
-# работают параллельно друг с другом. Это и даёт настоящее ускорение на
-# 54 картинках при сохранении корректности (один ключ = один запрос
-# одновременно, гонок нет).
-# ---------------------------------------------------------------------------
 _RETRY_DELAY_RE = re.compile(r'retry[_\s\-]?delay[^0-9]*(\d+(?:\.\d+)?)', re.IGNORECASE)
 
 
@@ -79,28 +44,19 @@ def _parse_retry_delay(err_text: str) -> float:
 
 class GeminiKeyPool:
     _BLACKOUT_MULT = 1.0
-    _BLACKOUT_MIN = 30.0  # минимум cooldown при 429, если retry_delay не найден
-    _JITTER_MAX = 3.0     # небольшой разброс, чтобы ключи не освобождались все разом
+    _BLACKOUT_MIN = 30.0
+    _JITTER_MAX = 3.0
 
     def __init__(self):
         self.keys: List[str] = []
         self.key_names: List[str] = []
-        self.clients: List[Optional[genai.Client]] = []  # lazy-init, см. _client()
-        self.blocked: List[float] = []   # monotonic-время, до которого ключ на cooldown
-        self.reserved: List[bool] = []   # НОВОЕ: ключ сейчас используется одной задачей
-        self.dead: List[bool] = []       # ключ получил 401/403 — считаем нерабочим навсегда
-        self.last_used: List[float] = []  # НОВОЕ: monotonic-время последней ВЫДАЧИ ключа —
-        # используется для упреждающего пейсинга в acquire(), а не только реактивного
-        # cooldown после ошибки. Наблюдение из продакшн-логов: у бесплатного тира
-        # квота настолько мала, что ключ ловит 429 уже на ВТОРОМ подряд запросе —
-        # ждать реальной ошибки слишком поздно, разумнее не давать ключ повторно
-        # раньше GEMINI_MIN_INTERVAL_SEC после предыдущей выдачи.
+        self.clients: List[Optional[genai.Client]] = []
+        self.blocked: List[float] = []
+        self.reserved: List[bool] = []
+        self.dead: List[bool] = []
+        self.last_used: List[float] = []
         self.blackout_until: float = 0.0
         self.rr_index: int = 0
-        # Важно: acquire()/release() вызываются только из корутин, которые
-        # выполняются в event loop (не из ThreadPoolExecutor-потоков), а
-        # значит между проверкой и установкой reserved нет await —
-        # asyncio кооперативен, поэтому доп. блокировка (Lock) не нужна.
 
     def init_from_env(self, prefix: str = "GEMINI_API_KEY") -> None:
         seen = set()
@@ -112,6 +68,16 @@ class GeminiKeyPool:
                     seen.add(v)
                     keys.append(v)
                     names.append(name)
+
+        if not keys and os.environ.get("INFISICAL_CLIENT_ID") and os.environ.get("INFISICAL_CLIENT_SECRET"):
+            try:
+                keys, names = self._fetch_keys_from_infisical(prefix)
+                if keys:
+                    print(f"[pid={os.getpid()}] Gemini pool: ключи не найдены в os.environ, "
+                          f"загружено {len(keys)} из Infisical (режим локальной разработки)")
+            except Exception as e:
+                print(f"[pid={os.getpid()}] Gemini pool: не удалось загрузить ключи из Infisical: {e}")
+
         self.keys = keys
         self.key_names = names
         self.clients = [None] * len(keys)
@@ -122,6 +88,48 @@ class GeminiKeyPool:
         self.blackout_until = 0.0
         self.rr_index = 0
         print(f"[pid={os.getpid()}] Gemini pool: инициализирован, {len(keys)} ключ(ей)")
+
+    @staticmethod
+    def _fetch_keys_from_infisical(prefix: str) -> tuple[List[str], List[str]]:
+        import requests as _requests
+
+        client_id = os.environ["INFISICAL_CLIENT_ID"]
+        client_secret = os.environ["INFISICAL_CLIENT_SECRET"]
+        project_id = os.environ["INFISICAL_PROJECT_ID"]
+        environment = os.environ.get("INFISICAL_ENVIRONMENT", "dev")
+
+        token_resp = _requests.post(
+            "https://app.infisical.com/api/v1/auth/universal-auth/login",
+            json={"clientId": client_id, "clientSecret": client_secret},
+            timeout=20,
+        )
+        token_resp.raise_for_status()
+        token = token_resp.json()["accessToken"]
+
+        secrets_resp = _requests.get(
+            "https://app.infisical.com/api/v3/secrets/raw",
+            headers={"Authorization": f"Bearer {token}"},
+            params={
+                "workspaceId": project_id,
+                "environment": environment,
+                "include_imports": "true",
+                "secretPath": "/",
+            },
+            timeout=30,
+        )
+        secrets_resp.raise_for_status()
+        all_secrets = {s["secretKey"]: s["secretValue"] for s in secrets_resp.json().get("secrets", [])}
+
+        seen = set()
+        keys, names = [], []
+        for name, value in sorted(all_secrets.items()):
+            if name.startswith(prefix) and value:
+                v = value.strip()
+                if v and v not in seen:
+                    seen.add(v)
+                    keys.append(v)
+                    names.append(name)
+        return keys, names
 
     def _client(self, idx: int) -> genai.Client:
         if self.clients[idx] is None:
@@ -135,12 +143,6 @@ class GeminiKeyPool:
         return False, 0.0
 
     def acquire(self) -> tuple[Optional[int], Optional[str], Optional[genai.Client]]:
-        """Резервирует и возвращает следующий свободный ключ по кругу.
-        Свободный = не в cooldown, не занят другой задачей И не использовался
-        последние GEMINI_MIN_INTERVAL_SEC секунд (упреждающий пейсинг —
-        не дожидаемся 429, чтобы понять, что квота ключа мала).
-        (None, None, None), если свободных сейчас нет — вызывающий код должен
-        подождать и повторить."""
         if not self.keys:
             return None, None, None
         n = len(self.keys)
@@ -159,8 +161,6 @@ class GeminiKeyPool:
         return None, None, None
 
     def release(self, idx: int, error_text: Optional[str] = None) -> None:
-        """Освобождает ключ. Если была ошибка — выставляет cooldown по типу
-        ошибки (та же классификация, что в llm.py: 429 / 401-403 / прочее)."""
         self.reserved[idx] = False
         if error_text is None:
             return
@@ -174,13 +174,9 @@ class GeminiKeyPool:
             print(f"[pid={os.getpid()}][gemini_key] {key_name} → 429, cooldown {cooldown:.0f} сек")
         elif "401" in err_up or "403" in err_up or "UNAUTHENTICATED" in err_up or "API_KEY_INVALID" in err_up or "PERMISSION_DENIED" in err_up:
             cooldown = 3600.0
-            self.dead[idx] = True  # ВАЖНО: помечаем отдельно, см. ниже — не даём этому
-            # ключу влиять на расчёт общего blackout наравне с временно занятыми.
+            self.dead[idx] = True
             print(f"[pid={os.getpid()}][gemini_key] {key_name} → ошибка авторизации (401/403), похоже ключ мёртв, cooldown 1ч")
         elif "503" in err_up or "UNAVAILABLE" in err_up:
-            # Модель перегружена НА СТОРОНЕ GOOGLE — это не проблема конкретного
-            # ключа, поэтому cooldown короче, чем для прочих ошибок: ключ скорее
-            # всего рабочий, просто сейчас не повезло с моделью/таймингом.
             cooldown = 10.0 + random.uniform(0, self._JITTER_MAX)
             print(f"[pid={os.getpid()}][gemini_key] {key_name} → 503 (модель перегружена), cooldown {cooldown:.0f} сек")
         else:
@@ -190,15 +186,8 @@ class GeminiKeyPool:
         self.blocked[idx] = time.monotonic() + cooldown
         now = time.monotonic()
 
-        # --- ИСПРАВЛЕНО: раньше здесь стоял max(self.blocked) — это брало
-        # САМЫЙ ДОЛГИЙ cooldown среди ВСЕХ ключей (включая мёртвые с 1-часовым
-        # cooldown) и делало blackout на час, хотя живые ключи освобождались
-        # уже через 15-30 сек. Правильно — min(): момент, когда освободится
-        # БЛИЖАЙШИЙ ключ. Дополнительно исключаем заведомо мёртвые (401/403)
-        # ключи из этого расчёта — они не должны участвовать ни в "все ли
-        # заняты", ни тем более задавать длительность blackout.
         live_idx = [i for i in range(len(self.keys)) if not self.dead[i]]
-        check_idx = live_idx if live_idx else list(range(len(self.keys)))  # если все мертвы — уже без разницы
+        check_idx = live_idx if live_idx else list(range(len(self.keys)))
 
         if all(now < self.blocked[i] for i in check_idx):
             soonest = min(self.blocked[i] for i in check_idx)
@@ -212,33 +201,18 @@ class GeminiKeyPool:
 gemini_pool = GeminiKeyPool()
 gemini_pool.init_from_env()
 
-GEMINI_KEYS = gemini_pool.keys  # для обратной совместимости (проверки "if GEMINI_KEYS")
+GEMINI_KEYS = gemini_pool.keys
 
-# Модель — фиксированная константа, как в проверенной реализации (llm.py),
-# а не "проверка какая модель доступна" при старте: в старом коде эта
-# проверка всё равно ничего не стоила (GenerativeModel() — локальный
-# конструктор без сетевого вызова), а в новом SDK бесплатной проверки без
-# реального запроса нет. Если понадобится сменить модель — через env.
-#
-# ВАЖНО: "gemini-flash-latest" по вашим логам массово отдаёт 503 UNAVAILABLE
-# ("high demand") — это перегрузка модели на стороне Google, не проблема
-# ключей. Ваш же диагностический скрипт (key_diag.py) подтвердил, что
-# "gemini-3.1-flash-lite" отвечает без единой ошибки на 15 из 18 ключей —
-# переключаю дефолт на неё. Смените через переменную окружения GEMINI_MODEL,
-# если понадобится другая.
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.1-flash-lite")
 gemini_model_name = GEMINI_MODEL if GEMINI_KEYS else None
 print(f"[pid={os.getpid()}] Gemini ключей найдено: {len(GEMINI_KEYS)}, модель: {gemini_model_name}")
 
-# --- ИЗМЕНЕНИЕ: упреждающий пейсинг ключа + больше терпения при ожидании ---
-# По логам: свободный тир текущей модели даёт квоту ~1 запрос за GEMINI_MIN_INTERVAL_SEC
-# секунд НА КЛЮЧ — второй подряд запрос почти гарантированно ловит 429 с
-# retry_delay ~30 сек. GEMINI_MIN_INTERVAL_SEC не даёт ключу уйти в реальный 429
-# заранее. GEMINI_ACQUIRE_TIMEOUT увеличен с 8 до 40 сек — раньше задачи сдавались
-# в ddddocr fallback быстрее, чем успевал освободиться хоть один ключ (30+ сек).
-GEMINI_MIN_INTERVAL_SEC = float(os.getenv("GEMINI_MIN_INTERVAL_SEC", "34.0"))
+GEMINI_MIN_INTERVAL_SEC = float(os.getenv("GEMINI_MIN_INTERVAL_SEC", "8.0"))
 GEMINI_ACQUIRE_TIMEOUT = float(os.getenv("GEMINI_ACQUIRE_TIMEOUT", "40.0"))
 GEMINI_ACQUIRE_POLL = 0.15
+
+GEMINI_CONCURRENT_LIMIT = int(os.getenv("GEMINI_CONCURRENT_LIMIT", "5"))
+_gemini_network_semaphore = asyncio.Semaphore(GEMINI_CONCURRENT_LIMIT)
 
 
 class OCRRequest(BaseModel):
@@ -263,10 +237,6 @@ def clean_base64(b64: str) -> bytes:
         raise HTTPException(status_code=400, detail=f"Invalid base64: {e}")
 
 
-# ---------------------------------------------------------------------------
-# TIER 1 / TIER 2 препроцессинг и recognize_dddd — БЕЗ ИЗМЕНЕНИЙ (исходная
-# логика сохранена полностью, только вызываются теперь через executor).
-# ---------------------------------------------------------------------------
 def make_variants_fast(img_bgr: np.ndarray, scale: int = 4) -> list[np.ndarray]:
     h, w = img_bgr.shape[:2]
     img = cv2.resize(img_bgr, (w * scale, h * scale), interpolation=cv2.INTER_LINEAR)
@@ -376,7 +346,6 @@ def _score(item):
 
 
 def recognize_dddd(image_bytes: bytes) -> str:
-    """Синхронная, CPU-bound. Вызывается через EXECUTOR.submit / run_in_executor."""
     try:
         nparr = np.frombuffer(image_bytes, np.uint8)
         img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
@@ -426,23 +395,10 @@ def recognize_dddd(image_bytes: bytes) -> str:
         return sorted(cnt_full.items(), key=_score, reverse=True)[0][0]
 
     except Exception as e:
-        # ИСПРАВЛЕНО: раньше здесь возвращался текст ошибки ("ERROR:...") как
-        # будто это распознанный номер — а вызывающий код (recognize_one_async)
-        # проверяет только `!= "0"`, так что мусор из except принимался как
-        # валидный fallback-результат (см. картинку 01 в тесте пользователя:
-        # "ERROR:OCR识别失败..." попала в ответ API как text). Логируем причину
-        # на сервере, а наружу отдаём тот же "0", что и при обычном "не смогли
-        # распознать" — единый контракт для вызывающей стороны.
         print(f"[pid={os.getpid()}][dddd] Ошибка распознавания: {e}")
         return "0"
 
 
-# ---------------------------------------------------------------------------
-# ИЗМЕНЕНИЕ 4: recognize_with_gemini теперь async и использует
-# client.aio.models.generate_content — нативный неблокирующий вызов SDK,
-# без ThreadPoolExecutor. Параллельность обеспечивается тем, что несколько
-# таких корутин могут одновременно ждать сетевой ответ на РАЗНЫХ ключах.
-# ---------------------------------------------------------------------------
 async def recognize_with_gemini_async(image_bytes: bytes) -> str:
     if not GEMINI_KEYS or gemini_model_name is None:
         return "0"
@@ -477,7 +433,6 @@ async def recognize_with_gemini_async(image_bytes: bytes) -> str:
         idx, key_name, client = gemini_pool.acquire()
 
         if idx is None:
-            # Все ключи либо заняты другой задачей, либо на cooldown.
             overloaded, _ = gemini_pool.is_overloaded()
             if overloaded or time.monotonic() > deadline:
                 break
@@ -485,8 +440,6 @@ async def recognize_with_gemini_async(image_bytes: bytes) -> str:
             continue
 
         if idx in tried_idx:
-            # Уже пробовали этот ключ в рамках текущей картинки — вернули его
-            # в оборот раньше времени, отпускаем и просим следующий круг.
             gemini_pool.release(idx)
             await asyncio.sleep(GEMINI_ACQUIRE_POLL)
             continue
@@ -494,11 +447,12 @@ async def recognize_with_gemini_async(image_bytes: bytes) -> str:
         tried_idx.add(idx)
         error_text: Optional[str] = None
         try:
-            response = await client.aio.models.generate_content(
-                model=gemini_model_name,
-                contents=[prompt, types.Part.from_bytes(data=png_bytes, mime_type="image/png")],
-                config=config,
-            )
+            async with _gemini_network_semaphore:
+                response = await client.aio.models.generate_content(
+                    model=gemini_model_name,
+                    contents=[prompt, types.Part.from_bytes(data=png_bytes, mime_type="image/png")],
+                    config=config,
+                )
             text = (response.text or "").strip()
             digits = "".join(c for c in text if c.isdigit())
             if digits:
@@ -516,7 +470,6 @@ async def recognize_with_gemini_async(image_bytes: bytes) -> str:
 
 
 def recognize_one_sync_part(image_bytes: bytes) -> str:
-    """Обёртка вокруг recognize_dddd для единообразного вызова через executor."""
     return recognize_dddd(image_bytes)
 
 
@@ -538,7 +491,6 @@ async def recognize_one_async(image_bytes: bytes, mode: str = "combo") -> dict:
         result = await loop.run_in_executor(EXECUTOR, recognize_one_sync_part, image_bytes)
         return {"text": result, "source": "ddddocr"}
 
-    # combo (по умолчанию) — та же логика, что была в исходном recognize_one
     dddd_result = await loop.run_in_executor(EXECUTOR, recognize_one_sync_part, image_bytes)
 
     if len(dddd_result) < 3 and GEMINI_KEYS:
@@ -551,12 +503,7 @@ async def recognize_one_async(image_bytes: bytes, mode: str = "combo") -> dict:
     return {"text": dddd_result, "source": "ddddocr"}
 
 
-# --- ИЗМЕНЕНИЕ 5: общий помощник параллельной batch-обработки ---------------
-# OCR_CONCURRENCY — сколько картинок обрабатывается одновременно суммарно
-# (и Gemini, и ddddocr-фоллбэки). Не привязан к числу ключей напрямую:
-# задачи сверх числа свободных ключей просто дождутся своего в acquire().
-# Разумный старт — среднее между "числом ключей" и "числом воркеров CPU".
-OCR_CONCURRENCY = int(os.getenv("OCR_CONCURRENCY", str(max(6, len(GEMINI_KEYS) * 2, OCR_MAX_WORKERS))))
+OCR_CONCURRENCY = int(os.getenv("OCR_CONCURRENCY", str(max(6, len(GEMINI_KEYS), OCR_MAX_WORKERS))))
 
 
 async def process_images_concurrently(images_b64: List[str], mode: str) -> List[dict]:
@@ -576,11 +523,6 @@ async def ocr_endpoint(
     req: OCRRequest,
     mode: Optional[str] = Query("combo", description="combo | gemini | dddd")
 ):
-    """Старый лимит в 3 картинки снят: он был нужен, только пока обработка
-    была строго последовательной с общим Gemini-локом. Теперь и одиночные,
-    и множественные запросы идут через один и тот же параллельный пайплайн.
-    Для действительно больших пачек используйте /ocr/batch — эндпоинты
-    идентичны по сути, /ocr/batch просто явное имя без implicit-лимита."""
     images = req.images if isinstance(req.images, list) else [req.images]
 
     if len(images) > 200:
@@ -595,9 +537,6 @@ async def ocr_batch_endpoint(
     req: OCRRequest,
     mode: Optional[str] = Query("combo", description="combo | gemini | dddd")
 ):
-    """Массовая обработка: список base64-картинок, параллельно, с бережным
-    использованием пула Gemini-ключей (round-robin + резервирование +
-    per-key cooldown) и CPU-пула для ddddocr-фоллбэка."""
     images = req.images if isinstance(req.images, list) else [req.images]
 
     if not images:
@@ -629,6 +568,7 @@ async def health():
         "gemini_model": gemini_model_name,
         "gemini_pool_overloaded": overloaded,
         "gemini_pool_overloaded_seconds_left": round(remaining, 1) if overloaded else 0,
+        "gemini_concurrent_limit": GEMINI_CONCURRENT_LIMIT,
         "gemini_keys_on_cooldown": [
             gemini_pool.key_names[i]
             for i, t in enumerate(gemini_pool.blocked)
