@@ -233,8 +233,67 @@ _gemini_network_semaphore = asyncio.Semaphore(GEMINI_CONCURRENT_LIMIT)
 # Если не задана — сервис работает как раньше (DIRECT), это осознанный
 # fallback, а не тихая деградация: в /health сразу видно текущий режим.
 # ---------------------------------------------------------------------------
-_raw_proxies = os.getenv("GEMINI_PROXIES", "").strip()
-_configured_proxies: List[str] = [p.strip() for p in _raw_proxies.split(",") if p.strip()] if _raw_proxies else []
+def _fetch_proxies_from_infisical(prefix: str = "PROXY_URL") -> List[str]:
+    """Тот же поход в Infisical, что и для GEMINI_API_KEY_* (см.
+    GeminiKeyPool._fetch_keys_from_infisical), но за прокси. Так секреты
+    (PROXY_URL_HTTPS1, PROXY_URL_US1, ...) можно держать только в Infisical,
+    не дублируя их вручную в Render env — используются те же
+    INFISICAL_CLIENT_ID/SECRET, что уже заведены для ключей."""
+    import requests as _requests
+
+    client_id = os.environ["INFISICAL_CLIENT_ID"]
+    client_secret = os.environ["INFISICAL_CLIENT_SECRET"]
+    project_id = os.environ.get("INFISICAL_PROJECT_ID", "555e71be-4c53-4b3e-9409-0d9838aea8b6")
+    environment = os.environ.get("INFISICAL_ENVIRONMENT", "dev")
+
+    token_resp = _requests.post(
+        "https://app.infisical.com/api/v1/auth/universal-auth/login",
+        json={"clientId": client_id, "clientSecret": client_secret},
+        timeout=20,
+    )
+    token_resp.raise_for_status()
+    token = token_resp.json()["accessToken"]
+
+    secrets_resp = _requests.get(
+        "https://app.infisical.com/api/v3/secrets/raw",
+        headers={"Authorization": f"Bearer {token}"},
+        params={
+            "workspaceId": project_id,
+            "environment": environment,
+            "include_imports": "true",
+            "secretPath": "/",
+        },
+        timeout=30,
+    )
+    secrets_resp.raise_for_status()
+    all_secrets = {s["secretKey"]: s["secretValue"] for s in secrets_resp.json().get("secrets", [])}
+
+    proxy_items = sorted((k, v) for k, v in all_secrets.items() if k.startswith(prefix) and v)
+    return [v.strip() for _, v in proxy_items if v.strip()]
+
+
+def _load_gemini_proxies() -> tuple[List[str], str]:
+    """Источник №1 — переменная окружения GEMINI_PROXIES (список через
+    запятую, без похода в сеть, для случая когда прокси хочется задать
+    прямо в Render). Источник №2 (fallback) — секреты PROXY_URL_* из
+    Infisical, чтобы вообще ничего не дублировать в Render env вручную —
+    ровно та же логика, что уже работает для GEMINI_API_KEY_*."""
+    raw = os.getenv("GEMINI_PROXIES", "").strip()
+    if raw:
+        return [p.strip() for p in raw.split(",") if p.strip()], "env:GEMINI_PROXIES"
+
+    if os.environ.get("INFISICAL_CLIENT_ID") and os.environ.get("INFISICAL_CLIENT_SECRET"):
+        try:
+            proxies = _fetch_proxies_from_infisical("PROXY_URL")
+            if proxies:
+                return proxies, "infisical:PROXY_URL_*"
+        except Exception as e:
+            print(f"[pid={os.getpid()}] Не удалось загрузить прокси из Infisical: {e}")
+
+    return [], "none"
+
+
+_configured_proxies, _proxy_source = _load_gemini_proxies()
 
 # DIRECT добавляем ПОСЛЕДНИМ резервным вариантом, а не первым — именно
 # DIRECT с Render почти гарантированно ловит 429 по диагностике выше.
@@ -242,8 +301,8 @@ GEMINI_PROXIES: List[Optional[str]] = (_configured_proxies + [None]) if _configu
 _proxy_cycle = itertools.cycle(range(len(GEMINI_PROXIES)))
 
 print(
-    f"[pid={os.getpid()}] Gemini proxy pool: {len(GEMINI_PROXIES)} канал(ов) "
-    f"({'прокси + DIRECT как fallback' if _configured_proxies else 'ТОЛЬКО DIRECT — GEMINI_PROXIES не задана!'})"
+    f"[pid={os.getpid()}] Gemini proxy pool: {len(GEMINI_PROXIES)} канал(ов), источник: {_proxy_source} "
+    f"({'прокси + DIRECT как fallback' if _configured_proxies else 'ТОЛЬКО DIRECT!'})"
 )
 
 
@@ -640,6 +699,7 @@ async def health():
         "gemini_concurrent_limit": GEMINI_CONCURRENT_LIMIT,
         "gemini_proxy_channels": len(GEMINI_PROXIES),
         "gemini_proxy_mode": "proxied+direct_fallback" if _configured_proxies else "direct_only",
+        "gemini_proxy_source": _proxy_source,
         "gemini_keys_on_cooldown": [
             gemini_pool.key_names[i]
             for i, t in enumerate(gemini_pool.blocked)
