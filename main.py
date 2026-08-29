@@ -11,6 +11,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import List, Union, Optional
 from collections import Counter
+from urllib.parse import urlsplit
 
 import ddddocr
 import httpx
@@ -307,6 +308,84 @@ def _next_proxy() -> Optional[str]:
     return GEMINI_PROXIES[next(_proxy_cycle)]
 
 
+def _proxy_label(proxy_url: Optional[str]) -> str:
+    """Безопасное имя канала для логов: никогда не печатаем user/password."""
+    if not proxy_url:
+        return "DIRECT"
+    try:
+        parsed = urlsplit(proxy_url)
+        host = parsed.hostname or "unknown-host"
+        port = f":{parsed.port}" if parsed.port else ""
+        return f"{parsed.scheme or 'proxy'}://{host}{port}"
+    except Exception:
+        return "PROXY"
+
+
+class GeminiSmartProxyPool:
+    """Direct-first канал с автоматическим cooldown нерабочих маршрутов.
+
+    DIRECT используется первым. Если Gemini начинает отдавать ошибки на
+    прямом IP или сам маршрут рвётся, канал временно уходит в cooldown и
+    выбирается следующий proxy из Infisical. После успешного запроса канал
+    снова становится рабочим.
+    """
+
+    def __init__(self, configured: List[str]):
+        unique: List[Optional[str]] = []
+        seen = set()
+        for route in [None, *configured]:
+            if route not in seen:
+                seen.add(route)
+                unique.append(route)
+        self.routes = unique
+        self.cooldown_until = {route: 0.0 for route in self.routes}
+        self.failures = {route: 0 for route in self.routes}
+        self.cursor = 0
+
+    def next(self) -> Optional[str]:
+        now = time.monotonic()
+        count = len(self.routes)
+        for offset in range(count):
+            route = self.routes[(self.cursor + offset) % count]
+            if now >= self.cooldown_until[route]:
+                self.cursor = (self.cursor + offset + 1) % count
+                return route
+
+        # Все каналы временно охлаждаются: выбираем тот, который освободится
+        # раньше, не создавая дополнительную паузу внутри запроса.
+        route = min(self.routes, key=lambda item: self.cooldown_until[item])
+        self.cursor = (self.routes.index(route) + 1) % count
+        return route
+
+    def mark_ok(self, route: Optional[str]) -> None:
+        self.failures[route] = 0
+        self.cooldown_until[route] = 0.0
+
+    def mark_failed(self, route: Optional[str], error_text: object) -> None:
+        self.failures[route] += 1
+        error_string = str(error_text)
+        upper = error_string.upper()
+        if isinstance(route, type(None)):
+            base = 30.0 if "429" in upper or "QUOTA" in upper else 8.0
+        elif "429" in upper or "QUOTA" in upper:
+            base = 20.0
+        elif isinstance(error_text, ProxyUnavailable):
+            base = 8.0
+        else:
+            base = 5.0
+
+        cooldown = min(120.0, base * (2 ** min(self.failures[route] - 1, 3)))
+        cooldown += random.uniform(0.0, 2.0)
+        self.cooldown_until[route] = time.monotonic() + cooldown
+        print(
+            f"[pid={os.getpid()}][gemini_proxy] {_proxy_label(route)} "
+            f"cooldown {cooldown:.1f} сек"
+        )
+
+
+smart_proxy_pool = GeminiSmartProxyPool(_configured_proxies)
+
+
 GEMINI_REST_URL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={key}"
 
 
@@ -338,7 +417,14 @@ def _get_http_client(proxy_url: Optional[str]) -> httpx.AsyncClient:
     return client
 
 
-async def _call_gemini_rest(png_bytes: bytes, prompt: str, model: str, api_key: str, proxy_url: Optional[str]) -> str:
+async def _call_gemini_rest(
+    png_bytes: bytes,
+    prompt: str,
+    model: str,
+    api_key: str,
+    proxy_url: Optional[str],
+    generation_config: Optional[dict] = None,
+) -> str:
     """Прямой REST-вызов к Gemini вместо genai SDK — прокси задаётся на
     каждую попытку отдельно через переиспользуемый клиент (см. выше)."""
     payload = {
@@ -350,7 +436,11 @@ async def _call_gemini_rest(png_bytes: bytes, prompt: str, model: str, api_key: 
                 ]
             }
         ],
-        "generationConfig": {"temperature": 0.0, "maxOutputTokens": 10},
+        "generationConfig": {
+            "temperature": 0.0,
+            "maxOutputTokens": 10,
+            **(generation_config or {}),
+        },
     }
     url = GEMINI_REST_URL.format(model=model, key=api_key)
     http_client = _get_http_client(proxy_url)
@@ -389,10 +479,12 @@ class OCRResponse(BaseModel):
 
 
 def clean_base64(b64: str) -> bytes:
+    b64 = b64.strip().strip("\"'")
     if b64.startswith("data:image"):
         b64 = b64.split(",", 1)[1]
+    b64 = re.sub(r"\s+", "", b64)
     try:
-        return base64.b64decode(b64)
+        return base64.b64decode(b64, validate=True)
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Invalid base64: {e}")
 
@@ -614,13 +706,13 @@ async def recognize_with_gemini_async(image_bytes: bytes) -> str:
             gemini_pool.release(idx, None)
             digits = "".join(c for c in text if c.isdigit())
             if digits:
-                print(f"[pid={os.getpid()}][gemini_key] OK key={key_name} proxy={proxy_url or 'DIRECT'}")
+                print(f"[pid={os.getpid()}][gemini_key] OK key={key_name} proxy={_proxy_label(proxy_url)}")
                 return digits
         except ProxyUnavailable as e:
             gemini_pool.release(idx, None)
             tried_idx.discard(idx)
             last_error = f"[proxy={proxy_url or 'DIRECT'}] {e}"
-            print(f"[pid={os.getpid()}][gemini_proxy] канал {proxy_url or 'DIRECT'} недоступен: {e}")
+            print(f"[pid={os.getpid()}][gemini_proxy] канал {_proxy_label(proxy_url)} недоступен: {e}")
             await asyncio.sleep(GEMINI_ACQUIRE_POLL)
         except Exception as e:
             error_text = f"{type(e).__name__}: {e}" if str(e) else type(e).__name__
@@ -630,6 +722,216 @@ async def recognize_with_gemini_async(image_bytes: bytes) -> str:
     if last_error:
         print(f"Gemini error (перебор завершён, попыток={len(tried_idx)}): {last_error}")
     return "0"
+
+
+GEMINI_SHEET_MAX_IMAGES = int(os.getenv("GEMINI_SHEET_MAX_IMAGES", "100"))
+GEMINI_SHEET_COLS = int(os.getenv("GEMINI_SHEET_COLS", "9"))
+GEMINI_SHEET_CELL_WIDTH = int(os.getenv("GEMINI_SHEET_CELL_WIDTH", "170"))
+GEMINI_SHEET_CELL_HEIGHT = int(os.getenv("GEMINI_SHEET_CELL_HEIGHT", "112"))
+
+
+def make_gemini_contact_sheet(images: List[bytes]) -> bytes:
+    """Собирает все изображения в одну PNG-картинку с ID ячеек."""
+    if not images:
+        raise ValueError("Пустой список изображений")
+    if len(images) > GEMINI_SHEET_MAX_IMAGES:
+        raise ValueError(
+            f"gemini_sheet поддерживает максимум {GEMINI_SHEET_MAX_IMAGES} "
+            f"изображений, получено {len(images)}"
+        )
+
+    cols = max(1, min(GEMINI_SHEET_COLS, len(images)))
+    rows = (len(images) + cols - 1) // cols
+    sheet = np.full(
+        (
+            rows * GEMINI_SHEET_CELL_HEIGHT,
+            cols * GEMINI_SHEET_CELL_WIDTH,
+            3,
+        ),
+        255,
+        dtype=np.uint8,
+    )
+
+    for index, image_bytes in enumerate(images, start=1):
+        encoded = np.frombuffer(image_bytes, np.uint8)
+        image = cv2.imdecode(encoded, cv2.IMREAD_COLOR)
+        if image is None:
+            raise ValueError(f"Не удалось декодировать изображение №{index}")
+
+        max_w = GEMINI_SHEET_CELL_WIDTH - 20
+        max_h = GEMINI_SHEET_CELL_HEIGHT - 30
+        h, w = image.shape[:2]
+        scale = min(max_w / max(w, 1), max_h / max(h, 1), 1.0)
+        if scale != 1.0:
+            image = cv2.resize(
+                image,
+                (max(1, int(w * scale)), max(1, int(h * scale))),
+                interpolation=cv2.INTER_AREA,
+            )
+
+        col = (index - 1) % cols
+        row = (index - 1) // cols
+        left = col * GEMINI_SHEET_CELL_WIDTH
+        top = row * GEMINI_SHEET_CELL_HEIGHT
+        ih, iw = image.shape[:2]
+        x = left + (GEMINI_SHEET_CELL_WIDTH - iw) // 2
+        y = top + 25 + (max_h - ih) // 2
+        sheet[y:y + ih, x:x + iw] = image
+
+        cv2.rectangle(
+            sheet,
+            (left, top),
+            (left + GEMINI_SHEET_CELL_WIDTH - 1, top + GEMINI_SHEET_CELL_HEIGHT - 1),
+            (150, 150, 150),
+            1,
+        )
+        cv2.putText(
+            sheet,
+            f"#{index}",
+            (left + 5, top + 17),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.45,
+            (20, 20, 20),
+            1,
+            cv2.LINE_AA,
+        )
+
+    success, buffer = cv2.imencode(
+        ".png",
+        sheet,
+        [cv2.IMWRITE_PNG_COMPRESSION, 3],
+    )
+    if not success:
+        raise ValueError("Не удалось собрать PNG contact sheet")
+    return buffer.tobytes()
+
+
+GEMINI_SHEET_PROMPT = f"""
+На изображении contact sheet из пронумерованных ячеек.
+В каждой ячейке находится одна картинка с трёхзначным числом.
+Распознай число в каждой ячейке и сопоставь его с номером ячейки.
+
+Верни строго JSON-объект без markdown и пояснений:
+{{"1":"353","2":"872", ... "{GEMINI_SHEET_MAX_IMAGES}":null}}
+
+Правила:
+- верни ключи только для фактически присутствующих ячеек;
+- ключи — строки с номерами ячеек от "1" до последней;
+- значение — строка ровно из трёх цифр;
+- если ячейка не читается, значение null;
+- ничего не переставляй и не придумывай.
+""".strip()
+
+
+def parse_gemini_sheet_result(text: str, count: int) -> List[str]:
+    """Принимает JSON object/list и приводит его к списку результатов."""
+    cleaned = text.strip()
+    if cleaned.startswith("```"):
+        cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"\s*```$", "", cleaned)
+
+    try:
+        data = json.loads(cleaned)
+    except json.JSONDecodeError:
+        start = min(
+            [pos for pos in (cleaned.find("{"), cleaned.find("[")) if pos >= 0],
+            default=-1,
+        )
+        end = max(cleaned.rfind("}"), cleaned.rfind("]"))
+        if start < 0 or end <= start:
+            raise ValueError("Gemini вернул не JSON")
+        data = json.loads(cleaned[start:end + 1])
+
+    if isinstance(data, dict) and isinstance(data.get("results"), list):
+        values = data["results"]
+    elif isinstance(data, dict):
+        values = [data.get(str(index)) for index in range(1, count + 1)]
+    elif isinstance(data, list):
+        values = data
+    else:
+        raise ValueError("Ожидался JSON-объект или JSON-массив")
+
+    result: List[str] = []
+    for value in values[:count]:
+        if value is None:
+            result.append("0")
+            continue
+        digits = "".join(char for char in str(value) if char.isdigit())
+        result.append(digits if len(digits) == 3 else "0")
+    result.extend(["0"] * (count - len(result)))
+    return result
+
+
+async def recognize_gemini_sheet_async(images: List[bytes]) -> List[dict]:
+    """Один Gemini-вызов на весь входной список с direct-first failover."""
+    if not GEMINI_KEYS or gemini_model_name is None:
+        return [{"text": "0", "source": "gemini_sheet_unavailable"} for _ in images]
+
+    try:
+        png_bytes = make_gemini_contact_sheet(images)
+    except ValueError as exc:
+        print(f"[pid={os.getpid()}][gemini_sheet] {exc}")
+        return [{"text": "0", "source": "gemini_sheet_error"} for _ in images]
+
+    max_attempts = max(4, min(24, len(GEMINI_KEYS) * 2 + len(smart_proxy_pool.routes)))
+    attempted_routes: set[tuple[int, Optional[str]]] = set()
+    last_error: Optional[str] = None
+
+    for _ in range(max_attempts):
+        idx, key_name = gemini_pool.acquire()
+        if idx is None:
+            await asyncio.sleep(GEMINI_ACQUIRE_POLL)
+            continue
+
+        proxy_url = smart_proxy_pool.next()
+        route_key = (idx, proxy_url)
+        if route_key in attempted_routes:
+            gemini_pool.release(idx)
+            await asyncio.sleep(GEMINI_ACQUIRE_POLL)
+            continue
+        attempted_routes.add(route_key)
+
+        try:
+            text = await _call_gemini_rest(
+                png_bytes,
+                GEMINI_SHEET_PROMPT.replace(
+                    f'"{GEMINI_SHEET_MAX_IMAGES}"',
+                    f'"{len(images)}"',
+                ),
+                gemini_model_name,
+                gemini_pool.keys[idx],
+                proxy_url,
+                generation_config={
+                    "temperature": 0.0,
+                    "responseMimeType": "application/json",
+                    "maxOutputTokens": max(256, len(images) * 12),
+                },
+            )
+            values = parse_gemini_sheet_result(text, len(images))
+            smart_proxy_pool.mark_ok(proxy_url)
+            gemini_pool.release(idx, None)
+            print(
+                f"[pid={os.getpid()}][gemini_sheet] OK key={key_name} "
+                f"proxy={_proxy_label(proxy_url)} images={len(images)}"
+            )
+            return [
+                {"text": value, "source": "gemini_sheet"}
+                for value in values
+            ]
+        except ProxyUnavailable as exc:
+            last_error = f"{type(exc).__name__}: {exc}"
+            smart_proxy_pool.mark_failed(proxy_url, exc)
+            gemini_pool.release(idx, None)
+        except Exception as exc:
+            last_error = f"{type(exc).__name__}: {exc}"
+            smart_proxy_pool.mark_failed(proxy_url, last_error)
+            gemini_pool.release(idx, last_error)
+
+    print(
+        f"[pid={os.getpid()}][gemini_sheet] не удалось выполнить запрос: "
+        f"{last_error or 'нет доступного ключа/канала'}"
+    )
+    return [{"text": "0", "source": "gemini_sheet_error"} for _ in images]
 
 
 def recognize_one_sync_part(image_bytes: bytes) -> str:
@@ -686,24 +988,59 @@ async def process_images_concurrently(images_b64: List[str], mode: str) -> List[
     return results
 
 
+def normalize_ocr_mode(mode: Optional[str]) -> str:
+    value = (mode or "combo").strip().lower().replace("-", "_")
+    if value in {
+        "gemini_sheet",
+        "gemini_batch_sheet",
+        "gemini_contact_sheet",
+        "gemini_all",
+        "gemini_all_in_one",
+        "geminialinon",
+    }:
+        return "gemini_sheet"
+    return value
+
+
+async def process_images_gemini_sheet(images_b64: List[str]) -> List[dict]:
+    images = [clean_base64(b64) for b64 in images_b64]
+    return await recognize_gemini_sheet_async(images)
+
+
 @app.post("/ocr", response_model=OCRResponse)
 async def ocr_endpoint(
     req: OCRRequest,
-    mode: Optional[str] = Query("combo", description="combo | gemini | dddd")
+    mode: Optional[str] = Query(
+        "combo",
+        description=(
+            "combo | gemini | dddd | gemini_sheet "
+            "(aliases: geminiAllInOne, geminiAlinOn)"
+        ),
+    )
 ):
     images = req.images if isinstance(req.images, list) else [req.images]
 
     if len(images) > 200:
         raise HTTPException(status_code=400, detail="Слишком много изображений за один запрос (лимит 200)")
 
-    results = await process_images_concurrently(images, mode)
+    normalized_mode = normalize_ocr_mode(mode)
+    if normalized_mode == "gemini_sheet":
+        results = await process_images_gemini_sheet(images)
+    else:
+        results = await process_images_concurrently(images, normalized_mode)
     return OCRResponse(results=results)
 
 
 @app.post("/ocr/batch", response_model=OCRResponse)
 async def ocr_batch_endpoint(
     req: OCRRequest,
-    mode: Optional[str] = Query("combo", description="combo | gemini | dddd")
+    mode: Optional[str] = Query(
+        "combo",
+        description=(
+            "combo | gemini | dddd | gemini_sheet "
+            "(aliases: geminiAllInOne, geminiAlinOn)"
+        ),
+    )
 ):
     images = req.images if isinstance(req.images, list) else [req.images]
 
@@ -712,7 +1049,11 @@ async def ocr_batch_endpoint(
     if len(images) > 500:
         raise HTTPException(status_code=400, detail="Слишком много изображений за один запрос (лимит 500)")
 
-    results = await process_images_concurrently(images, mode)
+    normalized_mode = normalize_ocr_mode(mode)
+    if normalized_mode == "gemini_sheet":
+        results = await process_images_gemini_sheet(images)
+    else:
+        results = await process_images_concurrently(images, normalized_mode)
     return OCRResponse(results=results)
 
 
