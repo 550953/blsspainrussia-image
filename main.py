@@ -24,7 +24,7 @@ import uvicorn
 PROCESS_START_TIME = time.time()
 STARTUP_TIMING_FILE = Path("/tmp/startup_timing.json")
 
-app = FastAPI(title="Digit OCR Service", version="4.1")
+app = FastAPI(title="Digit OCR Service", version="4.2")
 
 ocr_dddd = ddddocr.DdddOcr(show_ad=False)
 
@@ -42,11 +42,15 @@ def _parse_retry_delay(err_text: str) -> float:
 
 class GeminiKeyPool:
     """Пул ключей: round-robin + per-key cooldown + глобальный blackout.
-    ИЗМЕНЕНИЕ: класс больше не хранит genai.Client — вызовы теперь идут
-    напрямую через REST (см. _call_gemini_rest), потому что прокси нужно
-    прокидывать НА КАЖДУЮ попытку отдельно, а SDK берёт прокси только из
-    env-переменных в момент создания клиента (гонка при параллельных
-    корутинах в event loop)."""
+
+    ИЗМЕНЕНИЕ v4.2: убран GEMINI_MIN_INTERVAL_SEC как условие в acquire().
+    Диагностика (54 картинки, 15 ключей, round-robin, БЕЗ искусственного
+    интервала) прошла 54/54 без единого 429 за 14.5 сек. Реальная защита
+    от коллизий — это `reserved[idx]`: пока ключ занят, его никто больше
+    не возьмёт. Интервал в 8 сек поверх этого просто душил throughput
+    (15 ключей / 8 сек ≈ 1.9 запроса/сек теоретический потолок), не давая
+    никакой дополнительной защиты от рейт-лимитов, которой уже не было бы
+    от reserved-флага и cooldown после реального 429."""
 
     _BLACKOUT_MULT = 1.0
     _BLACKOUT_MIN = 30.0
@@ -142,7 +146,11 @@ class GeminiKeyPool:
 
     def acquire(self) -> tuple[Optional[int], Optional[str]]:
         """Резервирует и возвращает следующий свободный ключ по кругу.
-        (None, None), если свободных сейчас нет."""
+        (None, None), если свободных сейчас нет.
+
+        ИЗМЕНЕНИЕ v4.2: убрана проверка GEMINI_MIN_INTERVAL_SEC — см.
+        комментарий к классу выше. Единственное условие теперь: ключ не
+        занят прямо сейчас (reserved) и не в cooldown (blocked)."""
         if not self.keys:
             return None, None
         n = len(self.keys)
@@ -150,11 +158,7 @@ class GeminiKeyPool:
         for _ in range(n):
             idx = self.rr_index % n
             self.rr_index += 1
-            if (
-                not self.reserved[idx]
-                and now >= self.blocked[idx]
-                and now - self.last_used[idx] >= GEMINI_MIN_INTERVAL_SEC
-            ):
+            if not self.reserved[idx] and now >= self.blocked[idx]:
                 self.reserved[idx] = True
                 self.last_used[idx] = now
                 return idx, self.key_names[idx]
@@ -207,15 +211,21 @@ GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.1-flash-lite")
 gemini_model_name = GEMINI_MODEL if GEMINI_KEYS else None
 print(f"[pid={os.getpid()}] Gemini ключей найдено: {len(GEMINI_KEYS)}, модель: {gemini_model_name}")
 
-GEMINI_MIN_INTERVAL_SEC = float(os.getenv("GEMINI_MIN_INTERVAL_SEC", "8.0"))
 GEMINI_ACQUIRE_TIMEOUT = float(os.getenv("GEMINI_ACQUIRE_TIMEOUT", "40.0"))
 GEMINI_ACQUIRE_POLL = 0.15
 
-GEMINI_CONCURRENT_LIMIT = int(os.getenv("GEMINI_CONCURRENT_LIMIT", "5"))
-_gemini_network_semaphore = asyncio.Semaphore(GEMINI_CONCURRENT_LIMIT)
+# ИЗМЕНЕНИЕ v4.2: _gemini_network_semaphore (лимит 5) убран полностью.
+# Он был третьим, избыточным слоем троттлинга: reserved[idx] в пуле уже
+# не даёт двум запросам занять один и тот же ключ одновременно, а значит
+# реальный параллелизм и так физически не превышает число живых ключей.
+# Добавочный семафор на 5 просто резал throughput ниже того, что доказанно
+# безопасно (диагностика: 24 параллельных воркера, 15 ключей, 54/54 OK).
+# Если понадобится общий потолок отдельно от количества ключей — это
+# должен быть один параметр, а не третий независимый механизм; см.
+# OCR_CONCURRENCY ниже, который теперь единственный regulator параллелизма.
 
 # ---------------------------------------------------------------------------
-# ИЗМЕНЕНИЕ: прокси-пул для исходящих запросов к Gemini.
+# Прокси-пул для исходящих запросов к Gemini.
 #
 # Причина: сервис хостится на Render. Диагностика показала, что 429 сыпется
 # НЕ из-за реальной нехватки квоты у ключей — на shared outbound IP Render
@@ -224,9 +234,6 @@ _gemini_network_semaphore = asyncio.Semaphore(GEMINI_CONCURRENT_LIMIT)
 # на локальном мультипоточном тесте прошли 54/54 картинки без единой
 # ошибки, потому что запросы шли либо с домашнего IP, либо через сторонние
 # прокси — то есть НЕ с адреса из известного датацентр-диапазона Render.
-# (Render сам предупреждает: shared outbound IP используется многими их
-# клиентами одновременно, и если кто-то другой на этом IP словил бан от
-# стороннего сервиса — вы получаете его "по наследству".)
 #
 # GEMINI_PROXIES — список прокси через запятую в переменной окружения:
 #   GEMINI_PROXIES=socks5://user:pass@ip1:port1,http://user:pass@ip2:port2
@@ -234,11 +241,6 @@ _gemini_network_semaphore = asyncio.Semaphore(GEMINI_CONCURRENT_LIMIT)
 # fallback, а не тихая деградация: в /health сразу видно текущий режим.
 # ---------------------------------------------------------------------------
 def _fetch_proxies_from_infisical(prefix: str = "PROXY_URL") -> List[str]:
-    """Тот же поход в Infisical, что и для GEMINI_API_KEY_* (см.
-    GeminiKeyPool._fetch_keys_from_infisical), но за прокси. Так секреты
-    (PROXY_URL_HTTPS1, PROXY_URL_US1, ...) можно держать только в Infisical,
-    не дублируя их вручную в Render env — используются те же
-    INFISICAL_CLIENT_ID/SECRET, что уже заведены для ключей."""
     import requests as _requests
 
     client_id = os.environ["INFISICAL_CLIENT_ID"]
@@ -273,11 +275,6 @@ def _fetch_proxies_from_infisical(prefix: str = "PROXY_URL") -> List[str]:
 
 
 def _load_gemini_proxies() -> tuple[List[str], str]:
-    """Источник №1 — переменная окружения GEMINI_PROXIES (список через
-    запятую, без похода в сеть, для случая когда прокси хочется задать
-    прямо в Render). Источник №2 (fallback) — секреты PROXY_URL_* из
-    Infisical, чтобы вообще ничего не дублировать в Render env вручную —
-    ровно та же логика, что уже работает для GEMINI_API_KEY_*."""
     raw = os.getenv("GEMINI_PROXIES", "").strip()
     if raw:
         return [p.strip() for p in raw.split(",") if p.strip()], "env:GEMINI_PROXIES"
@@ -318,15 +315,32 @@ class ProxyUnavailable(Exception):
     соединения, таймаут подключения и т.п.) — это ошибка КАНАЛА, а не
     конкретного ключа. Ключ в этом не виноват и не должен уходить в
     cooldown — иначе один нерабочий прокси-канал может по цепочке
-    остановить весь пул ключей, как это только что произошло на проде."""
+    остановить весь пул ключей."""
     pass
 
 
+# ---------------------------------------------------------------------------
+# ИЗМЕНЕНИЕ v4.2: пул httpx.AsyncClient — один клиент на прокси-канал,
+# переиспользуемый между запросами (keep-alive), вместо создания нового
+# AsyncClient (а значит и нового TCP+TLS хендшейка) на КАЖДЫЙ вызов Gemini.
+# Клиентов мало (по числу прокси-каналов + DIRECT), поэтому держать их
+# живыми весь uptime процесса дёшево и не требует локов — словарь только
+# читается/дополняется из одного event loop (без await между check и set).
+# ---------------------------------------------------------------------------
+_HTTPX_CLIENTS: dict[Optional[str], httpx.AsyncClient] = {}
+
+
+def _get_http_client(proxy_url: Optional[str]) -> httpx.AsyncClient:
+    client = _HTTPX_CLIENTS.get(proxy_url)
+    if client is None:
+        client = httpx.AsyncClient(proxy=proxy_url, timeout=20.0)
+        _HTTPX_CLIENTS[proxy_url] = client
+    return client
+
+
 async def _call_gemini_rest(png_bytes: bytes, prompt: str, model: str, api_key: str, proxy_url: Optional[str]) -> str:
-    """Прямой REST-вызов к Gemini вместо genai SDK. Позволяет задавать
-    прокси НА КАЖДУЮ попытку отдельно (httpx.AsyncClient создаётся заново
-    под конкретный proxy_url, без общего мутируемого состояния между
-    параллельными корутинами)."""
+    """Прямой REST-вызов к Gemini вместо genai SDK — прокси задаётся на
+    каждую попытку отдельно через переиспользуемый клиент (см. выше)."""
     payload = {
         "contents": [
             {
@@ -339,24 +353,19 @@ async def _call_gemini_rest(png_bytes: bytes, prompt: str, model: str, api_key: 
         "generationConfig": {"temperature": 0.0, "maxOutputTokens": 10},
     }
     url = GEMINI_REST_URL.format(model=model, key=api_key)
+    http_client = _get_http_client(proxy_url)
 
     try:
-        async with httpx.AsyncClient(proxy=proxy_url, timeout=20.0) as http_client:
-            response = await http_client.post(url, json=payload)
+        response = await http_client.post(url, json=payload)
     except (httpx.ProxyError, httpx.ConnectError, httpx.ConnectTimeout) as e:
         raise ProxyUnavailable(f"{type(e).__name__}: {e}") from e
     except Exception as e:
-        # httpx поднимает отсутствие 'socksio' как обычное исключение ДО
-        # попытки соединения — тип не гарантирован между версиями httpx,
-        # поэтому дополнительно матчим по тексту сообщения.
         msg = str(e).lower()
         if "socksio" in msg or "unsupported proxy" in msg or "sockshandler" in msg:
             raise ProxyUnavailable(f"{type(e).__name__}: {e}") from e
         raise
 
     if response.status_code != 200:
-        # Текст ответа отдаём как есть — GeminiKeyPool.release() уже умеет
-        # классифицировать 429/401/403/503 по подстрокам внутри него.
         raise RuntimeError(f"{response.status_code} {response.text}")
 
     data = response.json()
@@ -597,19 +606,17 @@ async def recognize_with_gemini_async(image_bytes: bytes) -> str:
         tried_idx.add(idx)
         proxy_url = _next_proxy()
         try:
-            async with _gemini_network_semaphore:
-                text = await _call_gemini_rest(
-                    png_bytes, prompt, gemini_model_name, gemini_pool.keys[idx], proxy_url
-                )
+            # ИЗМЕНЕНИЕ v4.2: раньше здесь был `async with _gemini_network_semaphore:`.
+            # Убрано — см. комментарий у объявления GEMINI_ACQUIRE_TIMEOUT выше.
+            text = await _call_gemini_rest(
+                png_bytes, prompt, gemini_model_name, gemini_pool.keys[idx], proxy_url
+            )
             gemini_pool.release(idx, None)
             digits = "".join(c for c in text if c.isdigit())
             if digits:
                 print(f"[pid={os.getpid()}][gemini_key] OK key={key_name} proxy={proxy_url or 'DIRECT'}")
                 return digits
         except ProxyUnavailable as e:
-            # Ошибка канала (прокси), не ключа: возвращаем ключ БЕЗ cooldown
-            # и разрешаем попробовать его снова со следующим прокси —
-            # иначе один сломанный прокси-канал вырубит по цепочке весь пул.
             gemini_pool.release(idx, None)
             tried_idx.discard(idx)
             last_error = f"[proxy={proxy_url or 'DIRECT'}] {e}"
@@ -659,7 +666,12 @@ async def recognize_one_async(image_bytes: bytes, mode: str = "combo") -> dict:
     return {"text": dddd_result, "source": "ddddocr"}
 
 
-OCR_CONCURRENCY = int(os.getenv("OCR_CONCURRENCY", str(max(6, len(GEMINI_KEYS), OCR_MAX_WORKERS))))
+# ИЗМЕНЕНИЕ v4.2: OCR_CONCURRENCY теперь ЕДИНСТВЕННЫЙ регулятор параллелизма
+# для gemini-запросов (после удаления _gemini_network_semaphore). Дефолт
+# поднят так, чтобы очередь на ключи не пустовала: несколько "лишних"
+# корутин сверх числа ключей means как только ключ освобождается, следующая
+# картинка забирает его немедленно, без простоя на GEMINI_ACQUIRE_POLL.
+OCR_CONCURRENCY = int(os.getenv("OCR_CONCURRENCY", str(max(len(GEMINI_KEYS) + 8, OCR_MAX_WORKERS, 20))))
 
 
 async def process_images_concurrently(images_b64: List[str], mode: str) -> List[dict]:
@@ -724,7 +736,6 @@ async def health():
         "gemini_model": gemini_model_name,
         "gemini_pool_overloaded": overloaded,
         "gemini_pool_overloaded_seconds_left": round(remaining, 1) if overloaded else 0,
-        "gemini_concurrent_limit": GEMINI_CONCURRENT_LIMIT,
         "gemini_proxy_channels": len(GEMINI_PROXIES),
         "gemini_proxy_mode": "proxied+direct_fallback" if _configured_proxies else "direct_only",
         "gemini_proxy_source": _proxy_source,
@@ -776,6 +787,9 @@ async def on_startup():
 @app.on_event("shutdown")
 async def on_shutdown():
     EXECUTOR.shutdown(wait=False)
+    # ИЗМЕНЕНИЕ v4.2: закрываем переиспользуемые httpx-клиенты прокси-пула
+    for client in _HTTPX_CLIENTS.values():
+        await client.aclose()
 
 
 if __name__ == "__main__":
