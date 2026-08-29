@@ -7,3 +7,4 @@ opencv-python-headless
 numpy
 google-genai>=1.0.0
 httpx[socks]
+python-multipart
