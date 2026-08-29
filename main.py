@@ -25,7 +25,7 @@ import uvicorn
 PROCESS_START_TIME = time.time()
 STARTUP_TIMING_FILE = Path("/tmp/startup_timing.json")
 
-app = FastAPI(title="Digit OCR Service", version="4.2")
+app = FastAPI(title="Digit OCR Service", version="4.3")
 
 ocr_dddd = ddddocr.DdddOcr(show_ad=False)
 
@@ -44,14 +44,14 @@ def _parse_retry_delay(err_text: str) -> float:
 class GeminiKeyPool:
     """Пул ключей: round-robin + per-key cooldown + глобальный blackout.
 
-    ИЗМЕНЕНИЕ v4.2: убран GEMINI_MIN_INTERVAL_SEC как условие в acquire().
-    Диагностика (54 картинки, 15 ключей, round-robin, БЕЗ искусственного
-    интервала) прошла 54/54 без единого 429 за 14.5 сек. Реальная защита
-    от коллизий — это `reserved[idx]`: пока ключ занят, его никто больше
-    не возьмёт. Интервал в 8 сек поверх этого просто душил throughput
-    (15 ключей / 8 сек ≈ 1.9 запроса/сек теоретический потолок), не давая
-    никакой дополнительной защиты от рейт-лимитов, которой уже не было бы
-    от reserved-флага и cooldown после реального 429."""
+    v4.2: убран GEMINI_MIN_INTERVAL_SEC как условие в acquire(). Диагностика
+    (54 картинки, 15 ключей, round-robin, БЕЗ искусственного интервала)
+    прошла 54/54 без единого 429 за 14.5 сек. Реальная защита от коллизий —
+    это `reserved[idx]`: пока ключ занят, его никто больше не возьмёт.
+    Интервал в 8 сек поверх этого просто душил throughput (15 ключей / 8 сек
+    ≈ 1.9 запроса/сек теоретический потолок), не давая никакой
+    дополнительной защиты от рейт-лимитов, которой уже не было бы от
+    reserved-флага и cooldown после реального 429."""
 
     _BLACKOUT_MULT = 1.0
     _BLACKOUT_MIN = 30.0
@@ -103,6 +103,10 @@ class GeminiKeyPool:
 
         client_id = os.environ["INFISICAL_CLIENT_ID"]
         client_secret = os.environ["INFISICAL_CLIENT_SECRET"]
+        # ИЗМЕНЕНИЕ v4.3: убран дефолт (был захардкожен реальный project_id).
+        # Без переменной окружения — явный KeyError, а не тихий фоллбэк
+        # на чужой/старый проект. Обязательно задать INFISICAL_PROJECT_ID
+        # в .env перед публикацией репозитория.
         project_id = os.environ["INFISICAL_PROJECT_ID"]
         environment = os.environ.get("INFISICAL_ENVIRONMENT", "dev")
 
@@ -147,11 +151,7 @@ class GeminiKeyPool:
 
     def acquire(self) -> tuple[Optional[int], Optional[str]]:
         """Резервирует и возвращает следующий свободный ключ по кругу.
-        (None, None), если свободных сейчас нет.
-
-        ИЗМЕНЕНИЕ v4.2: убрана проверка GEMINI_MIN_INTERVAL_SEC — см.
-        комментарий к классу выше. Единственное условие теперь: ключ не
-        занят прямо сейчас (reserved) и не в cooldown (blocked)."""
+        (None, None), если свободных сейчас нет."""
         if not self.keys:
             return None, None
         n = len(self.keys)
@@ -212,18 +212,7 @@ GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.1-flash-lite")
 gemini_model_name = GEMINI_MODEL if GEMINI_KEYS else None
 print(f"[pid={os.getpid()}] Gemini ключей найдено: {len(GEMINI_KEYS)}, модель: {gemini_model_name}")
 
-GEMINI_ACQUIRE_TIMEOUT = float(os.getenv("GEMINI_ACQUIRE_TIMEOUT", "40.0"))
 GEMINI_ACQUIRE_POLL = 0.15
-
-# ИЗМЕНЕНИЕ v4.2: _gemini_network_semaphore (лимит 5) убран полностью.
-# Он был третьим, избыточным слоем троттлинга: reserved[idx] в пуле уже
-# не даёт двум запросам занять один и тот же ключ одновременно, а значит
-# реальный параллелизм и так физически не превышает число живых ключей.
-# Добавочный семафор на 5 просто резал throughput ниже того, что доказанно
-# безопасно (диагностика: 24 параллельных воркера, 15 ключей, 54/54 OK).
-# Если понадобится общий потолок отдельно от количества ключей — это
-# должен быть один параметр, а не третий независимый механизм; см.
-# OCR_CONCURRENCY ниже, который теперь единственный regulator параллелизма.
 
 # ---------------------------------------------------------------------------
 # Прокси-пул для исходящих запросов к Gemini.
@@ -246,7 +235,8 @@ def _fetch_proxies_from_infisical(prefix: str = "PROXY_URL") -> List[str]:
 
     client_id = os.environ["INFISICAL_CLIENT_ID"]
     client_secret = os.environ["INFISICAL_CLIENT_SECRET"]
-    project_id = os.environ.get("INFISICAL_PROJECT_ID", "555e71be-4c53-4b3e-9409-0d9838aea8b6")
+    # ИЗМЕНЕНИЕ v4.3: убран дефолт (см. комментарий в _fetch_keys_from_infisical).
+    project_id = os.environ["INFISICAL_PROJECT_ID"]
     environment = os.environ.get("INFISICAL_ENVIRONMENT", "dev")
 
     token_resp = _requests.post(
@@ -399,12 +389,9 @@ class ProxyUnavailable(Exception):
 
 
 # ---------------------------------------------------------------------------
-# ИЗМЕНЕНИЕ v4.2: пул httpx.AsyncClient — один клиент на прокси-канал,
-# переиспользуемый между запросами (keep-alive), вместо создания нового
-# AsyncClient (а значит и нового TCP+TLS хендшейка) на КАЖДЫЙ вызов Gemini.
-# Клиентов мало (по числу прокси-каналов + DIRECT), поэтому держать их
-# живыми весь uptime процесса дёшево и не требует локов — словарь только
-# читается/дополняется из одного event loop (без await между check и set).
+# Пул httpx.AsyncClient — один клиент на прокси-канал, переиспользуемый
+# между запросами (keep-alive), вместо создания нового AsyncClient (а
+# значит и нового TCP+TLS хендшейка) на КАЖДЫЙ вызов Gemini.
 # ---------------------------------------------------------------------------
 _HTTPX_CLIENTS: dict[Optional[str], httpx.AsyncClient] = {}
 
@@ -651,77 +638,8 @@ def recognize_dddd(image_bytes: bytes) -> str:
         return "0"
 
 
-async def recognize_with_gemini_async(image_bytes: bytes) -> str:
-    if not GEMINI_KEYS or gemini_model_name is None:
-        return "0"
-
-    overloaded, _ = gemini_pool.is_overloaded()
-    if overloaded:
-        return "0"
-
-    nparr = np.frombuffer(image_bytes, np.uint8)
-    img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-    if img is None:
-        return "0"
-    success, buf = cv2.imencode(".png", img)
-    if not success:
-        return "0"
-    png_bytes = buf.tobytes()
-
-    prompt = (
-        "На изображении написано трёхзначное число. "
-        "Распознай только это число. "
-        "Ответь строго только цифрами, ничего больше. "
-        "Пример правильного ответа: 678 или 700."
-    )
-
-    n = len(GEMINI_KEYS)
-    tried_idx: set[int] = set()
-    last_error: Optional[str] = None
-    deadline = time.monotonic() + GEMINI_ACQUIRE_TIMEOUT
-
-    while len(tried_idx) < n:
-        idx, key_name = gemini_pool.acquire()
-
-        if idx is None:
-            overloaded, _ = gemini_pool.is_overloaded()
-            if overloaded or time.monotonic() > deadline:
-                break
-            await asyncio.sleep(GEMINI_ACQUIRE_POLL)
-            continue
-
-        if idx in tried_idx:
-            gemini_pool.release(idx)
-            await asyncio.sleep(GEMINI_ACQUIRE_POLL)
-            continue
-
-        tried_idx.add(idx)
-        proxy_url = _next_proxy()
-        try:
-            # ИЗМЕНЕНИЕ v4.2: раньше здесь был `async with _gemini_network_semaphore:`.
-            # Убрано — см. комментарий у объявления GEMINI_ACQUIRE_TIMEOUT выше.
-            text = await _call_gemini_rest(
-                png_bytes, prompt, gemini_model_name, gemini_pool.keys[idx], proxy_url
-            )
-            gemini_pool.release(idx, None)
-            digits = "".join(c for c in text if c.isdigit())
-            if digits:
-                print(f"[pid={os.getpid()}][gemini_key] OK key={key_name} proxy={_proxy_label(proxy_url)}")
-                return digits
-        except ProxyUnavailable as e:
-            gemini_pool.release(idx, None)
-            tried_idx.discard(idx)
-            last_error = f"[proxy={proxy_url or 'DIRECT'}] {e}"
-            print(f"[pid={os.getpid()}][gemini_proxy] канал {_proxy_label(proxy_url)} недоступен: {e}")
-            await asyncio.sleep(GEMINI_ACQUIRE_POLL)
-        except Exception as e:
-            error_text = f"{type(e).__name__}: {e}" if str(e) else type(e).__name__
-            last_error = error_text
-            gemini_pool.release(idx, error_text)
-
-    if last_error:
-        print(f"Gemini error (перебор завершён, попыток={len(tried_idx)}): {last_error}")
-    return "0"
+def recognize_one_sync_part(image_bytes: bytes) -> str:
+    return recognize_dddd(image_bytes)
 
 
 GEMINI_SHEET_MAX_IMAGES = int(os.getenv("GEMINI_SHEET_MAX_IMAGES", "100"))
@@ -729,9 +647,27 @@ GEMINI_SHEET_COLS = int(os.getenv("GEMINI_SHEET_COLS", "9"))
 GEMINI_SHEET_CELL_WIDTH = int(os.getenv("GEMINI_SHEET_CELL_WIDTH", "170"))
 GEMINI_SHEET_CELL_HEIGHT = int(os.getenv("GEMINI_SHEET_CELL_HEIGHT", "112"))
 
+# ИЗМЕНЕНИЕ v4.3: раньше /ocr/batch пускал до 500 картинок, а
+# make_gemini_contact_sheet кидал ValueError при >GEMINI_SHEET_MAX_IMAGES
+# (100). recognize_gemini_sheet_async ловил это исключение и молча
+# возвращал "0" на ВСЮ пачку — ни разу не сходив в сеть. Теперь большие
+# пачки бьются на чанки размером GEMINI_SHEET_CHUNK_SIZE (54 — размер,
+# подтверждённый локальными тестами: 54/54 без единой ошибки) и гонятся
+# параллельно.
+GEMINI_SHEET_CHUNK_SIZE = int(os.getenv("GEMINI_SHEET_CHUNK_SIZE", "54"))
+GEMINI_SHEET_MAX_CONCURRENT_CHUNKS = int(
+    os.getenv("GEMINI_SHEET_MAX_CONCURRENT_CHUNKS", str(max(len(GEMINI_KEYS), 1)))
+)
+
+
+def _chunk(items: List[bytes], size: int) -> List[List[bytes]]:
+    return [items[i:i + size] for i in range(0, len(items), size)]
+
 
 def make_gemini_contact_sheet(images: List[bytes]) -> bytes:
-    """Собирает все изображения в одну PNG-картинку с ID ячеек."""
+    """Собирает список изображений (<=GEMINI_SHEET_MAX_IMAGES) в одну
+    PNG-картинку с ID ячеек. Чанкинг на верхнем уровне (process_images_gemini_sheet)
+    гарантирует, что сюда никогда не придёт больше лимита."""
     if not images:
         raise ValueError("Пустой список изображений")
     if len(images) > GEMINI_SHEET_MAX_IMAGES:
@@ -863,7 +799,8 @@ def parse_gemini_sheet_result(text: str, count: int) -> List[str]:
 
 
 async def recognize_gemini_sheet_async(images: List[bytes]) -> List[dict]:
-    """Один Gemini-вызов на весь входной список с direct-first failover."""
+    """Один Gemini-вызов на ОДИН чанк (<=GEMINI_SHEET_MAX_IMAGES) с
+    direct-first failover. Чанкинг делается выше, в process_images_gemini_sheet."""
     if not GEMINI_KEYS or gemini_model_name is None:
         return [{"text": "0", "source": "gemini_sheet_unavailable"} for _ in images]
 
@@ -934,127 +871,63 @@ async def recognize_gemini_sheet_async(images: List[bytes]) -> List[dict]:
     return [{"text": "0", "source": "gemini_sheet_error"} for _ in images]
 
 
-def recognize_one_sync_part(image_bytes: bytes) -> str:
-    return recognize_dddd(image_bytes)
-
-
-async def recognize_one_async(image_bytes: bytes, mode: str = "combo") -> dict:
-    mode = mode.lower().strip()
+async def _fill_unrecognized_with_dddd(images: List[bytes], results: List[dict]) -> List[dict]:
+    """Точечно добивает ddddocr только те ячейки, где Gemini вернул '0'
+    (null / не распознал / чанк целиком провалился). Не трогает то, что
+    уже успешно распозналось листом — экономим воркеры EXECUTOR."""
     loop = asyncio.get_event_loop()
-
-    if mode == "gemini":
-        if not GEMINI_KEYS:
-            return {"text": "0", "source": "gemini_unavailable"}
-        result = await recognize_with_gemini_async(image_bytes)
-        if result == "0":
-            fallback = await loop.run_in_executor(EXECUTOR, recognize_one_sync_part, image_bytes)
-            if fallback and fallback != "0":
-                return {"text": fallback, "source": "ddddocr_fallback"}
-        return {"text": result, "source": "gemini"}
-
-    if mode == "dddd":
-        result = await loop.run_in_executor(EXECUTOR, recognize_one_sync_part, image_bytes)
-        return {"text": result, "source": "ddddocr"}
-
-    dddd_result = await loop.run_in_executor(EXECUTOR, recognize_one_sync_part, image_bytes)
-
-    if len(dddd_result) < 3 and GEMINI_KEYS:
-        gemini_result = await recognize_with_gemini_async(image_bytes)
-        if len(gemini_result) >= 3:
-            return {"text": gemini_result, "source": "gemini"}
-        if len(gemini_result) > len(dddd_result):
-            return {"text": gemini_result, "source": "gemini"}
-
-    return {"text": dddd_result, "source": "ddddocr"}
-
-
-# ИЗМЕНЕНИЕ v4.2: OCR_CONCURRENCY теперь ЕДИНСТВЕННЫЙ регулятор параллелизма
-# для gemini-запросов (после удаления _gemini_network_semaphore). Дефолт
-# поднят так, чтобы очередь на ключи не пустовала: несколько "лишних"
-# корутин сверх числа ключей means как только ключ освобождается, следующая
-# картинка забирает его немедленно, без простоя на GEMINI_ACQUIRE_POLL.
-OCR_CONCURRENCY = int(os.getenv("OCR_CONCURRENCY", str(max(len(GEMINI_KEYS) + 8, OCR_MAX_WORKERS, 20))))
-
-
-async def process_images_concurrently(images_b64: List[str], mode: str) -> List[dict]:
-    semaphore = asyncio.Semaphore(OCR_CONCURRENCY)
-
-    async def _one(b64: str) -> dict:
-        async with semaphore:
-            return await recognize_one_async(clean_base64(b64), mode=mode)
-
-    results = await asyncio.gather(*[_one(b64) for b64 in images_b64])
-    gc.collect()
+    missing_idx = [i for i, r in enumerate(results) if r["text"] == "0"]
+    if not missing_idx:
+        return results
+    fallback_values = await asyncio.gather(*[
+        loop.run_in_executor(EXECUTOR, recognize_one_sync_part, images[i])
+        for i in missing_idx
+    ])
+    for i, value in zip(missing_idx, fallback_values):
+        if value and value != "0":
+            results[i] = {"text": value, "source": f"{results[i]['source']}+ddddocr_fallback"}
     return results
 
 
-def normalize_ocr_mode(mode: Optional[str]) -> str:
-    value = (mode or "combo").strip().lower().replace("-", "_")
-    if value in {
-        "gemini_sheet",
-        "gemini_batch_sheet",
-        "gemini_contact_sheet",
-        "gemini_all",
-        "gemini_all_in_one",
-        "geminialinon",
-    }:
-        return "gemini_sheet"
-    return value
-
-
 async def process_images_gemini_sheet(images_b64: List[str]) -> List[dict]:
+    """Единственный публичный режим обработки: бьёт вход на чанки по
+    GEMINI_SHEET_CHUNK_SIZE, гонит чанки параллельно (ограничено
+    семафором по числу живых ключей — не больше одного tile-запроса на
+    ключ единовременно, без залповой нагрузки в момент пика), и точечно
+    добивает нераспознанные ячейки каждого чанка через ddddocr."""
     images = [clean_base64(b64) for b64 in images_b64]
-    return await recognize_gemini_sheet_async(images)
+    chunks = _chunk(images, GEMINI_SHEET_CHUNK_SIZE)
+    semaphore = asyncio.Semaphore(GEMINI_SHEET_MAX_CONCURRENT_CHUNKS)
+
+    async def _run_chunk(chunk: List[bytes]) -> List[dict]:
+        async with semaphore:
+            chunk_results = await recognize_gemini_sheet_async(chunk)
+            return await _fill_unrecognized_with_dddd(chunk, chunk_results)
+
+    chunk_results = await asyncio.gather(*[_run_chunk(c) for c in chunks])
+    flat: List[dict] = []
+    for r in chunk_results:
+        flat.extend(r)
+    gc.collect()
+    return flat
 
 
 @app.post("/ocr", response_model=OCRResponse)
-async def ocr_endpoint(
-    req: OCRRequest,
-    mode: Optional[str] = Query(
-        "combo",
-        description=(
-            "combo | gemini | dddd | gemini_sheet "
-            "(aliases: geminiAllInOne, geminiAlinOn)"
-        ),
-    )
-):
+async def ocr_endpoint(req: OCRRequest):
     images = req.images if isinstance(req.images, list) else [req.images]
-
-    if len(images) > 200:
-        raise HTTPException(status_code=400, detail="Слишком много изображений за один запрос (лимит 200)")
-
-    normalized_mode = normalize_ocr_mode(mode)
-    if normalized_mode == "gemini_sheet":
-        results = await process_images_gemini_sheet(images)
-    else:
-        results = await process_images_concurrently(images, normalized_mode)
-    return OCRResponse(results=results)
+    if len(images) > 500:
+        raise HTTPException(status_code=400, detail="Слишком много изображений за один запрос (лимит 500)")
+    return OCRResponse(results=await process_images_gemini_sheet(images))
 
 
 @app.post("/ocr/batch", response_model=OCRResponse)
-async def ocr_batch_endpoint(
-    req: OCRRequest,
-    mode: Optional[str] = Query(
-        "combo",
-        description=(
-            "combo | gemini | dddd | gemini_sheet "
-            "(aliases: geminiAllInOne, geminiAlinOn)"
-        ),
-    )
-):
+async def ocr_batch_endpoint(req: OCRRequest):
     images = req.images if isinstance(req.images, list) else [req.images]
-
     if not images:
         raise HTTPException(status_code=400, detail="Пустой список изображений")
     if len(images) > 500:
         raise HTTPException(status_code=400, detail="Слишком много изображений за один запрос (лимит 500)")
-
-    normalized_mode = normalize_ocr_mode(mode)
-    if normalized_mode == "gemini_sheet":
-        results = await process_images_gemini_sheet(images)
-    else:
-        results = await process_images_concurrently(images, normalized_mode)
-    return OCRResponse(results=results)
+    return OCRResponse(results=await process_images_gemini_sheet(images))
 
 
 @app.get("/health")
@@ -1095,7 +968,8 @@ async def health():
             for i, dead in enumerate(gemini_pool.dead)
             if dead
         ],
-        "ocr_concurrency": OCR_CONCURRENCY,
+        "gemini_sheet_chunk_size": GEMINI_SHEET_CHUNK_SIZE,
+        "gemini_sheet_max_concurrent_chunks": GEMINI_SHEET_MAX_CONCURRENT_CHUNKS,
         "ocr_max_workers": OCR_MAX_WORKERS,
         "startup_timing": startup_info,
     }
@@ -1128,7 +1002,6 @@ async def on_startup():
 @app.on_event("shutdown")
 async def on_shutdown():
     EXECUTOR.shutdown(wait=False)
-    # ИЗМЕНЕНИЕ v4.2: закрываем переиспользуемые httpx-клиенты прокси-пула
     for client in _HTTPX_CLIENTS.values():
         await client.aclose()
 
