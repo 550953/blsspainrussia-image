@@ -25,7 +25,7 @@ import uvicorn
 PROCESS_START_TIME = time.time()
 STARTUP_TIMING_FILE = Path("/tmp/startup_timing.json")
 
-app = FastAPI(title="Digit OCR Service", version="4.3")
+app = FastAPI(title="Digit OCR Service", version="4.4")
 
 ocr_dddd = ddddocr.DdddOcr(show_ad=False)
 
@@ -578,6 +578,54 @@ def make_variants_full(img_bgr: np.ndarray) -> list[np.ndarray]:
     return variants
 
 
+# ---------------------------------------------------------------------------
+# НОВОЕ (v4.4): точечные варианты для ПОВТОРНОГО Gemini-запроса по ОДНОЙ
+# нераспознанной ячейке — перед тем как окончательно упасть в dddd.
+#
+# Проверено вручную на реальном сложном сэмпле этого генератора капчи:
+# одиночные цветовые каналы (просто GREEN, просто BLUE и т.п.) почти не
+# дают контраста, потому что цифра здесь отличается от фона ОТТЕНКОМ
+# МЕЖДУ каналами, а не яркостью одного канала. Разность каналов (G-B,
+# R-G, R-B) + гауссово размытие ПОСЛЕ разности — рабочий метод: без
+# размытия halftone-паттерн фона того же порядка яркости, что и сама
+# цифра, и топит сигнал в шуме. Если на вашем реальном датасете фон
+# генерится иначе — параметры (какие каналы, blur_ksize) почти наверняка
+# нужно будет подстроить под конкретный паттерн.
+# ---------------------------------------------------------------------------
+def make_variants_for_retry(image_bytes: bytes, scale: int = 6, blur_ksize: int = 9) -> list[bytes]:
+    """Точечные варианты для ОДНОЙ проблемной ячейки, только в памяти,
+    без файлов на диск. Возвращает список PNG-байтов."""
+    nparr = np.frombuffer(image_bytes, np.uint8)
+    img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+    if img is None:
+        return []
+
+    h, w = img.shape[:2]
+    img = cv2.resize(img, (w * scale, h * scale), interpolation=cv2.INTER_CUBIC).astype(np.int16)
+    b, g, r = cv2.split(img)
+
+    def diff_variant(a: np.ndarray, bb: np.ndarray, invert: bool = False) -> np.ndarray:
+        d = cv2.GaussianBlur((a - bb).astype(np.float32), (blur_ksize, blur_ksize), 0)
+        d = cv2.normalize(d, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+        return 255 - d if invert else d
+
+    grays = [
+        diff_variant(g, b),
+        diff_variant(r, g),
+        diff_variant(r, b),
+        diff_variant(g, b, invert=True),
+        diff_variant(r, g, invert=True),
+        diff_variant(r, b, invert=True),
+    ]
+
+    out = []
+    for v in grays:
+        ok, buf = cv2.imencode(".png", cv2.cvtColor(v, cv2.COLOR_GRAY2BGR))
+        if ok:
+            out.append(buf.tobytes())
+    return out
+
+
 def _score(item):
     text, freq = item
     bonus = 120 if len(text) == 3 else (25 if len(text) == 2 else 0)
@@ -659,15 +707,26 @@ GEMINI_SHEET_MAX_CONCURRENT_CHUNKS = int(
     os.getenv("GEMINI_SHEET_MAX_CONCURRENT_CHUNKS", str(max(len(GEMINI_KEYS), 1)))
 )
 
+# НОВОЕ (v4.4): настройки точечного повтора по одной нераспознанной ячейке.
+GEMINI_VARIANT_RETRY_ENABLED = os.getenv("GEMINI_VARIANT_RETRY_ENABLED", "1") not in ("0", "false", "False")
+GEMINI_VARIANT_RETRY_COLS = int(os.getenv("GEMINI_VARIANT_RETRY_COLS", "3"))
+GEMINI_VARIANT_RETRY_MIN_VOTES = int(os.getenv("GEMINI_VARIANT_RETRY_MIN_VOTES", "2"))
+GEMINI_VARIANT_RETRY_SCALE = int(os.getenv("GEMINI_VARIANT_RETRY_SCALE", "6"))
+GEMINI_VARIANT_RETRY_BLUR_KSIZE = int(os.getenv("GEMINI_VARIANT_RETRY_BLUR_KSIZE", "9"))
+
 
 def _chunk(items: List[bytes], size: int) -> List[List[bytes]]:
     return [items[i:i + size] for i in range(0, len(items), size)]
 
 
-def make_gemini_contact_sheet(images: List[bytes]) -> bytes:
+def make_gemini_contact_sheet(images: List[bytes], cols: Optional[int] = None) -> bytes:
     """Собирает список изображений (<=GEMINI_SHEET_MAX_IMAGES) в одну
     PNG-картинку с ID ячеек. Чанкинг на верхнем уровне (process_images_gemini_sheet)
-    гарантирует, что сюда никогда не придёт больше лимита."""
+    гарантирует, что сюда никогда не придёт больше лимита.
+
+    cols: опционально переопределить число колонок сетки (используется
+    точечным повтором — там всегда маленький лист на несколько вариантов
+    одной картинки, а не GEMINI_SHEET_COLS=9 как для полного батча)."""
     if not images:
         raise ValueError("Пустой список изображений")
     if len(images) > GEMINI_SHEET_MAX_IMAGES:
@@ -676,7 +735,7 @@ def make_gemini_contact_sheet(images: List[bytes]) -> bytes:
             f"изображений, получено {len(images)}"
         )
 
-    cols = max(1, min(GEMINI_SHEET_COLS, len(images)))
+    cols = max(1, min(cols or GEMINI_SHEET_COLS, len(images)))
     rows = (len(images) + cols - 1) // cols
     sheet = np.full(
         (
@@ -758,6 +817,28 @@ GEMINI_SHEET_PROMPT = f"""
 - ничего не переставляй и не придумывай.
 """.strip()
 
+# НОВОЕ (v4.4): промпт для точечного повтора. Все ячейки на этом листе —
+# РАЗНЫЕ версии обработки ОДНОЙ И ТОЙ ЖЕ картинки, а не разные капчи, так
+# что задача — распознать (возможно, по-разному читаемое на разных
+# вариантах) одно и то же число и вернуть его для каждой ячейки, где
+# получилось.
+GEMINI_VARIANT_RETRY_PROMPT_TEMPLATE = """
+На изображении contact sheet из {n} пронумерованных ячеек.
+Это РАЗНЫЕ варианты обработки контраста ОДНОЙ И ТОЙ ЖЕ исходной картинки
+с трёхзначным числом — само число везде одно и то же, отличается только
+то, насколько хорошо оно видно на конкретном варианте.
+
+Верни строго JSON-объект без markdown и пояснений:
+{{"1":"353","2":"353", ... "{n}":null}}
+
+Правила:
+- верни ключи для всех ячеек от "1" до "{n}";
+- значение — строка ровно из трёх цифр, если смог прочитать на этом варианте;
+- если конкретный вариант нечитаем, значение null для него (другие ячейки
+  на это не влияют);
+- ничего не придумывай — если не уверен, лучше null, чем случайное число.
+""".strip()
+
 
 def parse_gemini_sheet_result(text: str, count: int) -> List[str]:
     """Принимает JSON object/list и приводит его к списку результатов."""
@@ -798,17 +879,30 @@ def parse_gemini_sheet_result(text: str, count: int) -> List[str]:
     return result
 
 
-async def recognize_gemini_sheet_async(images: List[bytes]) -> List[dict]:
+async def recognize_gemini_sheet_async(
+    images: List[bytes],
+    cols: Optional[int] = None,
+    prompt: Optional[str] = None,
+) -> List[dict]:
     """Один Gemini-вызов на ОДИН чанк (<=GEMINI_SHEET_MAX_IMAGES) с
-    direct-first failover. Чанкинг делается выше, в process_images_gemini_sheet."""
+    direct-first failover. Чанкинг делается выше, в process_images_gemini_sheet.
+
+    prompt: опционально переопределить промпт (используется точечным
+    повтором — там свой промпт про "варианты одной картинки", а не про
+    "разные капчи")."""
     if not GEMINI_KEYS or gemini_model_name is None:
         return [{"text": "0", "source": "gemini_sheet_unavailable"} for _ in images]
 
     try:
-        png_bytes = make_gemini_contact_sheet(images)
+        png_bytes = make_gemini_contact_sheet(images, cols=cols)
     except ValueError as exc:
         print(f"[pid={os.getpid()}][gemini_sheet] {exc}")
         return [{"text": "0", "source": "gemini_sheet_error"} for _ in images]
+
+    effective_prompt = prompt if prompt is not None else GEMINI_SHEET_PROMPT.replace(
+        f'"{GEMINI_SHEET_MAX_IMAGES}"',
+        f'"{len(images)}"',
+    )
 
     max_attempts = max(4, min(24, len(GEMINI_KEYS) * 2 + len(smart_proxy_pool.routes)))
     attempted_routes: set[tuple[int, Optional[str]]] = set()
@@ -831,10 +925,7 @@ async def recognize_gemini_sheet_async(images: List[bytes]) -> List[dict]:
         try:
             text = await _call_gemini_rest(
                 png_bytes,
-                GEMINI_SHEET_PROMPT.replace(
-                    f'"{GEMINI_SHEET_MAX_IMAGES}"',
-                    f'"{len(images)}"',
-                ),
+                effective_prompt,
                 gemini_model_name,
                 gemini_pool.keys[idx],
                 proxy_url,
@@ -871,19 +962,78 @@ async def recognize_gemini_sheet_async(images: List[bytes]) -> List[dict]:
     return [{"text": "0", "source": "gemini_sheet_error"} for _ in images]
 
 
-async def _fill_unrecognized_with_dddd(images: List[bytes], results: List[dict]) -> List[dict]:
-    """Точечно добивает ddddocr только те ячейки, где Gemini вернул '0'
-    (null / не распознал / чанк целиком провалился). Не трогает то, что
-    уже успешно распозналось листом — экономим воркеры EXECUTOR."""
-    loop = asyncio.get_event_loop()
+async def recognize_gemini_variant_retry(image_bytes: bytes) -> Optional[tuple[str, int]]:
+    """НОВОЕ (v4.4): повторный запрос в Gemini ТОЛЬКО по этой картинке —
+    не весь батч, не 100 чужих ячеек, а несколько вариантов контраста
+    именно её, одним небольшим API-вызовом. Голосование по большинству
+    среди вариантов, которые Gemini смог прочитать.
+
+    Возвращает (текст, число_голосов) либо None, если Gemini недоступен
+    или ни один вариант не набрал GEMINI_VARIANT_RETRY_MIN_VOTES —
+    тогда вызывающий код идёт в dddd как раньше."""
+    if not GEMINI_VARIANT_RETRY_ENABLED or not GEMINI_KEYS:
+        return None
+
+    variants = make_variants_for_retry(
+        image_bytes,
+        scale=GEMINI_VARIANT_RETRY_SCALE,
+        blur_ksize=GEMINI_VARIANT_RETRY_BLUR_KSIZE,
+    )
+    if not variants:
+        return None
+
+    prompt = GEMINI_VARIANT_RETRY_PROMPT_TEMPLATE.format(n=len(variants))
+    sheet_results = await recognize_gemini_sheet_async(
+        variants,
+        cols=GEMINI_VARIANT_RETRY_COLS,
+        prompt=prompt,
+    )
+    votes = Counter(
+        r["text"] for r in sheet_results
+        if r["text"] != "0" and r["source"] == "gemini_sheet"
+    )
+    if not votes:
+        return None
+
+    top_text, top_freq = sorted(votes.items(), key=_score, reverse=True)[0]
+    if top_freq < GEMINI_VARIANT_RETRY_MIN_VOTES:
+        return None
+    return top_text, top_freq
+
+
+async def _fill_unrecognized(images: List[bytes], results: List[dict]) -> List[dict]:
+    """ИЗМЕНЕНИЕ v4.4 (было _fill_unrecognized_with_dddd): теперь три
+    уровня для каждой нераспознанной ячейки —
+      1) точечный Gemini-повтор по вариантам именно этой картинки;
+      2) если и это не сошлось — dddd на оригинале, как раньше.
+    Не трогает ячейки, которые уже успешно распознались общим листом."""
     missing_idx = [i for i, r in enumerate(results) if r["text"] == "0"]
     if not missing_idx:
         return results
+
+    # Шаг 1: точечный повтор в Gemini по каждой проблемной ячейке отдельно.
+    # Последовательно, а не gather — чтобы не толкаться за один и тот же
+    # пул ключей параллельно ради одних и тех же нескольких картинок.
+    for i in missing_idx:
+        retry = await recognize_gemini_variant_retry(images[i])
+        if retry is not None:
+            text, votes = retry
+            results[i] = {
+                "text": text,
+                "source": f"{results[i]['source']}+gemini_variant_retry(votes={votes})",
+            }
+
+    # Шаг 2: то, что и повтор не взял — как раньше, в dddd.
+    still_missing = [i for i in missing_idx if results[i]["text"] == "0"]
+    if not still_missing:
+        return results
+
+    loop = asyncio.get_event_loop()
     fallback_values = await asyncio.gather(*[
         loop.run_in_executor(EXECUTOR, recognize_one_sync_part, images[i])
-        for i in missing_idx
+        for i in still_missing
     ])
-    for i, value in zip(missing_idx, fallback_values):
+    for i, value in zip(still_missing, fallback_values):
         if value and value != "0":
             results[i] = {"text": value, "source": f"{results[i]['source']}+ddddocr_fallback"}
     return results
@@ -894,7 +1044,7 @@ async def process_images_gemini_sheet(images_b64: List[str]) -> List[dict]:
     GEMINI_SHEET_CHUNK_SIZE, гонит чанки параллельно (ограничено
     семафором по числу живых ключей — не больше одного tile-запроса на
     ключ единовременно, без залповой нагрузки в момент пика), и точечно
-    добивает нераспознанные ячейки каждого чанка через ddddocr."""
+    добивает нераспознанные ячейки каждого чанка (Gemini-повтор → dddd)."""
     images = [clean_base64(b64) for b64 in images_b64]
     chunks = _chunk(images, GEMINI_SHEET_CHUNK_SIZE)
     semaphore = asyncio.Semaphore(GEMINI_SHEET_MAX_CONCURRENT_CHUNKS)
@@ -902,7 +1052,7 @@ async def process_images_gemini_sheet(images_b64: List[str]) -> List[dict]:
     async def _run_chunk(chunk: List[bytes]) -> List[dict]:
         async with semaphore:
             chunk_results = await recognize_gemini_sheet_async(chunk)
-            return await _fill_unrecognized_with_dddd(chunk, chunk_results)
+            return await _fill_unrecognized(chunk, chunk_results)
 
     chunk_results = await asyncio.gather(*[_run_chunk(c) for c in chunks])
     flat: List[dict] = []
@@ -970,6 +1120,9 @@ async def health():
         ],
         "gemini_sheet_chunk_size": GEMINI_SHEET_CHUNK_SIZE,
         "gemini_sheet_max_concurrent_chunks": GEMINI_SHEET_MAX_CONCURRENT_CHUNKS,
+        "gemini_variant_retry_enabled": GEMINI_VARIANT_RETRY_ENABLED,
+        "gemini_variant_retry_cols": GEMINI_VARIANT_RETRY_COLS,
+        "gemini_variant_retry_min_votes": GEMINI_VARIANT_RETRY_MIN_VOTES,
         "ocr_max_workers": OCR_MAX_WORKERS,
         "startup_timing": startup_info,
     }
