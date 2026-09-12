@@ -7,6 +7,7 @@ import os
 import random
 import re
 import time
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import List, Union, Optional
@@ -25,7 +26,7 @@ import uvicorn
 PROCESS_START_TIME = time.time()
 STARTUP_TIMING_FILE = Path("/tmp/startup_timing.json")
 
-app = FastAPI(title="Digit OCR Service", version="4.4")
+app = FastAPI(title="Digit OCR Service", version="4.5")
 
 ocr_dddd = ddddocr.DdddOcr(show_ad=False)
 
@@ -1062,6 +1063,112 @@ async def process_images_gemini_sheet(images_b64: List[str]) -> List[dict]:
     return flat
 
 
+# ---------------------------------------------------------------------------
+# НОВОЕ (v4.5): очередь заданий в стиле 2captcha — submit -> job_id -> poll.
+#
+# Причина: несколько независимых клиентов (браузеров) шлют запросы в один
+# сервис. Раньше /ocr и /ocr/batch держали HTTP-соединение открытым до
+# конца всей обработки — это либо блокирует клиентов друг за другом
+# (при внешней "линейной" очереди клиента), либо приводит к куче зависших
+# долгих HTTP-запросов одновременно, если очереди нет вовсе.
+#
+# Здесь: submit сразу отдаёт job_id и не ждёт результата, обработка стартует
+# в фоне (asyncio.create_task — не BackgroundTasks, тот выполнился бы уже
+# ПОСЛЕ ответа в рамках того же соединения). Сами клиенты не мешают друг
+# другу: конкуренция идёт не за HTTP-слот, а за свободные ключи Gemini
+# внутри уже существующего пула — то есть там, где она и должна быть.
+#
+# _JOB_SEMAPHORE не даёт стартовать больше параллельных job'ов, чем есть
+# живых ключей Gemini — иначе 10 браузеров одновременно устроят 10x
+# чанкинг сразу и завалят пул запросами сверх реальной пропускной
+# способности.
+#
+# Хранилище — простой dict в памяти процесса. Это осознанное упрощение:
+# клиенты "честные" (не подбирают чужие job_id) и всегда приходят забрать
+# свой результат раз в ~5 минут, поэтому TTL не нужен — job удаляется
+# сразу после того, как клиент забрал результат. Работает только при
+# ОДНОМ воркере uvicorn — как и весь остальной процесс (gemini_pool /
+# smart_proxy_pool тоже глобальные объекты процесса). Если когда-нибудь
+# появится несколько воркеров/реплик — JOBS нужно будет вынести в
+# Redis/SQLite, иначе submit и result могут попасть в разные процессы.
+# ---------------------------------------------------------------------------
+JOBS: dict[str, dict] = {}
+
+_JOB_SEMAPHORE = asyncio.Semaphore(max(len(GEMINI_KEYS), 1))
+
+
+class JobSubmitResponse(BaseModel):
+    job_id: str = Field(..., description="Уникальный ID задания, использовать для polling'а")
+    status: str = Field(..., description="Всегда 'pending' сразу после сабмита")
+
+
+class JobResultResponse(BaseModel):
+    status: str = Field(..., description="'pending' | 'done' | 'error'")
+    results: Optional[List[OCRResultItem]] = Field(
+        None, description="Заполнено только когда status == 'done'"
+    )
+    error: Optional[str] = Field(
+        None, description="Текст ошибки, заполнено только когда status == 'error'"
+    )
+
+
+async def _run_job(job_id: str, images: List[str]) -> None:
+    async with _JOB_SEMAPHORE:
+        try:
+            results = await process_images_gemini_sheet(images)
+            JOBS[job_id] = {"status": "done", "results": results}
+        except Exception as e:
+            JOBS[job_id] = {"status": "error", "error": str(e)}
+
+
+@app.post(
+    "/ocr/submit",
+    response_model=JobSubmitResponse,
+    summary="Поставить пачку изображений в очередь на распознавание",
+    description=(
+        "Асинхронный режим (аналог 2captcha): принимает изображения, сразу "
+        "возвращает job_id и НЕ дожидается распознавания. Результат забирать "
+        "через GET /ocr/result/{job_id}. Несколько независимых клиентов могут "
+        "слать сюда одновременно — сервер сам разруливает нагрузку по пулу "
+        "ключей Gemini, никакой очереди на стороне клиента городить не нужно."
+    ),
+    tags=["async queue"],
+)
+async def ocr_submit(req: OCRRequest):
+    images = req.images if isinstance(req.images, list) else [req.images]
+    if not images:
+        raise HTTPException(status_code=400, detail="Пустой список изображений")
+    if len(images) > 500:
+        raise HTTPException(status_code=400, detail="Слишком много изображений за один запрос (лимит 500)")
+
+    job_id = uuid.uuid4().hex
+    JOBS[job_id] = {"status": "pending"}
+    asyncio.create_task(_run_job(job_id, images))
+    return JobSubmitResponse(job_id=job_id, status="pending")
+
+
+@app.get(
+    "/ocr/result/{job_id}",
+    response_model=JobResultResponse,
+    responses={404: {"description": "job_id не найден (не существовал или уже был забран ранее)"}},
+    summary="Забрать результат задания по job_id",
+    description=(
+        "Опрашивать раз в 1.5-2 сек, пока status не станет 'done' или "
+        "'error'. После того как клиент один раз получил финальный статус, "
+        "job удаляется из памяти сервера — повторный запрос тем же job_id "
+        "вернёт 404."
+    ),
+    tags=["async queue"],
+)
+async def ocr_result(job_id: str):
+    job = JOBS.get(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="unknown job_id")
+    if job["status"] in ("done", "error"):
+        JOBS.pop(job_id, None)
+    return job
+
+
 @app.post("/ocr", response_model=OCRResponse)
 async def ocr_endpoint(req: OCRRequest):
     images = req.images if isinstance(req.images, list) else [req.images]
@@ -1124,6 +1231,8 @@ async def health():
         "gemini_variant_retry_cols": GEMINI_VARIANT_RETRY_COLS,
         "gemini_variant_retry_min_votes": GEMINI_VARIANT_RETRY_MIN_VOTES,
         "ocr_max_workers": OCR_MAX_WORKERS,
+        "ocr_jobs_pending": sum(1 for j in JOBS.values() if j["status"] == "pending"),
+        "ocr_jobs_in_memory": len(JOBS),
         "startup_timing": startup_info,
     }
 
