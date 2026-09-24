@@ -33,6 +33,18 @@ ocr_dddd = ddddocr.DdddOcr(show_ad=False)
 OCR_MAX_WORKERS = int(os.getenv("OCR_MAX_WORKERS", "8"))
 EXECUTOR = ThreadPoolExecutor(max_workers=OCR_MAX_WORKERS, thread_name_prefix="ocr-worker")
 
+# Optional Better Stack delivery.  The token is read only from the Render
+# secret/environment store; it is never written to source or emitted in logs.
+# The suffix keeps this source separate from the user's existing Better Stack
+# source while allowing the same code to run locally and on Render.
+BETTERSTACK_URL = os.getenv("BETTERSTACK_URL_kj123664", "").strip().rstrip("/")
+BETTERSTACK_BEARER = os.getenv("BETTERSTACK_BEARER_kj123664", "").strip()
+BETTERSTACK_SERVICE = os.getenv(
+    "BETTERSTACK_SERVICE_kj123664",
+    "bls-ocr",
+).strip() or "bls-ocr"
+BETTERSTACK_ENABLED = bool(BETTERSTACK_URL and BETTERSTACK_BEARER)
+
 
 _RETRY_DELAY_RE = re.compile(r'retry[_\s\-]?delay[^0-9]*(\d+(?:\.\d+)?)', re.IGNORECASE)
 
@@ -395,6 +407,9 @@ class ProxyUnavailable(Exception):
 # значит и нового TCP+TLS хендшейка) на КАЖДЫЙ вызов Gemini.
 # ---------------------------------------------------------------------------
 _HTTPX_CLIENTS: dict[Optional[str], httpx.AsyncClient] = {}
+_BETTERSTACK_QUEUE: Optional[asyncio.Queue] = None
+_BETTERSTACK_TASK: Optional[asyncio.Task] = None
+_BETTERSTACK_CLIENT: Optional[httpx.AsyncClient] = None
 
 
 def _get_http_client(proxy_url: Optional[str]) -> httpx.AsyncClient:
@@ -1122,6 +1137,32 @@ def _utc_iso(timestamp: Optional[float] = None) -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%S", whole) + f".{milliseconds:03d}Z"
 
 
+async def _betterstack_loop() -> None:
+    """Forward structured events without blocking OCR or the request loop."""
+    global _BETTERSTACK_QUEUE, _BETTERSTACK_CLIENT
+    if _BETTERSTACK_QUEUE is None or _BETTERSTACK_CLIENT is None:
+        return
+
+    while True:
+        payload = await _BETTERSTACK_QUEUE.get()
+        try:
+            await _BETTERSTACK_CLIENT.post(
+                BETTERSTACK_URL,
+                headers={
+                    "Authorization": f"Bearer {BETTERSTACK_BEARER}",
+                    "Content-Type": "application/json",
+                },
+                json=payload,
+            )
+        except Exception:
+            # Better Stack is diagnostic plumbing only.  A logging outage must
+            # never turn into an OCR outage and must not recursively create
+            # another log event.
+            pass
+        finally:
+            _BETTERSTACK_QUEUE.task_done()
+
+
 def _job_log(event: str, job_id: str = "", **fields) -> None:
     """Emit one compact, correlation-friendly JSON log line.
 
@@ -1135,11 +1176,22 @@ def _job_log(event: str, job_id: str = "", **fields) -> None:
         "pid": os.getpid(),
         "component": "ocr_job",
         "event": event,
+        "service": BETTERSTACK_SERVICE,
+        "level": "error" if event == "error" else "info",
     }
     if job_id:
         payload["job_id"] = job_id
     payload.update(fields)
+    payload["message"] = f"{event} job={job_id}" if job_id else event
     print(json.dumps(payload, ensure_ascii=False, separators=(",", ":")), flush=True)
+
+    if _BETTERSTACK_QUEUE is not None:
+        try:
+            _BETTERSTACK_QUEUE.put_nowait(dict(payload))
+        except asyncio.QueueFull:
+            # Do not apply backpressure to OCR when the telemetry endpoint is
+            # unavailable or slower than the event stream.
+            JOB_STATS["betterstack_dropped"] += 1
 
 
 def _job_public_payload(job: dict) -> dict:
@@ -1458,6 +1510,11 @@ async def health():
         "ocr_oldest_running_age_seconds": oldest_age(running_jobs),
         "ocr_job_result_ttl_seconds": JOB_RESULT_TTL_SECONDS,
         "ocr_job_stats": dict(JOB_STATS),
+        "betterstack_enabled": BETTERSTACK_ENABLED,
+        "betterstack_service": BETTERSTACK_SERVICE,
+        "betterstack_queue_size": (
+            _BETTERSTACK_QUEUE.qsize() if _BETTERSTACK_QUEUE is not None else 0
+        ),
         "startup_timing": startup_info,
     }
 
@@ -1472,7 +1529,7 @@ async def favicon():
 
 @app.on_event("startup")
 async def on_startup():
-    global _JOB_CLEANUP_TASK
+    global _JOB_CLEANUP_TASK, _BETTERSTACK_QUEUE, _BETTERSTACK_TASK, _BETTERSTACK_CLIENT
     elapsed = time.time() - PROCESS_START_TIME
     payload = {
         "process_start_time": PROCESS_START_TIME,
@@ -1487,20 +1544,33 @@ async def on_startup():
         print(f"[startup_timing] Не удалось записать файл замера: {e}")
 
     _JOB_CLEANUP_TASK = asyncio.create_task(_job_cleanup_loop())
+    if BETTERSTACK_ENABLED:
+        _BETTERSTACK_QUEUE = asyncio.Queue(maxsize=2000)
+        _BETTERSTACK_CLIENT = httpx.AsyncClient(timeout=5.0)
+        _BETTERSTACK_TASK = asyncio.create_task(_betterstack_loop())
     _job_log(
         "service_ready",
         result_ttl_seconds=JOB_RESULT_TTL_SECONDS,
         cleanup_interval_seconds=JOB_CLEANUP_INTERVAL_SECONDS,
         gemini_keys=len(GEMINI_KEYS),
+        betterstack_enabled=BETTERSTACK_ENABLED,
+        betterstack_service=BETTERSTACK_SERVICE,
     )
 
 
 @app.on_event("shutdown")
 async def on_shutdown():
-    global _JOB_CLEANUP_TASK
+    global _JOB_CLEANUP_TASK, _BETTERSTACK_QUEUE, _BETTERSTACK_TASK, _BETTERSTACK_CLIENT
     if _JOB_CLEANUP_TASK is not None:
         _JOB_CLEANUP_TASK.cancel()
         _JOB_CLEANUP_TASK = None
+    if _BETTERSTACK_TASK is not None:
+        _BETTERSTACK_TASK.cancel()
+        _BETTERSTACK_TASK = None
+    if _BETTERSTACK_CLIENT is not None:
+        await _BETTERSTACK_CLIENT.aclose()
+        _BETTERSTACK_CLIENT = None
+    _BETTERSTACK_QUEUE = None
     EXECUTOR.shutdown(wait=False)
     for client in _HTTPX_CLIENTS.values():
         await client.aclose()
