@@ -33,16 +33,106 @@ ocr_dddd = ddddocr.DdddOcr(show_ad=False)
 OCR_MAX_WORKERS = int(os.getenv("OCR_MAX_WORKERS", "8"))
 EXECUTOR = ThreadPoolExecutor(max_workers=OCR_MAX_WORKERS, thread_name_prefix="ocr-worker")
 
-# Optional Better Stack delivery.  The token is read only from the Render
-# secret/environment store; it is never written to source or emitted in logs.
-# The suffix keeps this source separate from the user's existing Better Stack
-# source while allowing the same code to run locally and on Render.
-BETTERSTACK_URL = os.getenv("BETTERSTACK_URL_kj123664", "").strip().rstrip("/")
-BETTERSTACK_BEARER = os.getenv("BETTERSTACK_BEARER_kj123664", "").strip()
-BETTERSTACK_SERVICE = os.getenv(
+# Better Stack configuration follows the same secret flow as Gemini and the
+# proxy pool: Infisical is the primary source, with Render environment values
+# as a fallback.  Set BETTERSTACK_FORCE_RENDER_kj123664=true only when an
+# intentional one-off Render override is needed.
+_INFISICAL_SECRETS_CACHE: Optional[dict[str, str]] = None
+
+
+def _read_infisical_secrets_once() -> dict[str, str]:
+    global _INFISICAL_SECRETS_CACHE
+    if _INFISICAL_SECRETS_CACHE is not None:
+        return _INFISICAL_SECRETS_CACHE
+
+    _INFISICAL_SECRETS_CACHE = {}
+    required = (
+        os.environ.get("INFISICAL_CLIENT_ID"),
+        os.environ.get("INFISICAL_CLIENT_SECRET"),
+        os.environ.get("INFISICAL_PROJECT_ID"),
+    )
+    if not all(required):
+        return _INFISICAL_SECRETS_CACHE
+
+    try:
+        import requests as _requests
+
+        client_id, client_secret, project_id = required
+        environment = os.environ.get("INFISICAL_ENVIRONMENT", "dev")
+        token_resp = _requests.post(
+            "https://app.infisical.com/api/v1/auth/universal-auth/login",
+            json={"clientId": client_id, "clientSecret": client_secret},
+            timeout=20,
+        )
+        token_resp.raise_for_status()
+        token = token_resp.json()["accessToken"]
+        secrets_resp = _requests.get(
+            "https://app.infisical.com/api/v3/secrets/raw",
+            headers={"Authorization": f"Bearer {token}"},
+            params={
+                "workspaceId": project_id,
+                "environment": environment,
+                "include_imports": "true",
+                "secretPath": "/",
+            },
+            timeout=30,
+        )
+        secrets_resp.raise_for_status()
+        _INFISICAL_SECRETS_CACHE = {
+            str(item["secretKey"]): str(item.get("secretValue") or "")
+            for item in secrets_resp.json().get("secrets", [])
+            if item.get("secretKey")
+        }
+        print(
+            f"[pid={os.getpid()}] Infisical: загружено "
+            f"{len(_INFISICAL_SECRETS_CACHE)} секретов для конфигурации"
+        )
+    except Exception as exc:
+        print(
+            f"[pid={os.getpid()}] Infisical: не удалось загрузить "
+            f"Better Stack конфигурацию: {type(exc).__name__}: {exc}"
+        )
+    return _INFISICAL_SECRETS_CACHE
+
+
+def _config_secret(name: str, default: str = "") -> tuple[str, str]:
+    render_value = os.getenv(name, "").strip()
+    force_render = os.getenv(
+        "BETTERSTACK_FORCE_RENDER_kj123664",
+        "",
+    ).strip().lower() in {"1", "true", "yes", "on"}
+    if force_render and render_value:
+        return render_value, "render_override"
+
+    infisical_value = _read_infisical_secrets_once().get(name, "").strip()
+    if infisical_value:
+        return infisical_value, "infisical"
+    if render_value:
+        return render_value, "render_fallback"
+    return default, "default"
+
+
+BETTERSTACK_URL, _BETTERSTACK_URL_SOURCE = _config_secret(
+    "BETTERSTACK_URL_kj123664",
+)
+BETTERSTACK_URL = BETTERSTACK_URL.rstrip("/")
+BETTERSTACK_BEARER, _BETTERSTACK_BEARER_SOURCE = _config_secret(
+    "BETTERSTACK_BEARER_kj123664",
+)
+BETTERSTACK_SERVICE, _BETTERSTACK_SERVICE_SOURCE = _config_secret(
     "BETTERSTACK_SERVICE_kj123664",
     "bls-ocr",
-).strip() or "bls-ocr"
+)
+BETTERSTACK_SERVICE = BETTERSTACK_SERVICE.strip() or "bls-ocr"
+BETTERSTACK_CONFIG_SOURCE = (
+    "infisical"
+    if "infisical" in {
+        _BETTERSTACK_URL_SOURCE,
+        _BETTERSTACK_BEARER_SOURCE,
+        _BETTERSTACK_SERVICE_SOURCE,
+    }
+    else _BETTERSTACK_URL_SOURCE
+)
 BETTERSTACK_ENABLED = bool(BETTERSTACK_URL and BETTERSTACK_BEARER)
 
 
@@ -1512,6 +1602,7 @@ async def health():
         "ocr_job_stats": dict(JOB_STATS),
         "betterstack_enabled": BETTERSTACK_ENABLED,
         "betterstack_service": BETTERSTACK_SERVICE,
+        "betterstack_config_source": BETTERSTACK_CONFIG_SOURCE,
         "betterstack_queue_size": (
             _BETTERSTACK_QUEUE.qsize() if _BETTERSTACK_QUEUE is not None else 0
         ),
@@ -1555,6 +1646,7 @@ async def on_startup():
         gemini_keys=len(GEMINI_KEYS),
         betterstack_enabled=BETTERSTACK_ENABLED,
         betterstack_service=BETTERSTACK_SERVICE,
+        betterstack_config_source=BETTERSTACK_CONFIG_SOURCE,
     )
 
 
