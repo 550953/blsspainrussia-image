@@ -1220,6 +1220,67 @@ _JOB_CLEANUP_TASK: Optional[asyncio.Task] = None
 JOB_STATS = Counter()
 
 
+def _job_queue_metrics(job_id: str, job: dict, now: Optional[float] = None) -> dict:
+    """Return non-secret queue state for one OCR job."""
+    now = time.time() if now is None else float(now)
+    pending = sorted(
+        (
+            (str(candidate_id), candidate)
+            for candidate_id, candidate in JOBS.items()
+            if str(candidate.get("status") or "pending") == "pending"
+        ),
+        key=lambda item: (
+            float(item[1].get("created_at") or 0.0),
+            item[0],
+        ),
+    )
+    running_jobs = sum(
+        str(candidate.get("status") or "") == "running"
+        for candidate in JOBS.values()
+    )
+    status = str(job.get("status") or "pending")
+    queue_position = None
+    if status == "pending":
+        queue_position = next(
+            (
+                index
+                for index, (candidate_id, _candidate) in enumerate(pending, start=1)
+                if candidate_id == str(job_id)
+            ),
+            None,
+        )
+
+    created_at = float(job.get("created_at") or now)
+    started_at = job.get("started_at")
+    finished_at = job.get("finished_at")
+    queue_end = float(started_at) if started_at else now
+    processing_end = (
+        float(finished_at)
+        if finished_at
+        else now
+    )
+    queue_wait_ms = (
+        round(max(0.0, queue_end - created_at) * 1000)
+        if started_at or status == "pending"
+        else None
+    )
+    processing_ms = (
+        round(max(0.0, processing_end - float(started_at)) * 1000)
+        if started_at
+        else None
+    )
+    return {
+        "stage": str(job.get("stage") or ("queued" if status == "pending" else status)),
+        "queue_position": queue_position,
+        "queued_jobs": len(pending),
+        "running_jobs": running_jobs,
+        "max_concurrency": max(len(GEMINI_KEYS), 1),
+        "job_age_ms": round(max(0.0, now - created_at) * 1000),
+        "queue_wait_ms": queue_wait_ms,
+        "processing_ms": processing_ms,
+    }
+
+
 def _utc_iso(timestamp: Optional[float] = None) -> str:
     value = time.time() if timestamp is None else float(timestamp)
     whole = time.gmtime(value)
@@ -1286,17 +1347,25 @@ def _job_log(event: str, job_id: str = "", **fields) -> None:
 
 def _job_public_payload(job: dict) -> dict:
     status = str(job.get("status") or "pending")
+    public_status = (
+        status if status in {"done", "error"} else "pending"
+    )
+    payload = {
+        # Keep the long-standing public status contract. Older clients can
+        # continue polling "pending"; new clients use stage to distinguish
+        # queued from actively processing jobs.
+        "status": public_status,
+        **_job_queue_metrics(
+            str(job.get("job_id") or ""),
+            job,
+        ),
+    }
     if status == "done":
-        return {
-            "status": "done",
-            "results": job.get("results") or [],
-        }
+        payload["results"] = job.get("results") or []
+        return payload
     if status == "error":
-        return {
-            "status": "error",
-            "error": str(job.get("error") or "OCR job error"),
-        }
-    return {"status": "pending"}
+        payload["error"] = str(job.get("error") or "OCR job error")
+    return payload
 
 
 def _cleanup_expired_jobs() -> int:
@@ -1339,6 +1408,16 @@ class JobSubmitResponse(BaseModel):
 
 class JobResultResponse(BaseModel):
     status: str = Field(..., description="'pending' | 'done' | 'error'")
+    stage: Optional[str] = Field(None, description="'queued' | 'processing' | 'finished'")
+    queue_position: Optional[int] = Field(
+        None, description="Приблизительное место среди ожидающих заданий"
+    )
+    queued_jobs: Optional[int] = Field(None, description="Сколько заданий ожидает запуска")
+    running_jobs: Optional[int] = Field(None, description="Сколько заданий обрабатывается")
+    max_concurrency: Optional[int] = Field(None, description="Лимит параллельной обработки")
+    job_age_ms: Optional[int] = Field(None, description="Возраст задания в миллисекундах")
+    queue_wait_ms: Optional[int] = Field(None, description="Ожидание запуска в миллисекундах")
+    processing_ms: Optional[int] = Field(None, description="Время обработки в миллисекундах")
     results: Optional[List[OCRResultItem]] = Field(
         None, description="Заполнено только когда status == 'done'"
     )
@@ -1363,9 +1442,7 @@ async def _run_job(job_id: str, images: List[str]) -> None:
             job_id,
             account_id=job.get("account_id", ""),
             client_request_id=job.get("client_request_id", ""),
-            queue_ms=round(
-                max(0.0, started_at - float(job.get("created_at", started_at))) * 1000
-            ),
+            **_job_queue_metrics(job_id, job, started_at),
         )
         try:
             results = await process_images_gemini_sheet(images)
@@ -1381,12 +1458,12 @@ async def _run_job(job_id: str, images: List[str]) -> None:
                 job_id,
                 account_id=job.get("account_id", ""),
                 client_request_id=job.get("client_request_id", ""),
-                processing_ms=round(max(0.0, finished_at - started_at) * 1000),
                 total_ms=round(
                     max(0.0, finished_at - float(job.get("created_at", finished_at))) * 1000
                 ),
                 result_count=len(results or []),
                 result_ttl_seconds=JOB_RESULT_TTL_SECONDS,
+                **_job_queue_metrics(job_id, job, finished_at),
             )
         except Exception as e:
             finished_at = time.time()
@@ -1403,8 +1480,8 @@ async def _run_job(job_id: str, images: List[str]) -> None:
                 client_request_id=job.get("client_request_id", ""),
                 error_type=type(e).__name__,
                 error=str(e)[:500],
-                processing_ms=round(max(0.0, finished_at - started_at) * 1000),
                 result_ttl_seconds=JOB_RESULT_TTL_SECONDS,
+                **_job_queue_metrics(job_id, job, finished_at),
             )
 
 
@@ -1440,8 +1517,11 @@ async def ocr_submit(req: OCRRequest):
         "poll_count": 0,
         "first_poll_at": None,
         "last_poll_at": None,
+        "last_poll_log_at": None,
+        "last_poll_log_status": None,
         "result_delivered_at": None,
         "expires_at": None,
+        "job_id": job_id,
     }
     JOB_STATS["accepted"] += 1
     _job_log(
@@ -1451,6 +1531,7 @@ async def ocr_submit(req: OCRRequest):
         client_request_id=JOBS[job_id]["client_request_id"],
         image_count=len(images),
         jobs_in_memory=len(JOBS),
+        **_job_queue_metrics(job_id, JOBS[job_id], created_at),
     )
     asyncio.create_task(_run_job(job_id, images))
     return JobSubmitResponse(job_id=job_id, status="pending")
@@ -1483,15 +1564,24 @@ async def ocr_result(job_id: str):
     job["last_poll_at"] = now
 
     status = str(job.get("status") or "pending")
-    _job_log(
-        "poll",
-        job_id,
-        account_id=job.get("account_id", ""),
-        client_request_id=job.get("client_request_id", ""),
-        status=status,
-        poll_count=job["poll_count"],
-        age_ms=round(max(0.0, now - float(job.get("created_at", now))) * 1000),
-    )
+    last_log_at = job.get("last_poll_log_at")
+    last_log_status = job.get("last_poll_log_status")
+    if (
+        last_log_at is None
+        or last_log_status != status
+        or now - float(last_log_at) >= 10.0
+    ):
+        _job_log(
+            "poll",
+            job_id,
+            account_id=job.get("account_id", ""),
+            client_request_id=job.get("client_request_id", ""),
+            status=status,
+            poll_count=job["poll_count"],
+            **_job_queue_metrics(job_id, job, now),
+        )
+        job["last_poll_log_at"] = now
+        job["last_poll_log_status"] = status
 
     if status in ("done", "error") and not job.get("result_delivered_at"):
         job["result_delivered_at"] = now
