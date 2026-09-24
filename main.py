@@ -455,6 +455,11 @@ async def _call_gemini_rest(
 
 class OCRRequest(BaseModel):
     images: Union[str, List[str]] = Field(..., description="Один base64 или список")
+    # These metadata fields are intentionally small and contain no image data.
+    # Workers already send them; keeping them here lets the service correlate a
+    # remote job with the account without logging the Base64 payload.
+    account_id: str = Field("", max_length=128)
+    client_request_id: str = Field("", max_length=128)
 
 
 class OCRResultItem(BaseModel):
@@ -1094,6 +1099,94 @@ async def process_images_gemini_sheet(images_b64: List[str]) -> List[dict]:
 # ---------------------------------------------------------------------------
 JOBS: dict[str, dict] = {}
 
+# A completed result is deliberately retained for a short period instead of
+# being deleted on the first GET.  If a proxy drops the response after the
+# server has produced it, the client can poll the same job again instead of
+# receiving 404 and creating a duplicate OCR request.
+JOB_RESULT_TTL_SECONDS = max(
+    60,
+    int(os.getenv("OCR_JOB_RESULT_TTL_SECONDS", "300")),
+)
+JOB_CLEANUP_INTERVAL_SECONDS = max(
+    5,
+    int(os.getenv("OCR_JOB_CLEANUP_INTERVAL_SECONDS", "30")),
+)
+_JOB_CLEANUP_TASK: Optional[asyncio.Task] = None
+JOB_STATS = Counter()
+
+
+def _utc_iso(timestamp: Optional[float] = None) -> str:
+    value = time.time() if timestamp is None else float(timestamp)
+    whole = time.gmtime(value)
+    milliseconds = int(value * 1000) % 1000
+    return time.strftime("%Y-%m-%dT%H:%M:%S", whole) + f".{milliseconds:03d}Z"
+
+
+def _job_log(event: str, job_id: str = "", **fields) -> None:
+    """Emit one compact, correlation-friendly JSON log line.
+
+    Never pass images, API keys, passwords, or full proxy URLs here.  Render's
+    stdout is the primary diagnostic sink, so a structured line is searchable
+    even when the surrounding Uvicorn access log is interleaved.
+    """
+    JOB_STATS[f"event_{event}"] += 1
+    payload = {
+        "ts": _utc_iso(),
+        "pid": os.getpid(),
+        "component": "ocr_job",
+        "event": event,
+    }
+    if job_id:
+        payload["job_id"] = job_id
+    payload.update(fields)
+    print(json.dumps(payload, ensure_ascii=False, separators=(",", ":")), flush=True)
+
+
+def _job_public_payload(job: dict) -> dict:
+    status = str(job.get("status") or "pending")
+    if status == "done":
+        return {
+            "status": "done",
+            "results": job.get("results") or [],
+        }
+    if status == "error":
+        return {
+            "status": "error",
+            "error": str(job.get("error") or "OCR job error"),
+        }
+    return {"status": "pending"}
+
+
+def _cleanup_expired_jobs() -> int:
+    now = time.time()
+    expired = [
+        job_id
+        for job_id, job in list(JOBS.items())
+        if job.get("expires_at") and now >= float(job["expires_at"])
+    ]
+    for job_id in expired:
+        job = JOBS.pop(job_id, None)
+        if job is None:
+            continue
+        JOB_STATS["expired"] += 1
+        _job_log(
+            "expired",
+            job_id,
+            account_id=job.get("account_id", ""),
+            client_request_id=job.get("client_request_id", ""),
+            final_status=job.get("status", ""),
+            age_ms=round(max(0.0, now - float(job.get("created_at", now))) * 1000),
+            result_delivered=bool(job.get("result_delivered_at")),
+        )
+    return len(expired)
+
+
+async def _job_cleanup_loop() -> None:
+    while True:
+        await asyncio.sleep(JOB_CLEANUP_INTERVAL_SECONDS)
+        _cleanup_expired_jobs()
+
+
 _JOB_SEMAPHORE = asyncio.Semaphore(max(len(GEMINI_KEYS), 1))
 
 
@@ -1113,12 +1206,64 @@ class JobResultResponse(BaseModel):
 
 
 async def _run_job(job_id: str, images: List[str]) -> None:
+    job = JOBS.get(job_id)
+    if job is None:
+        return
+
     async with _JOB_SEMAPHORE:
+        started_at = time.time()
+        job["status"] = "running"
+        job["started_at"] = started_at
+        job["stage"] = "processing"
+        JOB_STATS["started"] += 1
+        _job_log(
+            "started",
+            job_id,
+            account_id=job.get("account_id", ""),
+            client_request_id=job.get("client_request_id", ""),
+            queue_ms=round(
+                max(0.0, started_at - float(job.get("created_at", started_at))) * 1000
+            ),
+        )
         try:
             results = await process_images_gemini_sheet(images)
-            JOBS[job_id] = {"status": "done", "results": results}
+            finished_at = time.time()
+            job["status"] = "done"
+            job["stage"] = "finished"
+            job["results"] = results
+            job["finished_at"] = finished_at
+            job["expires_at"] = finished_at + JOB_RESULT_TTL_SECONDS
+            JOB_STATS["done"] += 1
+            _job_log(
+                "done",
+                job_id,
+                account_id=job.get("account_id", ""),
+                client_request_id=job.get("client_request_id", ""),
+                processing_ms=round(max(0.0, finished_at - started_at) * 1000),
+                total_ms=round(
+                    max(0.0, finished_at - float(job.get("created_at", finished_at))) * 1000
+                ),
+                result_count=len(results or []),
+                result_ttl_seconds=JOB_RESULT_TTL_SECONDS,
+            )
         except Exception as e:
-            JOBS[job_id] = {"status": "error", "error": str(e)}
+            finished_at = time.time()
+            job["status"] = "error"
+            job["stage"] = "finished"
+            job["error"] = str(e)
+            job["finished_at"] = finished_at
+            job["expires_at"] = finished_at + JOB_RESULT_TTL_SECONDS
+            JOB_STATS["error"] += 1
+            _job_log(
+                "error",
+                job_id,
+                account_id=job.get("account_id", ""),
+                client_request_id=job.get("client_request_id", ""),
+                error_type=type(e).__name__,
+                error=str(e)[:500],
+                processing_ms=round(max(0.0, finished_at - started_at) * 1000),
+                result_ttl_seconds=JOB_RESULT_TTL_SECONDS,
+            )
 
 
 @app.post(
@@ -1135,6 +1280,7 @@ async def _run_job(job_id: str, images: List[str]) -> None:
     tags=["async queue"],
 )
 async def ocr_submit(req: OCRRequest):
+    _cleanup_expired_jobs()
     images = req.images if isinstance(req.images, list) else [req.images]
     if not images:
         raise HTTPException(status_code=400, detail="Пустой список изображений")
@@ -1142,7 +1288,28 @@ async def ocr_submit(req: OCRRequest):
         raise HTTPException(status_code=400, detail="Слишком много изображений за один запрос (лимит 500)")
 
     job_id = uuid.uuid4().hex
-    JOBS[job_id] = {"status": "pending"}
+    created_at = time.time()
+    JOBS[job_id] = {
+        "status": "pending",
+        "stage": "queued",
+        "created_at": created_at,
+        "account_id": str(req.account_id or "")[:128],
+        "client_request_id": str(req.client_request_id or "")[:128],
+        "poll_count": 0,
+        "first_poll_at": None,
+        "last_poll_at": None,
+        "result_delivered_at": None,
+        "expires_at": None,
+    }
+    JOB_STATS["accepted"] += 1
+    _job_log(
+        "accepted",
+        job_id,
+        account_id=JOBS[job_id]["account_id"],
+        client_request_id=JOBS[job_id]["client_request_id"],
+        image_count=len(images),
+        jobs_in_memory=len(JOBS),
+    )
     asyncio.create_task(_run_job(job_id, images))
     return JobSubmitResponse(job_id=job_id, status="pending")
 
@@ -1150,23 +1317,55 @@ async def ocr_submit(req: OCRRequest):
 @app.get(
     "/ocr/result/{job_id}",
     response_model=JobResultResponse,
-    responses={404: {"description": "job_id не найден (не существовал или уже был забран ранее)"}},
+    responses={404: {"description": "job_id не найден (не существовал или истёк TTL)"}},
     summary="Забрать результат задания по job_id",
     description=(
         "Опрашивать раз в 1.5-2 сек, пока status не станет 'done' или "
-        "'error'. После того как клиент один раз получил финальный статус, "
-        "job удаляется из памяти сервера — повторный запрос тем же job_id "
-        "вернёт 404."
+        "'error'. Финальный результат остаётся доступен несколько минут, "
+        "чтобы потерянный HTTP-ответ можно было безопасно забрать повторно; "
+        "после TTL job удаляется из памяти сервера."
     ),
     tags=["async queue"],
 )
 async def ocr_result(job_id: str):
+    _cleanup_expired_jobs()
     job = JOBS.get(job_id)
     if job is None:
+        _job_log("not_found", job_id)
         raise HTTPException(status_code=404, detail="unknown job_id")
-    if job["status"] in ("done", "error"):
-        JOBS.pop(job_id, None)
-    return job
+
+    now = time.time()
+    job["poll_count"] = int(job.get("poll_count") or 0) + 1
+    if not job.get("first_poll_at"):
+        job["first_poll_at"] = now
+    job["last_poll_at"] = now
+
+    status = str(job.get("status") or "pending")
+    _job_log(
+        "poll",
+        job_id,
+        account_id=job.get("account_id", ""),
+        client_request_id=job.get("client_request_id", ""),
+        status=status,
+        poll_count=job["poll_count"],
+        age_ms=round(max(0.0, now - float(job.get("created_at", now))) * 1000),
+    )
+
+    if status in ("done", "error") and not job.get("result_delivered_at"):
+        job["result_delivered_at"] = now
+        JOB_STATS["result_delivered"] += 1
+        _job_log(
+            "result_delivered",
+            job_id,
+            account_id=job.get("account_id", ""),
+            client_request_id=job.get("client_request_id", ""),
+            final_status=status,
+            poll_count=job["poll_count"],
+        )
+
+    # Keep the final payload available until the TTL.  This makes polling
+    # idempotent if the first final HTTP response is lost in a proxy.
+    return _job_public_payload(job)
 
 
 @app.post("/ocr", response_model=OCRResponse)
@@ -1189,6 +1388,7 @@ async def ocr_batch_endpoint(req: OCRRequest):
 
 @app.get("/health")
 async def health():
+    _cleanup_expired_jobs()
     startup_info = None
     if STARTUP_TIMING_FILE.exists():
         try:
@@ -1198,6 +1398,26 @@ async def health():
 
     overloaded, remaining = gemini_pool.is_overloaded()
     now = time.monotonic()
+    wall_now = time.time()
+    job_values = list(JOBS.values())
+    pending_jobs = [
+        job for job in job_values if job.get("status") == "pending"
+    ]
+    running_jobs = [
+        job for job in job_values if job.get("status") == "running"
+    ]
+
+    def oldest_age(jobs):
+        if not jobs:
+            return 0
+        return round(
+            max(
+                0.0,
+                wall_now
+                - min(float(job.get("created_at", wall_now)) for job in jobs),
+            ),
+            1,
+        )
 
     return {
         "status": "ok",
@@ -1231,8 +1451,13 @@ async def health():
         "gemini_variant_retry_cols": GEMINI_VARIANT_RETRY_COLS,
         "gemini_variant_retry_min_votes": GEMINI_VARIANT_RETRY_MIN_VOTES,
         "ocr_max_workers": OCR_MAX_WORKERS,
-        "ocr_jobs_pending": sum(1 for j in JOBS.values() if j["status"] == "pending"),
+        "ocr_jobs_pending": len(pending_jobs),
         "ocr_jobs_in_memory": len(JOBS),
+        "ocr_jobs_running": len(running_jobs),
+        "ocr_oldest_pending_age_seconds": oldest_age(pending_jobs),
+        "ocr_oldest_running_age_seconds": oldest_age(running_jobs),
+        "ocr_job_result_ttl_seconds": JOB_RESULT_TTL_SECONDS,
+        "ocr_job_stats": dict(JOB_STATS),
         "startup_timing": startup_info,
     }
 
@@ -1247,6 +1472,7 @@ async def favicon():
 
 @app.on_event("startup")
 async def on_startup():
+    global _JOB_CLEANUP_TASK
     elapsed = time.time() - PROCESS_START_TIME
     payload = {
         "process_start_time": PROCESS_START_TIME,
@@ -1260,9 +1486,21 @@ async def on_startup():
     except Exception as e:
         print(f"[startup_timing] Не удалось записать файл замера: {e}")
 
+    _JOB_CLEANUP_TASK = asyncio.create_task(_job_cleanup_loop())
+    _job_log(
+        "service_ready",
+        result_ttl_seconds=JOB_RESULT_TTL_SECONDS,
+        cleanup_interval_seconds=JOB_CLEANUP_INTERVAL_SECONDS,
+        gemini_keys=len(GEMINI_KEYS),
+    )
+
 
 @app.on_event("shutdown")
 async def on_shutdown():
+    global _JOB_CLEANUP_TASK
+    if _JOB_CLEANUP_TASK is not None:
+        _JOB_CLEANUP_TASK.cancel()
+        _JOB_CLEANUP_TASK = None
     EXECUTOR.shutdown(wait=False)
     for client in _HTTPX_CLIENTS.values():
         await client.aclose()
