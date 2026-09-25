@@ -144,6 +144,139 @@ def _parse_retry_delay(err_text: str) -> float:
     return float(m.group(1)) if m else 0.0
 
 
+def _classify_gemini_http_error(
+    http_status: int,
+    provider_status: str,
+    message: str,
+) -> dict:
+    status = int(http_status or 0)
+    provider = str(provider_status or "").upper()
+    text = str(message or "").casefold()
+
+    if "prepayment credits are depleted" in text:
+        return {
+            "category": "BILLING_CREDITS_DEPLETED",
+            "cooldown_seconds": 0.0,
+            "permanent_key_failure": False,
+            "hold_until_restart": True,
+            "action": "billing_hold_until_restart; no proxy cooldown",
+        }
+    if status == 402:
+        return {
+            "category": "BILLING_PAYMENT_REQUIRED",
+            "cooldown_seconds": 0.0,
+            "permanent_key_failure": False,
+            "hold_until_restart": True,
+            "action": "billing_hold_until_restart; no proxy cooldown",
+        }
+    if status == 403 and "spend cap breached" in text:
+        return {
+            "category": "BILLING_SPEND_CAP_BREACHED",
+            "cooldown_seconds": 0.0,
+            "permanent_key_failure": False,
+            "hold_until_restart": True,
+            "action": "billing_hold_until_restart; no proxy cooldown",
+        }
+    if status == 403 and "project has been denied access" in text:
+        return {
+            "category": "PROJECT_ACCESS_DENIED",
+            "cooldown_seconds": 0.0,
+            "permanent_key_failure": False,
+            "hold_until_restart": True,
+            "action": "project_hold_until_restart; no proxy cooldown",
+        }
+    if (
+        status == 401
+        or "api_key_invalid" in provider.casefold()
+        or "api key not valid" in text
+        or "api key is invalid" in text
+    ):
+        return {
+            "category": "INVALID_API_KEY",
+            "cooldown_seconds": 0.0,
+            "permanent_key_failure": True,
+            "hold_until_restart": False,
+            "action": "key_disabled_until_replaced_and_restart",
+        }
+    if status == 429 or provider == "RESOURCE_EXHAUSTED":
+        retry_after = _parse_retry_delay(message)
+        return {
+            "category": "RATE_LIMIT_OR_QUOTA",
+            "cooldown_seconds": max(30.0, retry_after)
+            + random.uniform(0.0, 3.0),
+            "permanent_key_failure": False,
+            "hold_until_restart": False,
+            "action": "temporary_key_pause; no proxy cooldown",
+        }
+    if status == 403:
+        return {
+            "category": "PROJECT_PERMISSION_DENIED",
+            "cooldown_seconds": 0.0,
+            "permanent_key_failure": False,
+            "hold_until_restart": True,
+            "action": "project_hold_until_restart; no proxy cooldown",
+        }
+    if status == 503 or provider == "UNAVAILABLE":
+        return {
+            "category": "UPSTREAM_UNAVAILABLE",
+            "cooldown_seconds": 10.0 + random.uniform(0.0, 3.0),
+            "permanent_key_failure": False,
+            "hold_until_restart": False,
+            "action": "temporary_key_pause; no proxy cooldown",
+        }
+    return {
+        "category": f"HTTP_{status}" if status else "API_RESPONSE_ERROR",
+        "cooldown_seconds": 15.0,
+        "permanent_key_failure": False,
+        "hold_until_restart": False,
+        "action": "temporary_key_pause; no proxy cooldown",
+    }
+
+
+def _safe_gemini_message(message: str) -> str:
+    text = re.sub(r"[\r\n\t]+", " ", str(message or "")).strip()
+    for secret in globals().get("GEMINI_KEYS", []):
+        if secret:
+            text = text.replace(secret, "[REDACTED_KEY]")
+    text = re.sub(r"projects/\d+", "projects/[REDACTED]", text, flags=re.IGNORECASE)
+    text = re.sub(
+        r"Correlation id:\s*[A-Za-z0-9-]+",
+        "Correlation id: [REDACTED]",
+        text,
+        flags=re.IGNORECASE,
+    )
+    text = re.sub(r"(?i)([?&]key=)[^&\s]+", r"\1[REDACTED]", text)
+    text = re.sub(r"\bAIza[0-9A-Za-z_-]{20,}\b", "[REDACTED_KEY]", text)
+    text = re.sub(
+        r"(?i)((?:x-goog-)?api[_ -]?key\s*[:=]\s*)[^\s,;]+",
+        r"\1[REDACTED_KEY]",
+        text,
+    )
+    return text[:500]
+
+
+class GeminiAPIError(RuntimeError):
+    def __init__(
+        self,
+        http_status: int,
+        provider_status: str,
+        message: str,
+        policy: dict,
+    ):
+        self.http_status = int(http_status or 0)
+        self.provider_status = str(provider_status or "")
+        self.message = _safe_gemini_message(message)
+        self.category = str(policy.get("category") or "API_RESPONSE_ERROR")
+        self.cooldown_seconds = float(policy.get("cooldown_seconds") or 0.0)
+        self.permanent_key_failure = bool(policy.get("permanent_key_failure"))
+        self.hold_until_restart = bool(policy.get("hold_until_restart"))
+        self.action = str(policy.get("action") or "")
+        super().__init__(
+            f"HTTP {self.http_status} "
+            f"{self.provider_status or 'API_ERROR'}: {self.message}"
+        )
+
+
 class GeminiKeyPool:
     """Пул ключей: round-robin + per-key cooldown + глобальный blackout.
 
@@ -156,9 +289,15 @@ class GeminiKeyPool:
     дополнительной защиты от рейт-лимитов, которой уже не было бы от
     reserved-флага и cooldown после реального 429."""
 
-    _BLACKOUT_MULT = 1.0
-    _BLACKOUT_MIN = 30.0
-    _JITTER_MAX = 3.0
+    _BILLING_HOLD_CATEGORIES = {
+        "BILLING_CREDITS_DEPLETED",
+        "BILLING_PAYMENT_REQUIRED",
+        "BILLING_SPEND_CAP_BREACHED",
+    }
+    _PROJECT_HOLD_CATEGORIES = {
+        "PROJECT_ACCESS_DENIED",
+        "PROJECT_PERMISSION_DENIED",
+    }
 
     def __init__(self):
         self.keys: List[str] = []
@@ -167,6 +306,7 @@ class GeminiKeyPool:
         self.reserved: List[bool] = []
         self.dead: List[bool] = []
         self.last_used: List[float] = []
+        self.last_error: List[Optional[dict]] = []
         self.blackout_until: float = 0.0
         self.rr_index: int = 0
 
@@ -196,6 +336,7 @@ class GeminiKeyPool:
         self.reserved = [False] * len(keys)
         self.dead = [False] * len(keys)
         self.last_used = [0.0] * len(keys)
+        self.last_error = [None] * len(keys)
         self.blackout_until = 0.0
         self.rr_index = 0
         print(f"[pid={os.getpid()}] Gemini pool: инициализирован, {len(keys)} ключ(ей)")
@@ -252,6 +393,13 @@ class GeminiKeyPool:
             return True, self.blackout_until - now
         return False, 0.0
 
+    def _is_operator_hold(self, idx: int) -> bool:
+        category = (self.last_error[idx] or {}).get("category")
+        return (
+            category in self._BILLING_HOLD_CATEGORIES
+            or category in self._PROJECT_HOLD_CATEGORIES
+        )
+
     def acquire(self) -> tuple[Optional[int], Optional[str]]:
         """Резервирует и возвращает следующий свободный ключ по кругу.
         (None, None), если свободных сейчас нет."""
@@ -262,48 +410,122 @@ class GeminiKeyPool:
         for _ in range(n):
             idx = self.rr_index % n
             self.rr_index += 1
-            if not self.reserved[idx] and now >= self.blocked[idx]:
+            if (
+                not self.dead[idx]
+                and not self.reserved[idx]
+                and now >= self.blocked[idx]
+            ):
                 self.reserved[idx] = True
                 self.last_used[idx] = now
                 return idx, self.key_names[idx]
         return None, None
 
-    def release(self, idx: int, error_text: Optional[str] = None) -> None:
+    def release(
+        self,
+        idx: int,
+        error: Optional[GeminiAPIError] = None,
+    ) -> dict:
         self.reserved[idx] = False
-        if error_text is None:
-            return
-
         key_name = self.key_names[idx] if idx < len(self.key_names) else f"key_{idx}"
-        err_up = error_text.upper()
+        if error is None:
+            self.blocked[idx] = 0.0
+            self.dead[idx] = False
+            self.last_error[idx] = None
+            return {"state": "READY", "cooldown_seconds": 0.0}
 
-        if "429" in err_up or "RESOURCE_EXHAUSTED" in err_up or "QUOTA" in err_up:
-            base = _parse_retry_delay(error_text)
-            cooldown = max(self._BLACKOUT_MIN, base * self._BLACKOUT_MULT) + random.uniform(0, self._JITTER_MAX)
-            print(f"[pid={os.getpid()}][gemini_key] {key_name} → 429, cooldown {cooldown:.0f} сек")
-        elif "401" in err_up or "403" in err_up or "UNAUTHENTICATED" in err_up or "API_KEY_INVALID" in err_up or "PERMISSION_DENIED" in err_up:
-            cooldown = 3600.0
-            self.dead[idx] = True
-            print(f"[pid={os.getpid()}][gemini_key] {key_name} → ошибка авторизации (401/403), похоже ключ мёртв, cooldown 1ч")
-        elif "503" in err_up or "UNAVAILABLE" in err_up:
-            cooldown = 10.0 + random.uniform(0, self._JITTER_MAX)
-            print(f"[pid={os.getpid()}][gemini_key] {key_name} → 503 (модель перегружена), cooldown {cooldown:.0f} сек")
-        else:
-            cooldown = 15.0
-            print(f"[pid={os.getpid()}][gemini_key] {key_name} → прочая ошибка, cooldown 15 сек: {error_text[:200]}")
+        cooldown = max(0.0, float(error.cooldown_seconds))
+        self.dead[idx] = bool(error.permanent_key_failure)
+        operator_hold = bool(error.hold_until_restart)
+        self.blocked[idx] = (
+            float("inf")
+            if self.dead[idx] or operator_hold
+            else time.monotonic() + cooldown
+        )
+        self.last_error[idx] = {
+            "key_name": key_name,
+            "http_status": error.http_status,
+            "provider_status": error.provider_status,
+            "category": error.category,
+            "message": error.message,
+        }
+        state = (
+            "INVALID_KEY"
+            if self.dead[idx]
+            else "BILLING_HOLD"
+            if error.category in self._BILLING_HOLD_CATEGORIES
+            else "PROJECT_HOLD"
+            if error.category in self._PROJECT_HOLD_CATEGORIES
+            else "COOLDOWN"
+        )
+        state_detail = (
+            "requires_key_replacement=true"
+            if self.dead[idx]
+            else "retry=disabled_until_restart"
+            if operator_hold
+            else f"cooldown={cooldown:.0f}s"
+        )
+        print(
+            f"[pid={os.getpid()}][gemini_key] {key_name} "
+            f"HTTP {error.http_status} {error.category}; "
+            f"state={state}; {state_detail}; "
+            "proxy is not quarantined for API responses",
+            flush=True,
+        )
 
-        self.blocked[idx] = time.monotonic() + cooldown
         now = time.monotonic()
-
-        live_idx = [i for i in range(len(self.keys)) if not self.dead[i]]
-        check_idx = live_idx if live_idx else list(range(len(self.keys)))
-
-        if all(now < self.blocked[i] for i in check_idx):
-            soonest = min(self.blocked[i] for i in check_idx)
+        live_idx = [
+            i
+            for i in range(len(self.keys))
+            if not self.dead[i] and not self._is_operator_hold(i)
+        ]
+        if live_idx and all(now < self.blocked[i] for i in live_idx):
+            soonest = min(self.blocked[i] for i in live_idx)
             if soonest > self.blackout_until:
                 self.blackout_until = soonest
                 wait = soonest - now
-                label = "живые " if live_idx else ""
-                print(f"[pid={os.getpid()}][gemini_key] ВСЕ {label}ключи заняты → blackout {wait:.0f} сек (ближайшее освобождение)")
+                print(
+                    f"[pid={os.getpid()}][gemini_key] все доступные ключи "
+                    f"временно заблокированы; ближайшая проверка через "
+                    f"{wait:.0f}s",
+                    flush=True,
+                )
+        return {
+            "state": state,
+            "cooldown_seconds": cooldown,
+            "permanent_key_failure": self.dead[idx],
+            "hold_until_restart": operator_hold,
+            "category": error.category,
+        }
+
+    def grouped_keys(self, now: Optional[float] = None) -> dict:
+        """Return compact, exhaustive key groups for /health."""
+        now = time.monotonic() if now is None else now
+        groups = {
+            "ready": [],
+            "in_use": [],
+            "cooldown": {},
+            "billing_hold": {},
+            "project_hold": {},
+            "invalid_key": [],
+        }
+        for idx, key_name in enumerate(self.key_names):
+            error = self.last_error[idx] or {}
+            category = str(error.get("category") or "")
+            if self.reserved[idx]:
+                groups["in_use"].append(key_name)
+            elif self.dead[idx]:
+                groups["invalid_key"].append(key_name)
+            elif category in self._BILLING_HOLD_CATEGORIES:
+                groups["billing_hold"].setdefault(category, []).append(key_name)
+            elif category in self._PROJECT_HOLD_CATEGORIES:
+                groups["project_hold"].setdefault(category, []).append(key_name)
+            elif now < self.blocked[idx]:
+                groups["cooldown"].setdefault(
+                    category or "TEMPORARY_BLOCK", []
+                ).append(key_name)
+            else:
+                groups["ready"].append(key_name)
+        return groups
 
 
 gemini_pool = GeminiKeyPool()
@@ -517,7 +739,7 @@ async def _call_gemini_rest(
     api_key: str,
     proxy_url: Optional[str],
     generation_config: Optional[dict] = None,
-) -> str:
+) -> tuple[str, dict]:
     """Прямой REST-вызов к Gemini вместо genai SDK — прокси задаётся на
     каждую попытку отдельно через переиспользуемый клиент (см. выше)."""
     payload = {
@@ -540,7 +762,7 @@ async def _call_gemini_rest(
 
     try:
         response = await http_client.post(url, json=payload)
-    except (httpx.ProxyError, httpx.ConnectError, httpx.ConnectTimeout) as e:
+    except httpx.RequestError as e:
         raise ProxyUnavailable(f"{type(e).__name__}: {e}") from e
     except Exception as e:
         msg = str(e).lower()
@@ -548,14 +770,71 @@ async def _call_gemini_rest(
             raise ProxyUnavailable(f"{type(e).__name__}: {e}") from e
         raise
 
-    if response.status_code != 200:
-        raise RuntimeError(f"{response.status_code} {response.text}")
-
-    data = response.json()
     try:
-        return data["candidates"][0]["content"]["parts"][0]["text"].strip()
+        data = response.json()
+    except Exception:
+        data = {}
+
+    if response.status_code != 200:
+        error_data = data.get("error", {}) if isinstance(data, dict) else {}
+        provider_status = (
+            str(error_data.get("status") or "")
+            if isinstance(error_data, dict)
+            else ""
+        )
+        message = (
+            str(error_data.get("message") or response.text)
+            if isinstance(error_data, dict)
+            else response.text
+        )
+        policy = _classify_gemini_http_error(
+            response.status_code,
+            provider_status,
+            message,
+        )
+        raise GeminiAPIError(
+            response.status_code,
+            provider_status,
+            message,
+            policy,
+        )
+
+    if not isinstance(data, dict):
+        message = "Gemini returned a non-object response."
+        raise GeminiAPIError(
+            response.status_code,
+            "INVALID_RESPONSE",
+            message,
+            _classify_gemini_http_error(
+                response.status_code,
+                "INVALID_RESPONSE",
+                message,
+            ),
+        )
+    candidates = data.get("candidates") or []
+    if not isinstance(candidates, list):
+        candidates = []
+    first_candidate = (
+        candidates[0]
+        if candidates and isinstance(candidates[0], dict)
+        else {}
+    )
+    try:
+        text = first_candidate["content"]["parts"][0]["text"].strip()
     except (KeyError, IndexError):
-        return ""
+        text = ""
+    prompt_feedback = data.get("promptFeedback") or {}
+    if not isinstance(prompt_feedback, dict):
+        prompt_feedback = {}
+    metadata = {
+        "served_model": str(data.get("modelVersion") or model)[:100],
+        "usage_metadata": data.get("usageMetadata") or {},
+        "finish_reason": str(first_candidate.get("finishReason") or "")[:80],
+        "prompt_block_reason": str(prompt_feedback.get("blockReason") or "")[:80],
+        "candidate_count": len(candidates),
+        "text_chars": len(text),
+    }
+    return text, metadata
 
 
 class OCRRequest(BaseModel):
@@ -1004,6 +1283,32 @@ async def recognize_gemini_sheet_async(
     if not GEMINI_KEYS or gemini_model_name is None:
         return [{"text": "0", "source": "gemini_sheet_unavailable"} for _ in images]
 
+    key_groups = gemini_pool.grouped_keys()
+    if not key_groups["ready"] and not key_groups["in_use"] and not key_groups["cooldown"]:
+        all_invalid = bool(key_groups["invalid_key"]) and not (
+            key_groups["billing_hold"] or key_groups["project_hold"]
+        )
+        category = "ALL_KEYS_INVALID" if all_invalid else "ALL_KEYS_ON_HOLD"
+        source = (
+            "gemini_sheet_keys_invalid"
+            if all_invalid
+            else "gemini_sheet_keys_held"
+        )
+        _job_log(
+            "gemini_keys_unavailable",
+            key_profile="pool",
+            category=category,
+            action="returned_zero_without_retry",
+            invalid_key_count=len(key_groups["invalid_key"]),
+            billing_hold_count=sum(
+                len(names) for names in key_groups["billing_hold"].values()
+            ),
+            project_hold_count=sum(
+                len(names) for names in key_groups["project_hold"].values()
+            ),
+        )
+        return [{"text": "0", "source": source} for _ in images]
+
     try:
         png_bytes = make_gemini_contact_sheet(images, cols=cols)
     except ValueError as exc:
@@ -1018,10 +1323,18 @@ async def recognize_gemini_sheet_async(
     max_attempts = max(4, min(24, len(GEMINI_KEYS) * 2 + len(smart_proxy_pool.routes)))
     attempted_routes: set[tuple[int, Optional[str]]] = set()
     last_error: Optional[str] = None
+    attempt_no = 0
 
     for _ in range(max_attempts):
         idx, key_name = gemini_pool.acquire()
         if idx is None:
+            current_groups = gemini_pool.grouped_keys()
+            if (
+                not current_groups["ready"]
+                and not current_groups["in_use"]
+                and not current_groups["cooldown"]
+            ):
+                break
             await asyncio.sleep(GEMINI_ACQUIRE_POLL)
             continue
 
@@ -1032,9 +1345,10 @@ async def recognize_gemini_sheet_async(
             await asyncio.sleep(GEMINI_ACQUIRE_POLL)
             continue
         attempted_routes.add(route_key)
+        attempt_no += 1
 
         try:
-            text = await _call_gemini_rest(
+            text, response_metadata = await _call_gemini_rest(
                 png_bytes,
                 effective_prompt,
                 gemini_model_name,
@@ -1049,6 +1363,39 @@ async def recognize_gemini_sheet_async(
             values = parse_gemini_sheet_result(text, len(images))
             smart_proxy_pool.mark_ok(proxy_url)
             gemini_pool.release(idx, None)
+            usage = response_metadata.get("usage_metadata") or {}
+            _job_log(
+                "gemini_attempt",
+                key_profile=key_name,
+                model=gemini_model_name,
+                served_model=response_metadata.get("served_model", gemini_model_name),
+                proxy=_proxy_label(proxy_url),
+                attempt=attempt_no,
+                http_status=200,
+                category="SUCCESS",
+                action="key_released",
+                image_count=len(images),
+                zero_count=sum(value == "0" for value in values),
+                usage={
+                    field: int(usage[field])
+                    for field in (
+                        "promptTokenCount",
+                        "candidatesTokenCount",
+                        "totalTokenCount",
+                        "thoughtsTokenCount",
+                    )
+                    if isinstance(usage, dict)
+                    and isinstance(usage.get(field), (int, float))
+                },
+                response_state={
+                    "finish_reason": response_metadata.get("finish_reason", ""),
+                    "prompt_block_reason": response_metadata.get(
+                        "prompt_block_reason", ""
+                    ),
+                    "candidate_count": response_metadata.get("candidate_count", 0),
+                    "text_chars": response_metadata.get("text_chars", 0),
+                },
+            )
             print(
                 f"[pid={os.getpid()}][gemini_sheet] OK key={key_name} "
                 f"proxy={_proxy_label(proxy_url)} images={len(images)}"
@@ -1058,13 +1405,70 @@ async def recognize_gemini_sheet_async(
                 for value in values
             ]
         except ProxyUnavailable as exc:
-            last_error = f"{type(exc).__name__}: {exc}"
+            last_error = (
+                f"{type(exc).__name__}: "
+                f"{_safe_gemini_message(str(exc))}"
+            )
             smart_proxy_pool.mark_failed(proxy_url, exc)
             gemini_pool.release(idx, None)
+            _job_log(
+                "gemini_proxy_error",
+                key_profile=key_name,
+                model=gemini_model_name,
+                proxy=_proxy_label(proxy_url),
+                attempt=attempt_no,
+                category="PROXY_UNAVAILABLE",
+                action="key_released_without_cooldown",
+                image_count=len(images),
+                error_type=type(exc).__name__,
+            )
+        except GeminiAPIError as exc:
+            last_error = str(exc)
+            smart_proxy_pool.mark_ok(proxy_url)
+            state = gemini_pool.release(idx, exc)
+            _job_log(
+                "gemini_api_error",
+                key_profile=key_name,
+                model=gemini_model_name,
+                proxy=_proxy_label(proxy_url),
+                attempt=attempt_no,
+                http_status=exc.http_status,
+                provider_status=exc.provider_status,
+                category=exc.category,
+                action=exc.action,
+                cooldown_seconds=exc.cooldown_seconds,
+                hold_until_restart=exc.hold_until_restart,
+                key_state=state["state"],
+                image_count=len(images),
+                api_message=exc.message,
+            )
         except Exception as exc:
-            last_error = f"{type(exc).__name__}: {exc}"
-            smart_proxy_pool.mark_failed(proxy_url, last_error)
-            gemini_pool.release(idx, last_error)
+            last_error = f"{type(exc).__name__}: {_safe_gemini_message(str(exc))}"
+            smart_proxy_pool.mark_ok(proxy_url)
+            policy = {
+                "category": "MODEL_OR_RESPONSE_ERROR",
+                "cooldown_seconds": 15.0,
+                "permanent_key_failure": False,
+                "hold_until_restart": False,
+                "action": "temporary_key_pause; proxy is healthy",
+            }
+            api_error = GeminiAPIError(0, "CLIENT_RESPONSE_ERROR", last_error, policy)
+            state = gemini_pool.release(idx, api_error)
+            _job_log(
+                "gemini_api_error",
+                key_profile=key_name,
+                model=gemini_model_name,
+                proxy=_proxy_label(proxy_url),
+                attempt=attempt_no,
+                http_status=0,
+                provider_status="CLIENT_RESPONSE_ERROR",
+                category=api_error.category,
+                action=api_error.action,
+                cooldown_seconds=api_error.cooldown_seconds,
+                key_state=state["state"],
+                image_count=len(images),
+                api_message=api_error.message,
+            )
 
     print(
         f"[pid={os.getpid()}][gemini_sheet] не удалось выполнить запрос: "
@@ -1328,7 +1732,11 @@ def _job_log(event: str, job_id: str = "", **fields) -> None:
         "component": "ocr_job",
         "event": event,
         "service": BETTERSTACK_SERVICE,
-        "level": "error" if event == "error" else "info",
+        "level": (
+            "error"
+            if event in {"error", "gemini_api_error"}
+            else "info"
+        ),
     }
     if job_id:
         payload["job_id"] = job_id
@@ -1655,28 +2063,13 @@ async def health():
         "status": "ok",
         "pid": os.getpid(),
         "gemini_keys_count": len(GEMINI_KEYS),
-        "gemini_key_names": gemini_pool.key_names,
+        "gemini_keys_by_state": gemini_pool.grouped_keys(now=now),
         "gemini_model": gemini_model_name,
         "gemini_pool_overloaded": overloaded,
         "gemini_pool_overloaded_seconds_left": round(remaining, 1) if overloaded else 0,
         "gemini_proxy_channels": len(GEMINI_PROXIES),
         "gemini_proxy_mode": "proxied+direct_fallback" if _configured_proxies else "direct_only",
         "gemini_proxy_source": _proxy_source,
-        "gemini_keys_on_cooldown": [
-            gemini_pool.key_names[i]
-            for i, t in enumerate(gemini_pool.blocked)
-            if now < t
-        ],
-        "gemini_keys_in_use": [
-            gemini_pool.key_names[i]
-            for i, busy in enumerate(gemini_pool.reserved)
-            if busy
-        ],
-        "gemini_keys_dead": [
-            gemini_pool.key_names[i]
-            for i, dead in enumerate(gemini_pool.dead)
-            if dead
-        ],
         "gemini_sheet_chunk_size": GEMINI_SHEET_CHUNK_SIZE,
         "gemini_sheet_max_concurrent_chunks": GEMINI_SHEET_MAX_CONCURRENT_CHUNKS,
         "gemini_variant_retry_enabled": GEMINI_VARIANT_RETRY_ENABLED,
