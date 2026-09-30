@@ -1,7 +1,7 @@
 """Pydantic-модели запросов и ответов."""
 from typing import List, Optional, Union
 
-from pydantic import BaseModel, Field, HttpUrl, model_validator
+from pydantic import BaseModel, Field
 
 
 class OCRRequest(BaseModel):
@@ -39,29 +39,22 @@ class JobResultResponse(BaseModel):
     error: Optional[str] = Field(None, description="Текст ошибки, только когда status == 'error'")
 
 
-# --------------------------------------------------------------------------- Mail.ru captcha6
+# ---------------------------------------------------------------------------
+# mail.ru captcha (6 alphanumeric)
+# ---------------------------------------------------------------------------
 
 class Captcha6Request(BaseModel):
-    """Запрос на распознавание одной Mail.ru-капчи (6 символов)."""
-    image_url: Optional[HttpUrl] = None
-    image_base64: Optional[str] = None
-    source: Optional[str] = Field(None, description='"mail.ru" | "captcha6" | null')
-    prompt: Optional[str] = None
-    expected_length: int = 6
-
-    @model_validator(mode="after")
-    def _one_source(self):
-        if not self.image_base64 and not self.image_url:
-            raise ValueError("Нужен image_base64 или image_url")
-        if self.image_base64 and self.image_url:
-            raise ValueError("Укажи только одно: base64 или URL")
-        return self
+    """Одна картинка mail.ru-капчи + опциональный url для логов."""
+    image: str = Field(..., description="base64 PNG/JPEG (можно с data:image/...;base64,)")
+    url: Optional[str] = Field(
+        None,
+        description="Опционально: исходный URL капчи (c.mail.ru/c/...?r=...), только для логов",
+        max_length=512,
+    )
+    account_id: str = Field("", max_length=128)
+    client_request_id: str = Field("", max_length=128)
 
 
 class Captcha6Response(BaseModel):
-    text: str
-    raw: Optional[str] = None
-    length: int
-    engine: str
-    duration_ms: Optional[int] = None
-    confidence: Optional[float] = None
+    text: str = Field(..., description="6 символов A-Z0-9 или пустая строка при ошибке")
+    source: str = Field(..., description="Источник распознавания, например mailru_gemini")

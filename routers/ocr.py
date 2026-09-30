@@ -1,11 +1,10 @@
-"""Эндпоинты распознавания: очередь (submit/result) и синхронные /ocr, /ocr/batch + captcha6."""
+"""Эндпоинты распознавания: очередь (submit/result) и синхронные /ocr, /ocr/batch, /ocr/captcha6."""
 import asyncio
 import time
 import uuid
 
 from fastapi import APIRouter, HTTPException
 
-from ..captcha6 import CAPTCHA_6_PROMPT, download_image, solve_captcha6
 from ..jobs import JOBS, _cleanup_expired_jobs, _job_public_payload, _job_queue_metrics, _run_job
 from ..pipeline import process_images_gemini_sheet
 from ..schemas import (
@@ -18,6 +17,7 @@ from ..schemas import (
 )
 from ..telemetry import JOB_STATS, _account_touch, _job_log
 from ..utils import clean_base64
+from ..mailru_captcha import recognize_mailru_captcha
 
 router = APIRouter()
 
@@ -150,30 +150,42 @@ async def ocr_batch_endpoint(req: OCRRequest):
 @router.post(
     "/ocr/captcha6",
     response_model=Captcha6Response,
-    summary="Распознать одну Mail.ru-капчу (6 символов)",
+    summary="Распознать капчу mail.ru (6 alphanumeric)",
     description=(
-        "Один запрос = одна картинка, без contact sheet. Принимает image_url ИЛИ image_base64. "
-        "Gemini, при неполном ответе запасной ddddocr. text всегда в нижнем регистре и длиной "
-        "expected_length ('?' на месте нечитаемых символов)."
+        "Синхронный эндпоинт для одной картинки mail.ru-капчи. "
+        "Ожидает base64 в поле image. Поле url опционально (только для логов). "
+        "Возвращает 6 символов A-Z0-9 или пустую строку при ошибке."
     ),
-    tags=["captcha6"],
+    tags=["mail.ru"],
 )
-async def ocr_captcha6(req: Captcha6Request) -> Captcha6Response:
-    t0 = time.perf_counter()
-    if req.image_url:
-        img_bytes = await download_image(str(req.image_url))
-    else:
-        img_bytes = clean_base64(req.image_base64 or "")
+async def ocr_captcha6(req: Captcha6Request):
+    image_bytes = clean_base64(req.image)
+    if len(image_bytes) < 100:
+        raise HTTPException(status_code=400, detail="image too small")
+    if len(image_bytes) > 2_000_000:
+        raise HTTPException(status_code=400, detail="image too large")
 
-    text, raw, engine = await solve_captcha6(
-        img_bytes,
-        req.prompt or CAPTCHA_6_PROMPT,
-        req.expected_length,
+    account_id = str(req.account_id or "")[:128]
+    client_request_id = str(req.client_request_id or "")[:128]
+    captcha_url = (req.url or "")[:512]
+
+    _job_log(
+        "mailru_accepted",
+        account_id=account_id,
+        client_request_id=client_request_id,
+        captcha_url=captcha_url or None,
+        image_bytes=len(image_bytes),
     )
-    return Captcha6Response(
-        text=text,
-        raw=raw,
-        length=len(text),
-        engine=engine,
-        duration_ms=int((time.perf_counter() - t0) * 1000),
+
+    text, source = await recognize_mailru_captcha(image_bytes)
+
+    _job_log(
+        "mailru_done",
+        account_id=account_id,
+        client_request_id=client_request_id,
+        captcha_url=captcha_url or None,
+        text=text or None,
+        source=source,
     )
+
+    return Captcha6Response(text=text or "", source=source)
