@@ -1,4 +1,4 @@
-"""Эндпоинты распознавания: очередь (submit/result) и синхронные /ocr, /ocr/batch."""
+"""Эндпоинты распознавания: очередь (submit/result) и синхронные /ocr, /ocr/batch, /ocr/captcha6."""
 import asyncio
 import time
 import uuid
@@ -7,8 +7,17 @@ from fastapi import APIRouter, HTTPException
 
 from ..jobs import JOBS, _cleanup_expired_jobs, _job_public_payload, _job_queue_metrics, _run_job
 from ..pipeline import process_images_gemini_sheet
-from ..schemas import JobResultResponse, JobSubmitResponse, OCRRequest, OCRResponse
+from ..schemas import (
+    Captcha6Request,
+    Captcha6Response,
+    JobResultResponse,
+    JobSubmitResponse,
+    OCRRequest,
+    OCRResponse,
+)
 from ..telemetry import JOB_STATS, _account_touch, _job_log
+from ..utils import clean_base64
+from ..mailru_captcha import recognize_mailru_captcha
 
 router = APIRouter()
 
@@ -136,3 +145,47 @@ async def ocr_batch_endpoint(req: OCRRequest):
     if len(images) > 500:
         raise HTTPException(status_code=400, detail="Слишком много изображений за один запрос (лимит 500)")
     return OCRResponse(results=await process_images_gemini_sheet(images))
+
+
+@router.post(
+    "/ocr/captcha6",
+    response_model=Captcha6Response,
+    summary="Распознать капчу mail.ru (6 alphanumeric)",
+    description=(
+        "Синхронный эндпоинт для одной картинки mail.ru-капчи. "
+        "Ожидает base64 в поле image. Поле url опционально (только для логов). "
+        "Возвращает 6 символов A-Z0-9 или пустую строку при ошибке."
+    ),
+    tags=["mail.ru"],
+)
+async def ocr_captcha6(req: Captcha6Request):
+    image_bytes = clean_base64(req.image)
+    if len(image_bytes) < 100:
+        raise HTTPException(status_code=400, detail="image too small")
+    if len(image_bytes) > 2_000_000:
+        raise HTTPException(status_code=400, detail="image too large")
+
+    account_id = str(req.account_id or "")[:128]
+    client_request_id = str(req.client_request_id or "")[:128]
+    captcha_url = (req.url or "")[:512]
+
+    _job_log(
+        "mailru_accepted",
+        account_id=account_id,
+        client_request_id=client_request_id,
+        captcha_url=captcha_url or None,
+        image_bytes=len(image_bytes),
+    )
+
+    text, source = await recognize_mailru_captcha(image_bytes)
+
+    _job_log(
+        "mailru_done",
+        account_id=account_id,
+        client_request_id=client_request_id,
+        captcha_url=captcha_url or None,
+        text=text or None,
+        source=source,
+    )
+
+    return Captcha6Response(text=text or "", source=source)

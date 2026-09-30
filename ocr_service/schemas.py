@@ -37,3 +37,24 @@ class JobResultResponse(BaseModel):
     processing_ms: Optional[int] = Field(None, description="Время обработки в миллисекундах")
     results: Optional[List[OCRResultItem]] = Field(None, description="Заполнено только когда status == 'done'")
     error: Optional[str] = Field(None, description="Текст ошибки, только когда status == 'error'")
+
+
+# ---------------------------------------------------------------------------
+# mail.ru captcha (6 alphanumeric)
+# ---------------------------------------------------------------------------
+
+class Captcha6Request(BaseModel):
+    """Одна картинка mail.ru-капчи + опциональный url для логов."""
+    image: str = Field(..., description="base64 PNG/JPEG (можно с data:image/...;base64,)")
+    url: Optional[str] = Field(
+        None,
+        description="Опционально: исходный URL капчи (c.mail.ru/c/...?r=...), только для логов",
+        max_length=512,
+    )
+    account_id: str = Field("", max_length=128)
+    client_request_id: str = Field("", max_length=128)
+
+
+class Captcha6Response(BaseModel):
+    text: str = Field(..., description="6 символов A-Z0-9 или пустая строка при ошибке")
+    source: str = Field(..., description="Источник распознавания, например mailru_gemini")
