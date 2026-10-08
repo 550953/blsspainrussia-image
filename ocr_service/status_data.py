@@ -14,6 +14,7 @@ from .config import (
     PROCESS_START_TIME,
 )
 from .jobs import JOB_RESULT_TTL_SECONDS, JOBS, _cleanup_expired_jobs
+from .config import GEMINI_MODELS
 from .key_pool import GEMINI_KEYS, gemini_model_name, gemini_pool
 from .pipeline import GEMINI_SHEET_MAX_CONCURRENT_CHUNKS
 from .proxies import _configured_proxies, _proxy_label, _proxy_source, smart_proxy_pool
@@ -44,13 +45,25 @@ def build_status() -> dict:
     # --- попытки Gemini за окно: по ключам и по прокси ---
     per_key: dict = {}
     per_proxy: dict = {}
+    per_model: dict = {}
     win = {"ok": 0, "api_err": 0, "n429": 0, "proxy_err": 0}
-    for ts, key, proxy, category, latency, _images, _zeros in ATTEMPTS:
+    for ts, key, proxy, category, latency, _images, _zeros, model in ATTEMPTS:
         if ts < cutoff:
             continue
         k = per_key.setdefault(key, {"ok": 0, "err": 0})
         p = per_proxy.setdefault(proxy, {"n": 0, "ok": 0, "n429": 0, "perr": 0, "lat": []})
         p["n"] += 1
+        if category != "PROXY_UNAVAILABLE":  # до модели запрос не дошёл: ей не засчитываем
+            m = per_model.setdefault(model, {"n": 0, "ok": 0, "n429": 0, "n5xx": 0, "lat": []})
+            m["n"] += 1
+            if category == "SUCCESS":
+                m["ok"] += 1
+                if latency is not None:
+                    m["lat"].append(latency)
+            elif category == "RATE_LIMIT_OR_QUOTA":
+                m["n429"] += 1
+            elif category == "UPSTREAM_UNAVAILABLE" or category in ("HTTP_500", "HTTP_502", "HTTP_504"):
+                m["n5xx"] += 1
         if category == "SUCCESS":
             win["ok"] += 1
             k["ok"] += 1
@@ -95,6 +108,19 @@ def build_status() -> dict:
             "ok_pct": round(100.0 * p["ok"] / p["n"], 1) if p["n"] else None,
             "n429": p["n429"], "proxy_err": p["perr"],
             "p50_ms": _percentile(p["lat"], 0.5), "p95_ms": _percentile(p["lat"], 0.95),
+        })
+
+    # --- модели: цепочка + всё, что реально отвечало за окно ---
+    models = []
+    names = list(GEMINI_MODELS) + [m for m in per_model if m not in GEMINI_MODELS and m != "?"]
+    for name in names:
+        m = per_model.get(name, {"n": 0, "ok": 0, "n429": 0, "n5xx": 0, "lat": []})
+        left = max(0.0, gemini_pool.model_blocked_until.get(name, 0.0) - mono)
+        models.append({
+            "name": name, "in_chain": name in GEMINI_MODELS,
+            "state": "bypass" if left > 0 else "ready", "bypass_left": round(left, 1),
+            "attempts": m["n"], "ok_pct": round(100.0 * m["ok"] / m["n"], 1) if m["n"] else None,
+            "n5xx": m["n5xx"], "n429": m["n429"], "p50_ms": _percentile(m["lat"], 0.5),
         })
 
     # --- качество за окно ---
@@ -197,6 +223,7 @@ def build_status() -> dict:
         },
         "jobs": jobs,
         "clients": clients,
+        "models": models,
         "proxies": {
             "mode": "proxied+direct_fallback" if _configured_proxies else "direct_only",
             "source": _proxy_source, "channels": len(smart_proxy_pool.routes), "list": proxies,

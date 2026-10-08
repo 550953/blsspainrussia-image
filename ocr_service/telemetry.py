@@ -15,7 +15,7 @@ from .config import BETTERSTACK_BEARER, BETTERSTACK_ENABLED, BETTERSTACK_SERVICE
 
 JOB_STATS = Counter()
 
-ATTEMPTS: deque = deque(maxlen=20000)   # (ts, key, proxy, category, latency_ms, images, zeros)
+ATTEMPTS: deque = deque(maxlen=20000)   # (ts, key, proxy, category, latency_ms, images, zeros, model)
 QUALITY: deque = deque(maxlen=20000)    # (ts, kind, n)
 KEY_LAST: dict = {}                     # key_name -> {used, ok, err, err_cat, err_http, err_msg}
 LAST_EVENT = {"attempt": None, "ok": None, "err": None}
@@ -31,6 +31,7 @@ def _record_attempt(p: dict) -> None:
     ATTEMPTS.append((
         now, key, str(p.get("proxy") or "DIRECT"), category, p.get("latency_ms"),
         int(p.get("image_count") or 0), int(p.get("zero_count") or 0),
+        str(p.get("served_model") or p.get("model") or "?"),
     ))
     LAST_EVENT["attempt"] = now
     last = KEY_LAST.setdefault(key, {})

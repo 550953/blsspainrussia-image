@@ -42,6 +42,7 @@ td.wrap{white-space:normal;min-width:220px}
 <div class="sec"><h2>Задания в памяти</h2><div class="scroll" id="jobs"></div></div>
 <div class="sec"><h2>Клиенты</h2><div class="scroll" id="clients"></div></div>
 <div class="sec"><h2>Ключи Gemini</h2><div class="scroll" id="keys"></div></div>
+<div class="sec"><h2>Модели за час</h2><div class="scroll" id="models"></div></div>
 <div class="sec"><h2>Прокси за час</h2><div class="scroll" id="proxies"></div></div>
 <div class="two">
   <div class="sec"><h2>События с запуска</h2><div id="counters"></div></div>
@@ -121,6 +122,11 @@ function render(d){
       if(k.err_cat)why=esc(k.err_cat)+(k.err_http!=null?' · HTTP '+k.err_http:'')+(k.state==='cooldown'?' · пауза ещё ~'+Math.round(k.cooldown_left)+' с':'')+(k.state==='invalid'?' · ключ надо заменить':'')+(k.state==='billing'||k.state==='project'?' · нужен рестарт':'')+(k.err_msg?'<br><span class="sub">'+esc(k.err_msg)+'</span>':'');
       return [esc(short(k.name)),chip(...KEY_STATE[k.state]),ago(k.used_ago),ago(k.ok_ago),ago(k.err_ago),k.ok_1h+' / '+(k.err_1h?'<span class="w">'+k.err_1h+'</span>':0),{w:1,h:why}];
     }));
+  // --- модели: кто реально отвечал и кого обходим из-за перегрузки ---
+  $('models').innerHTML=table(['Модель','Состояние','Попыток','Успех','503/5xx','429','p50'],
+    d.models.map(m=>[esc(m.name)+(m.in_chain?'':' <span class="sub">(не в цепочке)</span>'),
+      m.state==='bypass'?chip('обход ещё '+Math.round(m.bypass_left)+' с','warn'):chip('работает','ok'),
+      m.attempts,m.ok_pct==null?'—':m.ok_pct+'%',m.n5xx?'<span class="w">'+m.n5xx+'</span>':0,m.n429,dur(m.p50_ms)]));
   // --- прокси: канал с p50 сильно выше медианы подсвечивается ---
   const p50s=d.proxies.list.map(p=>p.p50_ms).filter(x=>x!=null).sort((a,b)=>a-b);
   const med=p50s.length?p50s[Math.floor(p50s.length/2)]:null;
