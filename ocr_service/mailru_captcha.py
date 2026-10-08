@@ -213,6 +213,9 @@ async def recognize_mailru_captcha(image_bytes: bytes) -> Tuple[str, str]:
                 api_message=api_error.message,
                 captcha_type="mailru",
             )
+        finally:
+            # CancelledError не ловится "except Exception": без finally ключ терялся навсегда.
+            gemini_pool.ensure_released(idx)
 
     print(
         f"[pid={os.getpid()}][mailru] fail: {last_error or 'нет доступного ключа/канала'}"

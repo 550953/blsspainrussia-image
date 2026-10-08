@@ -5,7 +5,7 @@ import uuid
 
 from fastapi import APIRouter, HTTPException
 
-from ..jobs import JOBS, _cleanup_expired_jobs, _job_public_payload, _job_queue_metrics, _run_job
+from ..jobs import JOBS, _cleanup_expired_jobs, _job_public_payload, _job_queue_metrics, spawn_job
 from ..pipeline import process_images_gemini_sheet
 from ..schemas import (
     Captcha6Request,
@@ -69,7 +69,7 @@ async def ocr_submit(req: OCRRequest):
         jobs_in_memory=len(JOBS),
         **_job_queue_metrics(job_id, JOBS[job_id], created_at),
     )
-    asyncio.create_task(_run_job(job_id, images))
+    spawn_job(job_id, images)
     return JobSubmitResponse(job_id=job_id, status="pending")
 
 

@@ -1,5 +1,7 @@
 """Низкоуровневый REST-вызов Gemini через httpx (по одному клиенту на канал)."""
+import asyncio
 import base64
+import os
 from typing import Optional
 
 import httpx
@@ -13,11 +15,15 @@ GEMINI_REST_URL = "https://generativelanguage.googleapis.com/v1beta/models/{mode
 # Один httpx.AsyncClient на канал (keep-alive), а не новый TCP+TLS на каждый вызов.
 _HTTPX_CLIENTS: dict = {}
 
+# Жёсткий потолок на ВЕСЬ вызов. httpx-timeout не покрывает SOCKS5-handshake:
+# прокси, принявший TCP и замолчавший, вешает запрос навсегда.
+GEMINI_HARD_TIMEOUT = float(os.getenv("GEMINI_HARD_TIMEOUT", "45"))
+
 
 def _get_http_client(proxy_url: Optional[str]) -> httpx.AsyncClient:
     client = _HTTPX_CLIENTS.get(proxy_url)
     if client is None:
-        client = httpx.AsyncClient(proxy=proxy_url, timeout=20.0)
+        client = httpx.AsyncClient(proxy=proxy_url, timeout=httpx.Timeout(20.0, connect=10.0))
         _HTTPX_CLIENTS[proxy_url] = client
     return client
 
@@ -51,7 +57,12 @@ async def _call_gemini_rest(
     http_client = _get_http_client(proxy_url)
 
     try:
-        response = await http_client.post(url, json=payload, headers={"x-goog-api-key": api_key})
+        response = await asyncio.wait_for(
+            http_client.post(url, json=payload, headers={"x-goog-api-key": api_key}),
+            timeout=GEMINI_HARD_TIMEOUT,
+        )
+    except asyncio.TimeoutError as e:
+        raise ProxyUnavailable(f"HardTimeout>{GEMINI_HARD_TIMEOUT:.0f}s: канал завис, ответа нет") from e
     except httpx.RequestError as e:
         raise ProxyUnavailable(f"{type(e).__name__}: {e}") from e
     except Exception as e:

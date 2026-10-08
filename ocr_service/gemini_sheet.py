@@ -203,6 +203,9 @@ async def recognize_gemini_sheet_async(
                 image_count=len(images),
                 api_message=api_error.message,
             )
+        finally:
+            # CancelledError не ловится "except Exception": без finally ключ терялся навсегда.
+            gemini_pool.ensure_released(idx)
 
     print(
         f"[pid={os.getpid()}][gemini_sheet] не удалось выполнить запрос: "

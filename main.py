@@ -65,11 +65,14 @@ async def on_startup():
         print(f"[startup_timing] Не удалось записать файл замера: {e}")
 
     jobs.start_cleanup_loop()
+    jobs.start_watchdog()
     telemetry.start_betterstack()
     telemetry._job_log(
         "service_ready",
         result_ttl_seconds=jobs.JOB_RESULT_TTL_SECONDS,
         cleanup_interval_seconds=jobs.JOB_CLEANUP_INTERVAL_SECONDS,
+        job_max_seconds=jobs.JOB_MAX_SECONDS,
+        watchdog_interval_seconds=jobs.WATCHDOG_INTERVAL_SECONDS,
         gemini_keys=len(GEMINI_KEYS),
         betterstack_enabled=BETTERSTACK_ENABLED,
         betterstack_service=BETTERSTACK_SERVICE,
@@ -80,6 +83,7 @@ async def on_startup():
 @app.on_event("shutdown")
 async def on_shutdown():
     jobs.stop_cleanup_loop()
+    jobs.stop_watchdog()
     await telemetry.stop_betterstack()
     EXECUTOR.shutdown(wait=False)
     await close_http_clients()

@@ -7,6 +7,10 @@ from .config import GEMINI_MODEL, _read_infisical_secrets_once
 from .gemini_errors import GeminiAPIError, set_known_keys
 
 
+# Аренда ключа на ОДНУ попытку. Должна быть больше GEMINI_HARD_TIMEOUT (45с).
+KEY_LEASE_TTL = float(os.getenv("GEMINI_KEY_LEASE_TTL", "60"))
+
+
 class GeminiKeyPool:
     """Пул ключей: round-robin + per-key cooldown + глобальный blackout.
 
@@ -27,6 +31,7 @@ class GeminiKeyPool:
         self.reserved: List[bool] = []
         self.dead: List[bool] = []
         self.last_used: List[float] = []
+        self.reserved_at: List[float] = []
         self.last_error: List[Optional[dict]] = []
         self.blackout_until: float = 0.0
         self.rr_index: int = 0
@@ -59,6 +64,7 @@ class GeminiKeyPool:
         self.reserved = [False] * len(keys)
         self.dead = [False] * len(keys)
         self.last_used = [0.0] * len(keys)
+        self.reserved_at = [0.0] * len(keys)
         self.last_error = [None] * len(keys)
         self.blackout_until = 0.0
         self.rr_index = 0
@@ -85,9 +91,26 @@ class GeminiKeyPool:
             self.rr_index += 1
             if not self.dead[idx] and not self.reserved[idx] and now >= self.blocked[idx]:
                 self.reserved[idx] = True
+                self.reserved_at[idx] = now
                 self.last_used[idx] = now
                 return idx, self.key_names[idx]
         return None, None
+
+    def ensure_released(self, idx: Optional[int]) -> None:
+        """Идемпотентно снять аренду (для finally): без cooldown и побочных эффектов."""
+        if idx is not None and 0 <= idx < len(self.reserved) and self.reserved[idx]:
+            self.reserved[idx] = False
+
+    def reap_stale(self, max_age: Optional[float] = None) -> List[str]:
+        """Снять аренды старше max_age (потерянные). Возвращает имена снятых ключей."""
+        max_age = KEY_LEASE_TTL if max_age is None else max_age
+        now = time.monotonic()
+        reaped = []
+        for idx, held in enumerate(self.reserved):
+            if held and now - self.reserved_at[idx] > max_age:
+                self.reserved[idx] = False
+                reaped.append(self.key_names[idx])
+        return reaped
 
     def release(self, idx: int, error: Optional[GeminiAPIError] = None) -> dict:
         self.reserved[idx] = False

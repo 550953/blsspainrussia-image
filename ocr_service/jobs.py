@@ -9,11 +9,18 @@ import os
 import time
 from typing import List, Optional
 
-from .key_pool import GEMINI_KEYS
+from .key_pool import GEMINI_KEYS, gemini_pool
 from .pipeline import process_images_gemini_sheet
 from .telemetry import JOB_STATS, _account_touch, _job_log
 
 JOBS: dict = {}
+BACKGROUND_TASKS: set = set()   # сильные ссылки: loop хранит таски слабо
+JOB_TASKS: dict = {}            # job_id -> asyncio.Task (для сторожа)
+# Клиент (браузер) ждёт ~1 минуту и шлёт задание заново, поэтому всё, что живёт дольше,
+# уже никому не нужно. Сторож принудительно отменяет такие задания и возвращает ключи.
+JOB_MAX_SECONDS = float(os.getenv("OCR_JOB_MAX_SECONDS", "60"))
+WATCHDOG_INTERVAL_SECONDS = max(2.0, float(os.getenv("OCR_WATCHDOG_INTERVAL_SECONDS", "10")))
+_WATCHDOG_TASK: Optional[asyncio.Task] = None
 JOB_RESULT_TTL_SECONDS = max(60, int(os.getenv("OCR_JOB_RESULT_TTL_SECONDS", "300")))
 JOB_CLEANUP_INTERVAL_SECONDS = max(5, int(os.getenv("OCR_JOB_CLEANUP_INTERVAL_SECONDS", "30")))
 _JOB_CLEANUP_TASK: Optional[asyncio.Task] = None
@@ -119,7 +126,101 @@ def stop_cleanup_loop() -> None:
         _JOB_CLEANUP_TASK = None
 
 
+def spawn_job(job_id: str, images: List[str]) -> asyncio.Task:
+    """Запустить задание фоном и сохранить ссылку на таск (для сторожа и от GC)."""
+    task = asyncio.create_task(_run_job(job_id, images))
+    BACKGROUND_TASKS.add(task)
+    JOB_TASKS[job_id] = task
+
+    def _done(t: asyncio.Task, _job_id: str = job_id) -> None:
+        BACKGROUND_TASKS.discard(t)
+        JOB_TASKS.pop(_job_id, None)
+
+    task.add_done_callback(_done)
+    return task
+
+
+def _watchdog_tick() -> dict:
+    """Один проход сторожа: отменяет зависшие задания, снимает потерянные аренды ключей."""
+    now = time.time()
+    killed = 0
+    for job_id, job in list(JOBS.items()):
+        if job.get("status") not in ("pending", "running"):
+            continue
+        age = now - float(job.get("created_at") or now)
+        if age <= JOB_MAX_SECONDS:
+            continue
+        task = JOB_TASKS.get(job_id)
+        if task is not None and not task.done():
+            task.cancel()  # _run_job сам проставит status=error и вернёт ключи через finally
+            killed += 1
+            _job_log(
+                "watchdog_kill", job_id,
+                account_id=job.get("account_id", ""),
+                client_request_id=job.get("client_request_id", ""),
+                status_before=job.get("status", ""),
+                age_ms=round(age * 1000),
+                limit_seconds=JOB_MAX_SECONDS,
+            )
+        else:
+            # Таска уже нет, а статус не финальный: пометить, чтобы не висело вечно.
+            _finish_job_error(job, "watchdog: задание потеряно (нет активной задачи)")
+            killed += 1
+    reaped = gemini_pool.reap_stale()
+    if reaped:
+        _job_log("watchdog_key_reaped", keys=reaped, ttl_seconds=gemini_pool_lease_ttl())
+    return {"killed": killed, "keys_reaped": len(reaped)}
+
+
+def gemini_pool_lease_ttl() -> float:
+    from .key_pool import KEY_LEASE_TTL
+    return KEY_LEASE_TTL
+
+
+async def _watchdog_loop() -> None:
+    while True:
+        await asyncio.sleep(WATCHDOG_INTERVAL_SECONDS)
+        try:
+            _watchdog_tick()
+        except Exception as exc:  # сторож не должен умирать
+            print(f"[pid={os.getpid()}][watchdog] ошибка прохода: {type(exc).__name__}: {exc}", flush=True)
+
+
+def start_watchdog() -> None:
+    global _WATCHDOG_TASK
+    _WATCHDOG_TASK = asyncio.create_task(_watchdog_loop())
+
+
+def stop_watchdog() -> None:
+    global _WATCHDOG_TASK
+    if _WATCHDOG_TASK is not None:
+        _WATCHDOG_TASK.cancel()
+        _WATCHDOG_TASK = None
+
+
+def _finish_job_error(job: dict, message: str) -> None:
+    finished_at = time.time()
+    job["status"] = "error"
+    job["stage"] = "finished"
+    job["error"] = message
+    job["finished_at"] = finished_at
+    job["expires_at"] = finished_at + JOB_RESULT_TTL_SECONDS
+    JOB_STATS["error"] += 1
+    JOB_STATS["watchdog_killed"] += 1
+    _account_touch(job.get("account_id", ""), "error", finished_at)
+
+
 async def _run_job(job_id: str, images: List[str]) -> None:
+    try:
+        await _run_job_inner(job_id, images)
+    except asyncio.CancelledError:
+        # Отмена сторожем (или остановка сервиса): задание не должно остаться pending/running.
+        job = JOBS.get(job_id)
+        if job is not None and job.get("status") in ("pending", "running"):
+            _finish_job_error(job, f"watchdog: задание отменено, лимит {JOB_MAX_SECONDS:.0f}s")
+
+
+async def _run_job_inner(job_id: str, images: List[str]) -> None:
     job = JOBS.get(job_id)
     if job is None:
         return
@@ -137,7 +238,7 @@ async def _run_job(job_id: str, images: List[str]) -> None:
             **_job_queue_metrics(job_id, job, started_at),
         )
         try:
-            results = await process_images_gemini_sheet(images)
+            results = await asyncio.wait_for(process_images_gemini_sheet(images), timeout=JOB_MAX_SECONDS)
             finished_at = time.time()
             zero_count = sum(1 for r in results if r.get("text") == "0")
             job["status"] = "done"
@@ -165,7 +266,7 @@ async def _run_job(job_id: str, images: List[str]) -> None:
             finished_at = time.time()
             job["status"] = "error"
             job["stage"] = "finished"
-            job["error"] = str(e)
+            job["error"] = str(e) or f"{type(e).__name__} (job deadline {JOB_MAX_SECONDS:.0f}s)"
             job["finished_at"] = finished_at
             job["expires_at"] = finished_at + JOB_RESULT_TTL_SECONDS
             JOB_STATS["error"] += 1
