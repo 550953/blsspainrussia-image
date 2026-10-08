@@ -108,6 +108,11 @@ STATUS_PASSWORD = os.getenv("STATUS_PASSWORD", "")
 # Gemini
 # ---------------------------------------------------------------------------
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.1-flash-lite")
+# Цепочка моделей по приоритету, через запятую. Если GEMINI_MODELS не задан, работает одна GEMINI_MODEL.
+# Пример: GEMINI_MODELS=gemini-3.5-flash-lite,gemini-3.1-flash-lite,gemini-3.5-flash
+GEMINI_MODELS = [m.strip() for m in os.getenv("GEMINI_MODELS", "").split(",") if m.strip()] or [GEMINI_MODEL]
+# На сколько секунд модель считается перегруженной после 503/500/504.
+GEMINI_MODEL_COOLDOWN = float(os.getenv("GEMINI_MODEL_COOLDOWN", "30"))
 GEMINI_ACQUIRE_POLL = 0.15
 
 # ---------------------------------------------------------------------------

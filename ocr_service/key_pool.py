@@ -3,7 +3,7 @@ import os
 import time
 from typing import List, Optional
 
-from .config import GEMINI_MODEL, _read_infisical_secrets_once
+from .config import GEMINI_MODEL, GEMINI_MODELS, GEMINI_MODEL_COOLDOWN, _read_infisical_secrets_once
 from .gemini_errors import GeminiAPIError, set_known_keys
 
 
@@ -35,6 +35,7 @@ class GeminiKeyPool:
         self.last_error: List[Optional[dict]] = []
         self.blackout_until: float = 0.0
         self.rr_index: int = 0
+        self.model_blocked_until: dict = {}
 
     def init_from_env(self, prefix: str = "GEMINI_API_KEY") -> None:
         seen = set()
@@ -95,6 +96,27 @@ class GeminiKeyPool:
                 self.last_used[idx] = now
                 return idx, self.key_names[idx]
         return None, None
+
+    def pick_model(self) -> str:
+        """Первая модель цепочки, не помеченная перегруженной. Если перегружены все,
+        берётся та, что освободится раньше (запросы не блокируются)."""
+        now = time.monotonic()
+        for model in GEMINI_MODELS:
+            if now >= self.model_blocked_until.get(model, 0.0):
+                return model
+        return min(GEMINI_MODELS, key=lambda m: self.model_blocked_until.get(m, 0.0))
+
+    def mark_model_overloaded(self, model: str, seconds: Optional[float] = None) -> None:
+        seconds = GEMINI_MODEL_COOLDOWN if seconds is None else seconds
+        until = time.monotonic() + seconds
+        if until > self.model_blocked_until.get(model, 0.0):
+            self.model_blocked_until[model] = until
+            print(f"[pid={os.getpid()}][gemini_model] {model} перегружена, обхожу {seconds:.0f}s", flush=True)
+
+    @staticmethod
+    def is_model_side_error(error: GeminiAPIError) -> bool:
+        """Сбой на стороне модели (не ключа): ключ штрафовать не нужно."""
+        return error.category == "UPSTREAM_UNAVAILABLE" or error.http_status in (500, 502, 504)
 
     def ensure_released(self, idx: Optional[int]) -> None:
         """Идемпотентно снять аренду (для finally): без cooldown и побочных эффектов."""
@@ -216,5 +238,5 @@ gemini_pool.init_from_env()
 GEMINI_KEYS = gemini_pool.keys
 set_known_keys(GEMINI_KEYS)  # чтобы _safe_gemini_message вычёркивал ключи из текста ошибок
 
-gemini_model_name = GEMINI_MODEL if GEMINI_KEYS else None
-print(f"[pid={os.getpid()}] Gemini ключей найдено: {len(GEMINI_KEYS)}, модель: {gemini_model_name}")
+gemini_model_name = GEMINI_MODELS[0] if GEMINI_KEYS else None  # основная модель (для /status)
+print(f"[pid={os.getpid()}] Gemini ключей найдено: {len(GEMINI_KEYS)}, модели: {GEMINI_MODELS}")

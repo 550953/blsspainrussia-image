@@ -90,12 +90,13 @@ async def recognize_gemini_sheet_async(
         attempted_routes.add(route_key)
         attempt_no += 1
 
+        model = gemini_pool.pick_model()
         t0 = time.monotonic()
         try:
             text, response_metadata = await _call_gemini_rest(
                 png_bytes,
                 effective_prompt,
-                gemini_model_name,
+                model,
                 gemini_pool.keys[idx],
                 proxy_url,
                 generation_config={
@@ -111,8 +112,8 @@ async def recognize_gemini_sheet_async(
             _job_log(
                 "gemini_attempt",
                 key_profile=key_name,
-                model=gemini_model_name,
-                served_model=response_metadata.get("served_model", gemini_model_name),
+                model=model,
+                served_model=response_metadata.get("served_model", model),
                 proxy=_proxy_label(proxy_url),
                 attempt=attempt_no,
                 latency_ms=round((time.monotonic() - t0) * 1000),
@@ -145,7 +146,7 @@ async def recognize_gemini_sheet_async(
             _job_log(
                 "gemini_proxy_error",
                 key_profile=key_name,
-                model=gemini_model_name,
+                model=model,
                 proxy=_proxy_label(proxy_url),
                 attempt=attempt_no,
                 latency_ms=round((time.monotonic() - t0) * 1000),
@@ -157,11 +158,16 @@ async def recognize_gemini_sheet_async(
         except GeminiAPIError as exc:
             last_error = str(exc)
             smart_proxy_pool.mark_ok(proxy_url)
-            state = gemini_pool.release(idx, exc)
+            if gemini_pool.is_model_side_error(exc):
+                # 503 и подобное: перегружена МОДЕЛЬ, а не ключ. Ключ не штрафуем, модель обходим.
+                gemini_pool.mark_model_overloaded(model)
+                state = gemini_pool.release(idx, None)
+            else:
+                state = gemini_pool.release(idx, exc)
             _job_log(
                 "gemini_api_error",
                 key_profile=key_name,
-                model=gemini_model_name,
+                model=model,
                 proxy=_proxy_label(proxy_url),
                 attempt=attempt_no,
                 latency_ms=round((time.monotonic() - t0) * 1000),
@@ -190,7 +196,7 @@ async def recognize_gemini_sheet_async(
             _job_log(
                 "gemini_api_error",
                 key_profile=key_name,
-                model=gemini_model_name,
+                model=model,
                 proxy=_proxy_label(proxy_url),
                 attempt=attempt_no,
                 latency_ms=round((time.monotonic() - t0) * 1000),
