@@ -3,7 +3,7 @@ import os
 import time
 from typing import List, Optional
 
-from .config import GEMINI_MODEL, GEMINI_MODELS, GEMINI_MODEL_COOLDOWN, _read_infisical_secrets_once
+from .config import GEMINI_MODEL, GEMINI_MODELS, GEMINI_MODEL_COOLDOWN, GEMINI_MODEL_KEYS, _read_infisical_secrets_once
 from .gemini_errors import GeminiAPIError, set_known_keys
 
 
@@ -36,6 +36,7 @@ class GeminiKeyPool:
         self.blackout_until: float = 0.0
         self.rr_index: int = 0
         self.model_blocked_until: dict = {}
+        self.model_unavailable: set = set()   # (idx, model): модель закрыта для этого ключа (404)
 
     def init_from_env(self, prefix: str = "GEMINI_API_KEY") -> None:
         seen = set()
@@ -97,14 +98,29 @@ class GeminiKeyPool:
                 return idx, self.key_names[idx]
         return None, None
 
-    def pick_model(self) -> str:
-        """Первая модель цепочки, не помеченная перегруженной. Если перегружены все,
-        берётся та, что освободится раньше (запросы не блокируются)."""
+    def model_allowed(self, idx: Optional[int], model: str) -> bool:
+        """Можно ли этому ключу работать с моделью (ограничение GEMINI_MODEL_KEYS и 404-память)."""
+        if idx is None:
+            return True
+        if (idx, model) in self.model_unavailable:
+            return False
+        prefixes = GEMINI_MODEL_KEYS.get(model)
+        return prefixes is None or any(self.key_names[idx].startswith(p) for p in prefixes)
+
+    def mark_model_unavailable(self, idx: int, model: str) -> None:
+        if (idx, model) not in self.model_unavailable:
+            self.model_unavailable.add((idx, model))
+            print(f"[pid={os.getpid()}][gemini_model] {model} недоступна ключу {self.key_names[idx]} (404), больше не пробую", flush=True)
+
+    def pick_model(self, idx: Optional[int] = None) -> str:
+        """Первая допустимая для ключа модель цепочки, не помеченная перегруженной.
+        Если перегружены все, берётся та, что освободится раньше (запросы не блокируются)."""
+        candidates = [m for m in GEMINI_MODELS if self.model_allowed(idx, m)] or list(GEMINI_MODELS)
         now = time.monotonic()
-        for model in GEMINI_MODELS:
+        for model in candidates:
             if now >= self.model_blocked_until.get(model, 0.0):
                 return model
-        return min(GEMINI_MODELS, key=lambda m: self.model_blocked_until.get(m, 0.0))
+        return min(candidates, key=lambda m: self.model_blocked_until.get(m, 0.0))
 
     def mark_model_overloaded(self, model: str, seconds: Optional[float] = None) -> None:
         seconds = GEMINI_MODEL_COOLDOWN if seconds is None else seconds

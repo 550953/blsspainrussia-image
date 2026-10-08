@@ -1,5 +1,6 @@
 """Эндпоинты распознавания: очередь (submit/result) и синхронные /ocr, /ocr/batch, /ocr/captcha6."""
 import asyncio
+import os
 import time
 import uuid
 
@@ -20,6 +21,9 @@ from ..utils import clean_base64
 from ..mailru_captcha import recognize_mailru_captcha
 
 router = APIRouter()
+
+# Скрипт в браузере ждёт ответ 30с; не держим ключи дольше. Отмена возвращает ключи через finally.
+MAILRU_DEADLINE_SECONDS = float(os.getenv("MAILRU_DEADLINE_SECONDS", "25"))
 
 
 @router.post(
@@ -177,7 +181,10 @@ async def ocr_captcha6(req: Captcha6Request):
         image_bytes=len(image_bytes),
     )
 
-    text, source = await recognize_mailru_captcha(image_bytes)
+    try:
+        text, source = await asyncio.wait_for(recognize_mailru_captcha(image_bytes), timeout=MAILRU_DEADLINE_SECONDS)
+    except asyncio.TimeoutError:
+        text, source = "", "mailru_deadline"
 
     _job_log(
         "mailru_done",

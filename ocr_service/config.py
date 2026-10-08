@@ -111,6 +111,16 @@ GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.1-flash-lite")
 # Цепочка моделей по приоритету, через запятую. Если GEMINI_MODELS не задан, работает одна GEMINI_MODEL.
 # Пример: GEMINI_MODELS=gemini-3.5-flash-lite,gemini-3.1-flash-lite,gemini-3.5-flash
 GEMINI_MODELS = [m.strip() for m in os.getenv("GEMINI_MODELS", "").split(",") if m.strip()] or [GEMINI_MODEL]
+# Ограничить модель определёнными ключами (по началу имени ключа), формат: "модель=префикс1|префикс2;модель2=префикс3".
+# Нужно для "чёрного дня": gemini-2.5-flash закрыта для новых проектов и работает только на старом ключе.
+# Пример: GEMINI_MODEL_KEYS=gemini-2.5-flash=550953
+GEMINI_MODEL_KEYS: dict = {}
+for _part in os.getenv("GEMINI_MODEL_KEYS", "").split(";"):
+    if "=" in _part:
+        _m, _prefixes = _part.split("=", 1)
+        _plist = [x.strip() for x in _prefixes.split("|") if x.strip()]
+        if _m.strip() and _plist:
+            GEMINI_MODEL_KEYS[_m.strip()] = _plist
 # На сколько секунд модель считается перегруженной после 503/500/504.
 GEMINI_MODEL_COOLDOWN = float(os.getenv("GEMINI_MODEL_COOLDOWN", "30"))
 GEMINI_ACQUIRE_POLL = 0.15

@@ -90,7 +90,7 @@ async def recognize_mailru_captcha(image_bytes: bytes) -> Tuple[str, str]:
         attempted_routes.add(route_key)
         attempt_no += 1
 
-        model = gemini_pool.pick_model()
+        model = gemini_pool.pick_model(idx)
         t0 = time.monotonic()
         try:
             raw_text, response_metadata = await _call_gemini_rest(
@@ -102,7 +102,7 @@ async def recognize_mailru_captcha(image_bytes: bytes) -> Tuple[str, str]:
                 generation_config={
                     "temperature": 0.0,
                     "responseMimeType": "application/json",
-                    "maxOutputTokens": 32,
+                    "maxOutputTokens": 256,
                 },
             )
             parsed = _parse_mailru_text(raw_text)
@@ -166,7 +166,11 @@ async def recognize_mailru_captcha(image_bytes: bytes) -> Tuple[str, str]:
         except GeminiAPIError as exc:
             last_error = str(exc)
             smart_proxy_pool.mark_ok(proxy_url)
-            if gemini_pool.is_model_side_error(exc):
+            if exc.http_status == 404:
+                # Модель закрыта для этого ключа (например 2.5 для новых проектов): ключ не штрафуем.
+                gemini_pool.mark_model_unavailable(idx, model)
+                state = gemini_pool.release(idx, None)
+            elif gemini_pool.is_model_side_error(exc):
                 # 503 и подобное: перегружена МОДЕЛЬ, а не ключ. Ключ не штрафуем, модель обходим.
                 gemini_pool.mark_model_overloaded(model)
                 state = gemini_pool.release(idx, None)

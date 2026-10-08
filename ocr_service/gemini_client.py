@@ -18,12 +18,16 @@ _HTTPX_CLIENTS: dict = {}
 # Жёсткий потолок на ВЕСЬ вызов. httpx-timeout не покрывает SOCKS5-handshake:
 # прокси, принявший TCP и замолчавший, вешает запрос навсегда.
 GEMINI_HARD_TIMEOUT = float(os.getenv("GEMINI_HARD_TIMEOUT", "45"))
+# Таймаут чтения/записи и подключения для одной попытки. Обычный ответ 2-5с, поэтому 15с хватает с запасом,
+# а зависший канал обнаруживается быстрее, и задание успевает сделать больше попыток до дедлайна.
+GEMINI_HTTP_TIMEOUT = float(os.getenv("GEMINI_HTTP_TIMEOUT", "15"))
+GEMINI_CONNECT_TIMEOUT = float(os.getenv("GEMINI_CONNECT_TIMEOUT", "8"))
 
 
 def _get_http_client(proxy_url: Optional[str]) -> httpx.AsyncClient:
     client = _HTTPX_CLIENTS.get(proxy_url)
     if client is None:
-        client = httpx.AsyncClient(proxy=proxy_url, timeout=httpx.Timeout(20.0, connect=10.0))
+        client = httpx.AsyncClient(proxy=proxy_url, timeout=httpx.Timeout(GEMINI_HTTP_TIMEOUT, connect=GEMINI_CONNECT_TIMEOUT))
         _HTTPX_CLIENTS[proxy_url] = client
     return client
 
