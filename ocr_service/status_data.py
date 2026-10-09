@@ -81,6 +81,24 @@ def build_status() -> dict:
                 p["n429"] += 1
     win_total = win["ok"] + win["api_err"] + win["proxy_err"]
 
+    # --- график за час: 12 корзин по 5 минут (старые слева) и последние ошибки ---
+    BUCKET = 300
+    timeline = [{"ok": 0, "err": 0, "proxy_err": 0} for _ in range(STATS_WINDOW_SECONDS // BUCKET)]
+    recent_errors = []
+    for ts, key, proxy, category, latency, _images, _zeros, model in ATTEMPTS:
+        if ts < cutoff:
+            continue
+        i = min(len(timeline) - 1, int((ts - cutoff) // BUCKET))
+        if category == "SUCCESS":
+            timeline[i]["ok"] += 1
+        elif category == "PROXY_UNAVAILABLE":
+            timeline[i]["proxy_err"] += 1
+        else:
+            timeline[i]["err"] += 1
+        if category != "SUCCESS":
+            recent_errors.append({"ago": ago(ts), "key": key, "proxy": proxy, "category": category, "model": model})
+    recent_errors = recent_errors[-12:][::-1]
+
     # --- ключи ---
     keys = []
     counts = Counter()
@@ -102,8 +120,12 @@ def build_status() -> dict:
         label = _proxy_label(route)
         p = per_proxy.get(label, {"n": 0, "ok": 0, "n429": 0, "perr": 0, "lat": []})
         left = max(0.0, smart_proxy_pool.cooldown_until[route] - mono)
+        reason = smart_proxy_pool.block_reason.get(route, "") if left > 0 else ""
         proxies.append({
-            "label": label, "state": "cooldown" if left > 0 else "ready", "cooldown_left": round(left, 1),
+            "label": label,
+            "state": ("quarantine" if reason == "geo" else "cooldown") if left > 0 else "ready",
+            "reason": reason, "geo_hits": smart_proxy_pool.geo_hits.get(route, 0),
+            "cooldown_left": round(left, 1),
             "failures": smart_proxy_pool.failures[route], "attempts": p["n"],
             "ok_pct": round(100.0 * p["ok"] / p["n"], 1) if p["n"] else None,
             "n429": p["n429"], "proxy_err": p["perr"],
@@ -221,12 +243,15 @@ def build_status() -> dict:
             "dddd_used": q["dddd_used"], "dddd_saved": q["dddd_saved"], "final_zero": q["final_zero"],
             "all_zero_jobs_total": JOB_STATS["all_zero_jobs"],
         },
+        "timeline": timeline,
+        "recent_errors": recent_errors,
         "jobs": jobs,
         "clients": clients,
         "models": models,
         "proxies": {
             "mode": "proxied+direct_fallback" if _configured_proxies else "direct_only",
             "source": _proxy_source, "channels": len(smart_proxy_pool.routes), "list": proxies,
+            "quarantined": sum(1 for x in proxies if x["state"] == "quarantine"),
         },
         "counters": {k: v for k, v in JOB_STATS.items() if not k.startswith("event_")},
         "config": {

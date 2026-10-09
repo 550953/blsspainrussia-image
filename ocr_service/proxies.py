@@ -48,6 +48,15 @@ class ProxyUnavailable(Exception):
     """Ошибка КАНАЛА (обрыв, таймаут, нет socksio), а не ключа: ключ в cooldown не уходит."""
 
 
+class ProxyGeoBlocked(ProxyUnavailable):
+    """Google отверг запрос по гео (400 User location is not supported): выходной IP канала в плохой стране.
+    Канал уходит в карантин надолго, ключ не штрафуется, запрос повторяется через другой канал."""
+
+
+# Сколько держим канал в карантине после гео-отказа (сек). По умолчанию 1 час.
+PROXY_GEO_QUARANTINE_SECONDS = float(os.getenv("PROXY_GEO_QUARANTINE_SECONDS", "3600"))
+
+
 class GeminiSmartProxyPool:
     """DIRECT первым, остальные по кругу; при обрыве канал уходит в cooldown."""
 
@@ -61,6 +70,8 @@ class GeminiSmartProxyPool:
         self.routes = unique
         self.cooldown_until = {route: 0.0 for route in self.routes}
         self.failures = {route: 0 for route in self.routes}
+        self.block_reason = {route: "" for route in self.routes}  # "geo" | "" (для /status)
+        self.geo_hits = {route: 0 for route in self.routes}       # сколько раз ловили гео-отказ с запуска
         self.cursor = 0
 
     def next(self) -> Optional[str]:
@@ -76,10 +87,29 @@ class GeminiSmartProxyPool:
         return route
 
     def mark_ok(self, route: Optional[str]) -> None:
+        """Успех (или ответ Gemini с ошибкой ключа/модели) снимает обычный cooldown,
+        но НЕ трогает гео-карантин: параллельный запрос не должен его стереть."""
         self.failures[route] = 0
+        if self.block_reason.get(route) == "geo" and time.monotonic() < self.cooldown_until[route]:
+            return
+        self.block_reason[route] = ""
         self.cooldown_until[route] = 0.0
 
+    def quarantine_geo(self, route: Optional[str]) -> None:
+        """Канал отдаёт гео-отказ: в карантин на PROXY_GEO_QUARANTINE_SECONDS (1 час)."""
+        self.geo_hits[route] += 1
+        self.failures[route] += 1
+        self.block_reason[route] = "geo"
+        self.cooldown_until[route] = max(self.cooldown_until[route], time.monotonic() + PROXY_GEO_QUARANTINE_SECONDS)
+        print(
+            f"[pid={os.getpid()}][gemini_proxy] {_proxy_label(route)} GEO-блок (User location is not supported): "
+            f"карантин {PROXY_GEO_QUARANTINE_SECONDS / 60:.0f} мин"
+        )
+
     def mark_failed(self, route: Optional[str], error_text: object) -> None:
+        if isinstance(error_text, ProxyGeoBlocked):
+            self.quarantine_geo(route)
+            return
         self.failures[route] += 1
         upper = str(error_text).upper()
         if route is None:

@@ -6,8 +6,8 @@ from typing import Optional
 
 import httpx
 
-from .gemini_errors import GeminiAPIError, _classify_gemini_http_error
-from .proxies import ProxyUnavailable
+from .gemini_errors import GeminiAPIError, _classify_gemini_http_error, is_geo_blocked
+from .proxies import ProxyGeoBlocked, ProxyUnavailable
 
 # Ключ передаётся заголовком x-goog-api-key, а не в URL: так он не попадает в логи httpx.
 GEMINI_REST_URL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
@@ -84,6 +84,9 @@ async def _call_gemini_rest(
         error_data = data.get("error", {}) if isinstance(data, dict) else {}
         provider_status = str(error_data.get("status") or "") if isinstance(error_data, dict) else ""
         message = str(error_data.get("message") or response.text) if isinstance(error_data, dict) else response.text
+        if is_geo_blocked(response.status_code, message):
+            # Виноват выходной IP канала: ключ не трогаем, канал в карантин, запрос уйдёт на другой канал.
+            raise ProxyGeoBlocked("HTTP 400: User location is not supported (гео-блок выходного IP)")
         policy = _classify_gemini_http_error(response.status_code, provider_status, message)
         raise GeminiAPIError(response.status_code, provider_status, message, policy)
 

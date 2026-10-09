@@ -15,6 +15,23 @@ def set_known_keys(keys: List[str]) -> None:
     _KNOWN_KEYS = keys
 
 
+# Google отвечает 400 FAILED_PRECONDITION, если ВЫХОДНОЙ IP запроса стоит в неподдерживаемой стране.
+# Это вина канала (прокси/DIRECT), а не ключа и не модели.
+_GEO_BLOCK_MARKERS = (
+    "user location is not supported",
+    "location is not supported for the api use",
+    "not available in your country",
+    "not available in your region",
+)
+
+
+def is_geo_blocked(http_status: int, message: str) -> bool:
+    if int(http_status or 0) != 400:
+        return False
+    text = str(message or "").casefold()
+    return any(marker in text for marker in _GEO_BLOCK_MARKERS)
+
+
 def _parse_retry_delay(err_text: str) -> float:
     m = _RETRY_DELAY_RE.search(err_text)
     return float(m.group(1)) if m else 0.0
