@@ -1,8 +1,2 @@
-fastapi>=0.115.0
-uvicorn[standard]>=0.30.0
-ddddocr>=1.5.6
-pydantic>=2.0.0
-opencv-python-headless
-numpy
-httpx[socks]
-requests
+fastapi>=0.110
+uvicorn>=0.29
