@@ -21,7 +21,9 @@ from ..config import (
 )
 from ..email_template.director import FONTS, HEADERS, INDICATORS, PALETTES, make_brief, set_history_size
 from ..email_template.generate import run_template_job
+from ..email_template.prompt import PROMPT_VERSION
 from ..email_template.preview import render
+from ..email_template.runner import run_template_selfcheck
 from ..email_template.validator import rules, validate
 from ..key_pool import gemini_pool
 from ..telemetry import TEMPLATE_STATS, _job_log, ensure_template_day, record_template_run
@@ -134,6 +136,21 @@ def _log_rejection(reason: str, *, limited: bool = False):
         _job_log("tpl_rejected_limit", **fields)
 
 
+def _set_basic_error_detail(job: dict, code: str, category: str, safe_message: str):
+    job.setdefault("error_detail", {
+        "category": category,
+        "http_status": None,
+        "provider_status": "",
+        "safe_message": safe_message[:200],
+        "model": job.get("model") or (job.get("models") or [None])[0],
+        "key_name": None,
+        "api_attempts": 0,
+        "proxy_preflight_failures": 0,
+        "attempt_times_ms": [],
+        "error_code": code,
+    })
+
+
 def effective_concurrency() -> int:
     live = sum(
         1 for idx in range(len(gemini_pool.keys))
@@ -157,12 +174,14 @@ async def _run_queued(job_id: str):
     except asyncio.TimeoutError:
         job.update(status="error", stage="finished", error="queue_timeout",
                    finished_at=time.time(), expires_at=time.time() + TEMPLATE_RESULT_TTL_SECONDS)
+        _set_basic_error_detail(job, "queue_timeout", "QUEUE_TIMEOUT", "Задание не попало в очередь вовремя.")
         record_template_run(job, "queue_timeout")
         _job_log("tpl_error", job_id, component="email_template", error="queue_timeout")
         return
     except asyncio.CancelledError:
         job.update(status="error", stage="finished", error="cancelled",
                    finished_at=time.time(), expires_at=time.time() + TEMPLATE_RESULT_TTL_SECONDS)
+        _set_basic_error_detail(job, "cancelled", "CANCELLED", "Задание отменено.")
         _job_log("tpl_error", job_id, component="email_template", error="cancelled")
         return
     try:
@@ -184,6 +203,7 @@ async def _run_queued(job_id: str):
             else:
                 job.update(status="error", stage="finished", error="deadline",
                            finished_at=now, expires_at=now + TEMPLATE_RESULT_TTL_SECONDS)
+                _set_basic_error_detail(job, "deadline", "DEADLINE", "Истёк срок выполнения задания.")
                 record_template_run(job, "deadline")
                 _job_log("tpl_error", job_id, component="email_template", error="deadline")
     except asyncio.CancelledError:
@@ -197,11 +217,15 @@ async def _run_queued(job_id: str):
             else:
                 job.update(status="error", stage="finished", error="cancelled",
                            finished_at=now, expires_at=now + TEMPLATE_RESULT_TTL_SECONDS)
+                _set_basic_error_detail(job, "cancelled", "CANCELLED", "Задание отменено.")
                 record_template_run(job, "cancelled")
         raise
     except Exception as exc:
         if job.get("status") not in {"done", "error"}:
             now = time.time()
+            _set_basic_error_detail(
+                job, "generation_unavailable", "UNKNOWN", "Неизвестная ошибка генерации.",
+            )
             if job.get("template"):
                 job["template"].setdefault("generation_error", "generation_unavailable")
                 job.update(status="done", stage="finished", error=None,
@@ -282,7 +306,7 @@ async def submit(request: Request):
                 "job_id": job["job_id"], "status": job["status"], "kind": "email_template",
                 "reused": True,
                 "brief": {key: value for key, value in job["brief"].items() if key != "avoid_palettes"},
-                "prompt_version": "1.0", "schema_version": 1,
+                "prompt_version": PROMPT_VERSION, "schema_version": 1,
             }
     if time.monotonic() < _BREAKER_UNTIL:
         remaining = max(1, int(_BREAKER_UNTIL - time.monotonic()))
@@ -340,7 +364,7 @@ async def submit(request: Request):
     return {
         "job_id": job_id, "status": "pending", "kind": "email_template", "reused": False,
         "brief": {key: value for key, value in brief.items() if key != "avoid_palettes"},
-        "prompt_version": "1.0", "schema_version": 1,
+        "prompt_version": PROMPT_VERSION, "schema_version": 1,
     }
 
 
@@ -370,11 +394,20 @@ async def result(job_id: str, request: Request, html: int = 1):
         if job.get("started_at") else None,
         "template": job.get("template"),
         "error": job.get("error"),
+        "error_detail": job.get("error_detail"),
     }
     if html == 0 and payload["template"]:
         payload["template"] = dict(payload["template"])
         payload["template"].pop("html", None)
     return payload
+
+
+@router.get("/template/selfcheck", dependencies=[Depends(require_status_auth)])
+async def selfcheck():
+    if not TEMPLATE_ENABLED:
+        raise HTTPException(status_code=503, detail="Генерация шаблонов выключена")
+    _rate_limit("selfcheck", 6)
+    return await run_template_selfcheck(TEMPLATE_MODELS[0] if TEMPLATE_MODELS else "")
 
 
 @router.post("/template/cancel/{job_id}")
@@ -397,6 +430,7 @@ async def cancel(job_id: str, request: Request):
         now = time.time()
         job.update(status="error", stage="finished", error="cancelled",
                    finished_at=now, expires_at=now + TEMPLATE_RESULT_TTL_SECONDS)
+        _set_basic_error_detail(job, "cancelled", "CANCELLED", "Задание отменено.")
     if not was_started and job.get("status") == "error" and job.get("error") == "cancelled":
         record_template_run(job, "cancelled")
     _job_log("tpl_cancelled", job_id, component="email_template", status=job.get("status"))

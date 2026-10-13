@@ -95,6 +95,7 @@ def test_submit_enforces_closed_whitelist_and_idempotency(api):
     first = post_submit(api, **payload)
     second = post_submit(api, **payload)
     assert first.status_code == second.status_code == 200
+    assert first.json()["prompt_version"] == second.json()["prompt_version"] == "1.2"
     assert first.json()["reused"] is False
     assert second.json()["reused"] is True
     assert first.json()["job_id"] == second.json()["job_id"]
@@ -170,6 +171,48 @@ def test_result_html_zero_namespace_isolation_and_unknown_job(api, monkeypatch):
     assert "html" not in result.json()["template"]
     assert api.get("/template/result/job-visible", headers=headers("other-valid-key")).status_code == 404
     assert api.get("/template/result/no-such-job", headers=headers()).status_code == 404
+
+
+def test_result_includes_safe_error_detail(api):
+    detail = {
+        "category": "HTTP_404", "http_status": 404, "provider_status": "NOT_FOUND",
+        "safe_message": "Модель не найдена.", "model": "unit-model",
+        "key_name": "GEMINI_API_KEY_1", "api_attempts": 2,
+        "proxy_preflight_failures": 1, "attempt_times_ms": [250, 310],
+        "error_code": "model_rejected",
+    }
+    tpl.TEMPLATE_JOBS["failed-diagnostic"] = {
+        "job_id": "failed-diagnostic", "namespace": NAMESPACE, "created_at": time.time(),
+        "status": "error", "stage": "finished", "error": "model_rejected",
+        "error_detail": detail,
+    }
+
+    response = api.get("/template/result/failed-diagnostic", headers=headers())
+    assert response.status_code == 200
+    assert response.json()["error_detail"] == detail
+
+
+def test_selfcheck_is_status_auth_gated_enabled_and_rate_limited(api, monkeypatch):
+    calls = []
+
+    async def selfcheck(model):
+        calls.append(model)
+        return {
+            "ok": True, "model": model, "http_status": 200, "provider_status": "OK",
+            "safe_message": "Модель ответила.", "step": "ok", "elapsed_ms": 25,
+        }
+
+    monkeypatch.setattr(tpl, "run_template_selfcheck", selfcheck)
+    monkeypatch.setattr(tpl, "TEMPLATE_ENABLED", False)
+    assert api.get("/template/selfcheck").status_code == 503
+    monkeypatch.setattr(tpl, "TEMPLATE_ENABLED", True)
+
+    responses = [api.get("/template/selfcheck") for _ in range(6)]
+    assert all(response.status_code == 200 for response in responses)
+    assert all(response.json()["step"] == "ok" for response in responses)
+    assert calls == ["unit-model"] * 6
+    limited = api.get("/template/selfcheck")
+    assert limited.status_code == 429
 
 
 def test_template_store_cleanup_preserves_live_jobs_and_bounds_finished_results(api, monkeypatch):

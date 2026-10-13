@@ -14,6 +14,7 @@ import asyncio
 import copy
 import http.client
 import json
+import os
 import socket
 import sys
 import threading
@@ -28,7 +29,7 @@ import uvicorn
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 
-from ocr_service import gemini_client, telemetry
+from ocr_service import config, gemini_client, telemetry
 from ocr_service.email_template import generate, runner
 from ocr_service.key_pool import gemini_pool
 from ocr_service.proxies import GeminiSmartProxyPool
@@ -60,13 +61,16 @@ from ocr_service.routers import template as template_router
 ROOT = Path(__file__).resolve().parents[1]
 GOOD_HTML = (ROOT / "tests" / "fixtures" / "good.html").read_text(encoding="utf-8")
 SMOKE_API_KEY = "local-smoke-not-a-secret"
-MODEL = "gemini-2.5-flash"
+MODEL = "local-smoke-model"
+SMOKE_READ_TIMEOUT = float(os.getenv("TEMPLATE_SMOKE_READ_TIMEOUT", "0.15"))
 
 ACTIVE_EVENTS: list[tuple[float, str]] = []
 ACTIVE_LOCK = threading.Lock()
 FAKE_GENERATE_COUNT = 0
 FAKE_503_REMAINING = 0
-FAKE_GENERATE_DELAY = 0.0
+FAKE_ERROR_QUEUE: list[dict] = []
+FAKE_TEXT_QUEUE: list[str] = []
+FAKE_DELAY_QUEUE: list[float] = []
 FAKE_REQUEST_SEEN = threading.Event()
 UPSTREAM_PORT = 0
 RUNNER_API_ATTEMPTS = 0
@@ -92,8 +96,25 @@ async def fake_generate(model: str):
     FAKE_REQUEST_SEEN.set()
     FAKE_GENERATE_COUNT += 1
     event(f"fake Gemini generateContent #{FAKE_GENERATE_COUNT} model={model}")
-    if FAKE_GENERATE_DELAY:
-        await asyncio.sleep(FAKE_GENERATE_DELAY)
+    if FAKE_DELAY_QUEUE:
+        delay = FAKE_DELAY_QUEUE.pop(0)
+        if delay:
+            event(f"fake Gemini response delayed {delay:.2f}s")
+            await asyncio.sleep(delay)
+            event("fake Gemini delayed response completed")
+    if FAKE_ERROR_QUEUE:
+        response = FAKE_ERROR_QUEUE.pop(0)
+        event(f"fake Gemini → {response['status']} {response['provider_status']}")
+        return JSONResponse(
+            status_code=response["status"],
+            content={
+                "error": {
+                    "code": response["status"],
+                    "status": response["provider_status"],
+                    "message": response["message"],
+                },
+            },
+        )
     if FAKE_503_REMAINING:
         FAKE_503_REMAINING -= 1
         event("fake Gemini → 503 UNAVAILABLE")
@@ -101,10 +122,11 @@ async def fake_generate(model: str):
             status_code=503,
             content={"error": {"code": 503, "status": "UNAVAILABLE", "message": "local smoke overload"}},
         )
+    text = FAKE_TEXT_QUEUE.pop(0) if FAKE_TEXT_QUEUE else GOOD_HTML + "\n№ 1"
     return {
         "modelVersion": model,
         "candidates": [{
-            "content": {"parts": [{"text": GOOD_HTML + "\n№ 1"}]},
+            "content": {"parts": [{"text": text}]},
             "finishReason": "STOP",
         }],
         "usageMetadata": {
@@ -146,6 +168,9 @@ class LocalGeminiServer:
 class LocalProxyHandler(BaseHTTPRequestHandler):
     behavior = "healthy"
     request_seen = None
+    stall_seen = None
+    post_count = 0
+    post_count_lock = threading.Lock()
 
     def log_message(self, *_args):
         pass
@@ -156,12 +181,20 @@ class LocalProxyHandler(BaseHTTPRequestHandler):
         if target.query:
             path += "?" + target.query
         event(f"proxy {self.behavior}: {self.command} {path}")
-        if self.request_seen is not None and self.command == "POST":
-            self.request_seen.set()
+        if self.command == "POST":
+            handler_type = type(self)
+            with handler_type.post_count_lock:
+                post_number = handler_type.post_count
+                handler_type.post_count += 1
+            if self.request_seen is not None:
+                self.request_seen.set()
         if self.behavior == "blackhole":
             time.sleep(1.5)
             return
-        if self.behavior == "stall_generate" and self.command == "POST":
+        if self.behavior == "stall_generate" and self.command == "POST" and post_number >= 1:
+            event("proxy stall_generate: second Gemini request held open")
+            if self.stall_seen is not None:
+                self.stall_seen.set()
             time.sleep(8)
             return
         if self.behavior == "dies_mid_response" and self.command == "POST":
@@ -186,7 +219,10 @@ class LocalProxyHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(len(response_body)))
             self.send_header("Connection", "close")
             self.end_headers()
-            self.wfile.write(response_body)
+            try:
+                self.wfile.write(response_body)
+            except (BrokenPipeError, ConnectionResetError):
+                event("proxy client closed before delayed response was forwarded")
         finally:
             conn.close()
 
@@ -195,11 +231,15 @@ class LocalProxyHandler(BaseHTTPRequestHandler):
 
 
 class LocalProxy:
-    def __init__(self, behavior: str, request_seen=None):
+    def __init__(self, behavior: str, request_seen=None, stall_seen=None):
         handler = type(
             f"SmokeProxyHandler_{behavior}",
             (LocalProxyHandler,),
-            {"behavior": behavior, "request_seen": request_seen},
+            {
+                "behavior": behavior, "request_seen": request_seen,
+                "stall_seen": stall_seen, "post_count": 0,
+                "post_count_lock": threading.Lock(),
+            },
         )
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
         self.server.daemon_threads = True
@@ -221,16 +261,16 @@ def closed_proxy_url() -> str:
     return f"http://127.0.0.1:{port}"
 
 
-def reset_keys():
-    gemini_pool.keys = [SMOKE_API_KEY]
-    gemini_pool.key_names = ["GEMINI_API_KEY_SMOKE"]
-    gemini_pool.blocked = [0.0]
-    gemini_pool.reserved = [False]
-    gemini_pool.dead = [False]
-    gemini_pool.last_used = [0.0]
-    gemini_pool.reserved_at = [0.0]
-    gemini_pool.last_error = [None]
-    gemini_pool.lease_ttl = [300.0]
+def reset_keys(count: int = 1):
+    gemini_pool.keys = [f"{SMOKE_API_KEY}-{index}" for index in range(count)]
+    gemini_pool.key_names = [f"GEMINI_API_KEY_SMOKE_{index + 1}" for index in range(count)]
+    gemini_pool.blocked = [0.0] * count
+    gemini_pool.reserved = [False] * count
+    gemini_pool.dead = [False] * count
+    gemini_pool.last_used = [0.0] * count
+    gemini_pool.reserved_at = [0.0] * count
+    gemini_pool.last_error = [None] * count
+    gemini_pool.lease_ttl = [300.0] * count
     gemini_pool.blackout_until = 0.0
     gemini_pool.rr_index = 0
     gemini_pool.model_blocked_until = {}
@@ -266,7 +306,13 @@ def make_job(job_id: str, **overrides):
 
 def install_events():
     def log_event(name, job_id=None, **fields):
-        detail = " ".join(f"{key}={value}" for key, value in fields.items() if key in {"category", "error_type", "attempt"})
+        detail = " ".join(
+            f"{key}={value}" for key, value in fields.items()
+            if key in {
+                "category", "error_type", "attempt", "http_status",
+                "provider_status", "key_name", "safe_message",
+            }
+        )
         event(f"{name} job={job_id}" + (f" {detail}" if detail else ""))
     runner._job_log = log_event
     generate._job_log = log_event
@@ -283,17 +329,20 @@ async def tracked_generation_call(**kwargs):
     return await REAL_GENERATION_CALL(**kwargs)
 
 
-def prepare_case(proxies: list[str]):
+def prepare_case(proxies: list[str], key_count: int = 1):
     global ACTIVE_EVENTS, FAKE_GENERATE_COUNT, FAKE_503_REMAINING
-    global FAKE_GENERATE_DELAY, FAKE_REQUEST_SEEN, RUNNER_API_ATTEMPTS
+    global FAKE_ERROR_QUEUE, FAKE_TEXT_QUEUE, FAKE_DELAY_QUEUE
+    global FAKE_REQUEST_SEEN, RUNNER_API_ATTEMPTS
     with ACTIVE_LOCK:
         ACTIVE_EVENTS = []
     FAKE_GENERATE_COUNT = 0
     FAKE_503_REMAINING = 0
-    FAKE_GENERATE_DELAY = 0.0
+    FAKE_ERROR_QUEUE = []
+    FAKE_TEXT_QUEUE = []
+    FAKE_DELAY_QUEUE = []
     FAKE_REQUEST_SEEN = threading.Event()
     RUNNER_API_ATTEMPTS = 0
-    reset_keys()
+    reset_keys(key_count)
     pool = GeminiSmartProxyPool([])
     pool.routes = list(proxies)
     pool.cooldown_until = {route: 0.0 for route in pool.routes}
@@ -305,10 +354,12 @@ def prepare_case(proxies: list[str]):
     runner.call_gemini_generate = tracked_generation_call
     runner.TEMPLATE_YIELD_TO_OCR = False
     runner.TEMPLATE_INFRA_RETRIES = 4
+    runner.TEMPLATE_RESERVE_KEYS_FOR_OCR = 0
     runner.TEMPLATE_HARD_TIMEOUT = 5
     runner.TEMPLATE_PROXY_PREFLIGHT_TIMEOUT = 0.25
     runner.TEMPLATE_MIN_CALL_SECONDS = 0.1
     runner.TEMPLATE_DEADLINE_MARGIN = 0
+    config.TEMPLATE_HTTP_READ_TIMEOUT = SMOKE_READ_TIMEOUT
     runner.TEMPLATE_MODEL_COOLDOWN = 0.01
     gemini_client.TEMPLATE_PROXY_PREFLIGHT_URL = "http://fake-gemini.invalid/health"
     gemini_client.GEMINI_REST_URL = "http://fake-gemini.invalid/v1beta/models/{model}:generateContent"
@@ -330,7 +381,7 @@ def assert_case(name: str, condition: bool, reason: str):
 
 def report_case(name: str, started: float, job: dict, pool, expected: bool, extra: str = ""):
     elapsed = time.monotonic() - started
-    reserved = bool(gemini_pool.reserved and gemini_pool.reserved[0])
+    reserved = any(gemini_pool.reserved)
     route_status = ",".join(
         f"{route.rsplit(':', 1)[-1]}={'cooldown' if pool.failures.get(route, 0) else 'clean'}"
         for route in pool.routes
@@ -360,7 +411,7 @@ async def run_generation_case(name: str, routes: list[str], expectation):
 
 
 async def main():
-    global FAKE_503_REMAINING
+    global FAKE_503_REMAINING, FAKE_ERROR_QUEUE, FAKE_TEXT_QUEUE, FAKE_DELAY_QUEUE
     server = LocalGeminiServer()
     proxies: list[LocalProxy] = []
     saved_pool_attrs = {
@@ -373,6 +424,8 @@ async def main():
     }
     original_logs = (runner._job_log, generate._job_log, template_router._job_log)
     original_proxy_pool = runner.smart_proxy_pool
+    original_reserve = runner.TEMPLATE_RESERVE_KEYS_FOR_OCR
+    original_read_timeout = config.TEMPLATE_HTTP_READ_TIMEOUT
     server.start()
     healthy = LocalProxy("healthy")
     blackhole = LocalProxy("blackhole")
@@ -459,36 +512,136 @@ async def main():
         )
         all_passed &= report_case("7 Gemini 503 twice, then 200", started, job, pool, valid)
 
-        # 8. Cancel a real queued job during its HTTP request; preserve an earlier result,
-        # return the key, and release the router semaphore.
-        cancel_request_seen = threading.Event()
+        # 8–10. Same-model 400/403/404 on two distinct keys should stop immediately,
+        # block only the key/model pairs, and keep the global keys healthy.
+        rejection_cases = [
+            (400, "INVALID_ARGUMENT", "Model is not valid for this project"),
+            (403, "PERMISSION_DENIED", "Project has no permission for this model"),
+            (404, "NOT_FOUND", "Model was not found"),
+        ]
+        for number, (status, provider_status, message) in enumerate(rejection_cases, start=8):
+            started = time.monotonic()
+            pool = prepare_case([healthy.url], key_count=2)
+            FAKE_ERROR_QUEUE = [
+                {"status": status, "provider_status": provider_status, "message": message},
+                {"status": status, "provider_status": provider_status, "message": message},
+            ]
+            job = make_job(f"{number}-model-rejected-{status}")
+            await generate.run_template_job(job["job_id"], job)
+            detail = job.get("error_detail", {})
+            valid = (
+                job.get("status") == "error" and job.get("error") == "model_rejected"
+                and detail.get("error_code") == "model_rejected"
+                and detail.get("http_status") == status
+                and detail.get("api_attempts") == 2
+                and len(detail.get("attempt_times_ms", [])) == 2
+                and RUNNER_API_ATTEMPTS == 2 and FAKE_GENERATE_COUNT == 2
+                and gemini_pool.dead == [False, False]
+                and gemini_pool.blocked == [0.0, 0.0]
+                and gemini_pool.last_error == [None, None]
+                and gemini_pool.blackout_until == 0.0
+                and all((index, MODEL) in gemini_pool.key_model_blocked for index in (0, 1))
+                and not gemini_pool.reserved[0] and not gemini_pool.reserved[1]
+                and not gemini_pool.model_unavailable
+                and pool.failures.get(healthy.url, 0) == 0
+            )
+            all_passed &= report_case(
+                f"{number} Gemini {status} → fast model_rejected; keys remain healthy",
+                started, job, pool, valid,
+                extra=f"key_model_blocks={len(gemini_pool.key_model_blocked)}",
+            )
+
+        # 11. Preflight succeeds, first live provider response is slower than the
+        # smoke-only read-timeout env; retry on the same healthy proxy and finish.
         started = time.monotonic()
-        stalled = LocalProxy("stall_generate", request_seen=cancel_request_seen)
+        pool = prepare_case([healthy.url])
+        slow_response_seconds = max(0.35, SMOKE_READ_TIMEOUT * 3)
+        FAKE_DELAY_QUEUE = [slow_response_seconds]
+        job = make_job("11-slow-live-response")
+        await generate.run_template_job(job["job_id"], job)
+        await asyncio.sleep(slow_response_seconds + 0.05)  # drain fake response after client timeout
+        valid = (
+            job.get("status") == "done" and job.get("template", {}).get("html")
+            and RUNNER_API_ATTEMPTS == 2 and FAKE_GENERATE_COUNT == 2
+            and telemetry.TEMPLATE_STATS["generation_timeout"] >= 1
+            and not gemini_pool.dead[0] and gemini_pool.blocked[0] == 0.0
+            and gemini_pool.last_error[0] is None and not gemini_pool.reserved[0]
+            and pool.failures.get(healthy.url, 0) == 0
+        )
+        all_passed &= report_case(
+            "11 slow-but-live response retries without proxy cooldown",
+            started, job, pool, valid,
+            extra=f"read_timeout_env={SMOKE_READ_TIMEOUT:.3f}s",
+        )
+
+        # 12. Generate a real invalid first draft, verify it is persisted, then cancel
+        # while the second Gemini call is held by the local proxy.
+        stall_seen = threading.Event()
+        started = time.monotonic()
+        stalled = LocalProxy("stall_generate", stall_seen=stall_seen)
         proxies.append(stalled)
         pool = prepare_case([stalled.url])
-        previous = {"html": GOOD_HTML, "valid": False, "attempts": []}
-        job = make_job("8-cancel-mid-call", template=previous)
+        draft_html = GOOD_HTML.replace(
+            '<h2 style="margin:20px 0 12px;color:#24352d;font-size:20px;line-height:1.5">Покупка уже в работе</h2>',
+            "",
+        ).replace(
+            "Мы подготовили свежие детали",
+            "DRAFT-SAVED-BEFORE-CANCEL — Мы подготовили свежие детали",
+        )
+        FAKE_TEXT_QUEUE = [draft_html + "\n№ 1"]
+        job = make_job("12-cancel-after-real-draft", max_attempts=2)
         template_router.TEMPLATE_JOBS[job["job_id"]] = job
         template_router._SEMAPHORE = asyncio.Semaphore(1)
         task = asyncio.create_task(template_router._run_queued(job["job_id"]))
-        await asyncio.to_thread(cancel_request_seen.wait, 3)
-        event("cancel request task while proxy is holding generateContent response")
+        await asyncio.wait_for(asyncio.to_thread(stall_seen.wait, 5), timeout=6)
+        draft_saved = bool(job.get("template", {}).get("html"))
+        event(
+            "verified generated draft persisted before cancellation "
+            f"(valid={job.get('template', {}).get('valid')}, attempts={len(job.get('template', {}).get('attempts', []))})"
+        )
         task.cancel()
         try:
             await task
         except asyncio.CancelledError:
             pass
         valid = (
-            job.get("status") == "done" and job.get("template", {}).get("html") == GOOD_HTML
+            draft_saved and job.get("status") == "done"
+            and "DRAFT-SAVED-BEFORE-CANCEL" in job.get("template", {}).get("html", "")
+            and job.get("template", {}).get("valid") is False
             and job.get("template", {}).get("generation_error") == "cancelled"
-            and RUNNER_API_ATTEMPTS == 1
+            and RUNNER_API_ATTEMPTS == 2 and FAKE_GENERATE_COUNT == 1
             and not gemini_pool.reserved[0] and template_router._SEMAPHORE._value == 1
             and pool.failures.get(stalled.url, 0) == 0
         )
         all_passed &= report_case(
-            "8 cancellation mid-call preserves result/releases key+semaphore",
+            "12 cancellation preserves the generated draft and releases key+semaphore",
             started, job, pool, valid,
-            extra=f"semaphore_available={template_router._SEMAPHORE._value}",
+            extra=f"draft_saved_before_cancel={draft_saved}; semaphore_available={template_router._SEMAPHORE._value}",
+        )
+
+        # 13. Cancellation before any model result must remain error=cancelled.
+        started = time.monotonic()
+        pool = prepare_case([healthy.url])
+        job = make_job("13-cancel-before-any-result")
+        template_router.TEMPLATE_JOBS[job["job_id"]] = job
+        template_router._SEMAPHORE = asyncio.Semaphore(0)
+        task = asyncio.create_task(template_router._run_queued(job["job_id"]))
+        await asyncio.sleep(0.01)
+        event("cancel queued task before generator/result was started")
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        valid = (
+            job.get("status") == "error" and job.get("error") == "cancelled"
+            and not job.get("template") and job.get("error_detail", {}).get("error_code") == "cancelled"
+            and RUNNER_API_ATTEMPTS == 0 and FAKE_GENERATE_COUNT == 0
+            and not any(gemini_pool.reserved)
+        )
+        all_passed &= report_case(
+            "13 cancellation before a result returns error=cancelled",
+            started, job, pool, valid,
         )
 
     finally:
@@ -498,11 +651,13 @@ async def main():
         server.stop()
         runner.smart_proxy_pool = original_proxy_pool
         runner.call_gemini_generate = REAL_GENERATION_CALL
+        runner.TEMPLATE_RESERVE_KEYS_FOR_OCR = original_reserve
+        config.TEMPLATE_HTTP_READ_TIMEOUT = original_read_timeout
         runner._job_log, generate._job_log, template_router._job_log = original_logs
         for name, value in saved_pool_attrs.items():
             setattr(gemini_pool, name, value)
 
-    print(f"\nSMOKE RESULT: {'PASS' if all_passed else 'FAIL'} (8 scenarios)")
+    print(f"\nSMOKE RESULT: {'PASS' if all_passed else 'FAIL'} (13 scenarios)")
     if not all_passed:
         raise SystemExit(1)
 

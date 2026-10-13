@@ -128,7 +128,23 @@ def _issue(report, rule, severity, message, where=""):
     if rule in TEMPLATE_DISABLED_RULES and severity == "W":
         return
     target = report.errors if severity == "E" else report.warnings
-    target.append(Issue(rule, severity, message, str(where).replace("\n", " ")[:120]))
+    target.append(Issue(rule, severity, message, re.sub(r"\s+", " ", str(where)).strip()[:200]))
+
+
+def _fragment(source: str, start: int, end: Optional[int] = None, limit: int = 200) -> str:
+    """Return a compact source excerpt around a validator finding."""
+    if not source:
+        return ""
+    start = max(0, min(len(source), int(start)))
+    end = start if end is None else max(start, min(len(source), int(end)))
+    left = max(0, start - limit // 3)
+    right = min(len(source), max(end, start + 1) + (limit - (start - left)))
+    excerpt = re.sub(r"\s+", " ", source[left:right]).strip()
+    if left:
+        excerpt = "…" + excerpt
+    if right < len(source):
+        excerpt += "…"
+    return excerpt[:limit]
 
 
 def _contrast_message(label, foreground, background, observed):
@@ -194,34 +210,238 @@ def validate(source: str, currency_method: Optional[int] = None) -> Report:
     titles = [node for node in nodes if node.tag == "title"]
     if not titles or "{{productName}}" not in _text(titles[0]):
         _issue(report, "V03", "E", "{{productName}} должен быть в <title>")
-    marker_pos = source.find(MARKER)
+    marker_matches = list(re.finditer(r"<!--\s*Здесь\s+вставляется\s+тело\s+письма\s*-->", source, re.I))
+    marker_pos = marker_matches[0].start() if marker_matches else -1
     body_start_pos = next((node.start_pos for node in nodes if node.tag == "body"), 0)
     detail_start = source.find("{{productName}}", body_start_pos)
     if detail_start < 0 or (marker_pos >= 0 and detail_start >= marker_pos):
         detail_start = -1
-    if marker_pos < 0:
-        _issue(report, "T18", "E", "Нет обязательного комментария-маркера")
-    elif source.count(MARKER) != 1:
-        _issue(report, "T18", "E", "Маркер должен присутствовать ровно один раз")
-    elif not re.match(r"\s*<h2\b", source[marker_pos + len(MARKER):], re.I):
-        _issue(report, "T18", "E", "Маркер должен стоять непосредственно перед <h2> сообщения")
+    message_heading = next(
+        (node for node in nodes if node.tag == "h2" and node.start_pos > source.find("{{transactionalId}}")),
+        next((node for node in nodes if node.tag == "h2" and node.start_pos > body_start_pos), None),
+    )
+    message_cell = message_heading
+    while message_cell is not None and message_cell.tag != "td":
+        message_cell = message_cell.parent
+    if not marker_matches:
+        heading_at = message_heading.start_pos if message_heading else max(0, body_start_pos)
+        _issue(
+            report, "T18", "E", "Нет обязательного комментария-маркера",
+            _fragment(source, heading_at, heading_at + 120),
+        )
+    elif len(marker_matches) != 1:
+        duplicate = marker_matches[1]
+        _issue(
+            report, "T18", "E", "Маркер должен присутствовать ровно один раз",
+            _fragment(source, duplicate.start(), duplicate.end()),
+        )
+    elif not re.match(r"<h2\b", source[marker_matches[0].end():], re.I):
+        marker = marker_matches[0]
+        _issue(
+            report, "T18", "E", "Маркер должен стоять вплотную перед <h2> сообщения",
+            _fragment(source, marker.start(), marker.end() + 80),
+        )
+    elif (
+        message_heading is None
+        or message_cell is None
+        or marker_matches[0].end() != message_heading.start_pos
+    ):
+        marker = marker_matches[0]
+        _issue(
+            report, "T18", "E", "Маркер и <h2> сообщения должны стоять вплотную в одной ячейке",
+            _fragment(source, marker.start(), marker.end() + 80),
+        )
     body_before_marker = source[:marker_pos] if marker_pos >= 0 else source
     if detail_start < 0:
         _issue(report, "V04", "E", "{{productName}} должен быть в деталях заказа")
     if "{{brandName}}" not in body_before_marker or body_before_marker.find("{{brandName}}") > body_before_marker.find("{{name}}") >= 0:
         _issue(report, "V05", "E", "{{brandName}} должен быть в шапке до приветствия")
+    header_end = source.find("{{name}}", body_start_pos)
+    if header_end < 0:
+        header_end = marker_pos if marker_pos >= 0 else len(source)
+    header_brand_matches = [
+        item for item in re.finditer(r"\{\{brandName\}\}", source[body_start_pos:header_end])
+    ]
+    if len(header_brand_matches) > 1:
+        duplicate_brand = header_brand_matches[1]
+        absolute_start = body_start_pos + duplicate_brand.start()
+        _issue(
+            report, "V12", "W", "{{brandName}} должен встречаться в шапке только один раз",
+            _fragment(source, absolute_start, absolute_start + len("{{brandName}}")),
+        )
+    brand_node = next(
+        (
+            node for node in nodes
+            if "{{brandName}}" in node.text and body_start_pos <= node.start_pos < header_end
+        ),
+        None,
+    )
+    if brand_node is not None:
+        ancestors = []
+        current = brand_node
+        while current is not None and current.tag not in {"body", "html", "root", "table", "tr"}:
+            ancestors.append(current)
+            current = current.parent
+
+        def fixed_dimension(value):
+            return bool(re.fullmatch(r"\s*\d+(?:\.\d+)?(?:px|pt|em|rem)?\s*", value or "", re.I))
+
+        geometry_problem = False
+        font_size_px = None
+        line_height_px = None
+        line_height_ratio = None
+        rounded_circle = False
+        for node in ancestors:
+            style = _style(node)
+            if any(
+                fixed_dimension(style.get(key, "")) or fixed_dimension(node.attrs.get(key, ""))
+                for key in ("width", "height")
+            ):
+                geometry_problem = True
+            radius = style.get("border-radius", "")
+            rounded_circle = rounded_circle or bool(re.search(r"(?:50\s*%|9999(?:px|pt)?)", radius, re.I))
+            if font_size_px is None and (match := re.fullmatch(r"\s*(\d+(?:\.\d+)?)px\s*", style.get("font-size", ""), re.I)):
+                font_size_px = float(match.group(1))
+            if line_height_px is None and (match := re.fullmatch(r"\s*(\d+(?:\.\d+)?)px\s*", style.get("line-height", ""), re.I)):
+                line_height_px = float(match.group(1))
+            if line_height_ratio is None and (match := re.fullmatch(r"\s*(\d+(?:\.\d+)?)\s*", style.get("line-height", ""))):
+                line_height_ratio = float(match.group(1))
+        if rounded_circle or (
+            font_size_px is not None and line_height_px is not None and line_height_px < font_size_px
+        ) or (line_height_ratio is not None and line_height_ratio < 1):
+            geometry_problem = True
+        if geometry_problem:
+            brand_start = source.find("{{brandName}}", brand_node.start_pos)
+            _issue(
+                report, "V12", "W",
+                "Уберите фиксированные width/height, круг или line-height меньше текста вокруг {{brandName}}",
+                _fragment(source, brand_start, brand_start + len("{{brandName}}")),
+            )
     body_name_pos = source.find("{{name}}", body_start_pos)
     body_transaction_pos = source.find("{{transactionalId}}", body_name_pos + 1) if body_name_pos >= 0 else -1
     if not (0 <= body_name_pos < body_transaction_pos < marker_pos and marker_pos >= 0):
         _issue(report, "V06", "E", "Приветствие и детали заказа должны содержать имя и номер")
     anchors = [node for node in nodes if node.tag == "a"]
-    if len(anchors) != 1 or (anchors and anchors[0].attrs.get("href") != "mailto:{{supportEmail}}") or source.count("{{supportEmail}}") != 1:
-        _issue(report, "V07", "E", "Допустима только одна ссылка mailto:{{supportEmail}}")
-    email_after_link = bool(
-        anchors and any("{{email}}" in node.text and node.start_pos > anchors[0].start_pos for node in nodes)
+    support_anchors = [
+        node for node in anchors
+        if node.attrs.get("href", "").strip() == "mailto:{{supportEmail}}"
+    ]
+    source_anchors = list(re.finditer(r"<a\b[^>]*>[\s\S]*?</a\s*>", source, re.I))
+    support_source = next(
+        (
+            item for item in source_anchors
+            if re.search(r"\bhref\s*=\s*([\"'])mailto:\{\{supportEmail\}\}\1", item.group(0), re.I)
+        ),
+        None,
     )
-    if not email_after_link:
-        _issue(report, "V07", "E", "{{email}} должен быть текстом в подвале")
+    support_token_count = source.count("{{supportEmail}}")
+    support_label = _text(support_anchors[0]).strip() if support_anchors else ""
+    bad_support_label = not support_label or bool(
+        re.search(r"\{\{supportEmail\}\}|mailto:|[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}", support_label, re.I)
+    )
+    if (
+        len(support_anchors) != 1
+        or len(anchors) != 1
+        or support_token_count != 1
+        or bad_support_label
+    ):
+        duplicate = source_anchors[1] if len(support_anchors) > 1 and len(source_anchors) > 1 else None
+        if support_token_count > 1:
+            tokens = list(re.finditer(r"\{\{supportEmail\}\}", source))
+            duplicate = next(
+                (source_anchor for source_anchor in source_anchors
+                 if source_anchor.start() <= tokens[1].start() < source_anchor.end()),
+                None,
+            )
+        if duplicate is None and source_anchors:
+            duplicate = next(
+                (item for item in source_anchors
+                 if not re.search(r"\bhref\s*=\s*([\"'])mailto:\{\{supportEmail\}\}\1", item.group(0), re.I)),
+                source_anchors[0],
+            )
+        if duplicate is None and support_anchors and bad_support_label:
+            duplicate = next(
+                (item for item in source_anchors
+                 if item.start() <= support_anchors[0].start_pos < item.end()),
+                None,
+            )
+        where = _fragment(source, duplicate.start(), duplicate.end()) if duplicate else ""
+        if support_token_count != 1:
+            tokens = list(re.finditer(r"\{\{supportEmail\}\}", source))
+            if tokens:
+                token = tokens[1] if len(tokens) > 1 else tokens[0]
+                where = _fragment(source, token.start(), token.end())
+            elif source_anchors:
+                where = _fragment(source, source_anchors[0].start(), source_anchors[0].end())
+            else:
+                where = _fragment(source, body_start_pos, body_start_pos + 100)
+        _issue(
+            report, "V07", "E",
+            "Нужна одна ссылка mailto:{{supportEmail}} с обычной подписью; переменная — только в href",
+            where,
+        )
+
+    anchor_spans = [(match.start(), match.end()) for match in source_anchors]
+    email_locations = [match.start() for match in re.finditer(r"\{\{email\}\}", source)]
+    footer_root = support_anchors[0] if support_anchors else None
+    while footer_root is not None and footer_root.tag not in {"tr", "table"}:
+        footer_root = footer_root.parent
+
+    def in_footer(position):
+        if footer_root is None:
+            return False
+        for node in nodes:
+            if "{{email}}" not in node.text:
+                continue
+            node_position = source.find("{{email}}", node.start_pos)
+            if node_position != position:
+                continue
+            current = node
+            while current is not None and current is not footer_root:
+                current = current.parent
+            if current is footer_root:
+                return True
+        return False
+
+    support_end = support_source.end() if support_source else -1
+    separate_email_locations = set()
+    for element in re.finditer(r"<(p|span)\b[^>]*>", source, re.I):
+        if element.start() < support_end:
+            continue
+        close_tag = re.search(r"</" + element.group(1) + r"\s*>", source[element.end():], re.I)
+        if close_tag is None:
+            continue
+        element_end = element.end() + close_tag.end()
+        separate_email_locations.update(
+            item for item in email_locations
+            if element.start() <= item < element_end
+        )
+
+    email_outside_footer = next(
+        (
+            position for position in email_locations
+            if support_anchors and position > support_end
+            and not any(start <= position < end for start, end in anchor_spans)
+            and in_footer(position)
+            and position in separate_email_locations
+        ),
+        None,
+    )
+    if email_outside_footer is None:
+        offending = next(
+            (
+                position for position in email_locations
+                if any(start <= position < end for start, end in anchor_spans)
+            ),
+            email_locations[0] if email_locations else (
+                support_anchors[0].start_pos if support_anchors else body_start_pos
+            ),
+        )
+        _issue(
+            report, "V07", "E",
+            "{{email}} должен быть обычным текстом в отдельном <p> или <span> после ссылки",
+            _fragment(source, offending, offending + len("{{email}}")),
+        )
     if any(re.search(r"mailto:[^\"'>]*\?", node.attrs.get("href", ""), re.I) for node in anchors):
         _issue(report, "V09", "W", "Уберите параметры запроса из mailto-ссылки")
     price_at = source.find("{{price}}")
@@ -605,20 +825,56 @@ def validate(source: str, currency_method: Optional[int] = None) -> Report:
     status_text = ""
     if detail_start >= 0 and marker_pos > detail_start:
         status_text = html.unescape(re.sub(r"<[^>]*>", " ", source[detail_start:marker_pos])).casefold()
-    if re.search(r"(?<![\w])(?:завтра|сегодня до|в ближайш\w*|за\s+\d+\s+(?:мин|час|дн|сут|недел)\w*|\d+\s+(?:рабоч\w+\s+)?(?:дн|час|сут)\w*|до\s+\d+\s+(?:дн|час)\w*)", content_text):
-        _issue(report, "S07", "E", "Обещания сроков в письме запрещены")
-    elif re.search(r"в течение|через\s+\d", content_text):
-        if re.search(r"в течение|через\s+\d", (message_text + " " + status_text).casefold()):
-            _issue(report, "S07", "E", "Обещания сроков в блоке сообщения запрещены")
-        else:
-            _issue(report, "S07", "W", "Проверьте формулировку, похожую на обещание срока")
-    for heading in (n for n in nodes if n.tag in {"h1", "h2", "h3"}):
-        if re.search(r"\b[A-ZА-ЯЁ]{3,}\b", _text(heading)) and not re.search(r"\b(?:USD|ID|PDF|SMS|OK|FAQ)\b", _text(heading)):
-            _issue(report, "S04", "E", "Не используйте слова целиком заглавными в заголовках")
+    timing_promise = re.search(
+        r"\b(?:"
+        r"завтра|сегодня\s+до|в\s+ближайш\w*"
+        r"|не\s+(?:более|дольше|позже)\s+(?:пары|пару|двух|трех|трёх|нескольких|\d+)\s+"
+        r"(?:рабочих\s+)?(?:дн\w*|час\w*|сут\w*|недел\w*)"
+        r"|в\s+течение(?:\s+(?:ближайш\w*|следующ\w*|пары|пару|двух|трех|трёх|нескольких|\d+)"
+        r"(?:\s+(?:рабочих\s+)?(?:дн\w*|час\w*|сут\w*|недел\w*))?)?"
+        r"|за\s+(?:пару|пары|двух|трех|трёх|нескольких|\d+)\s+"
+        r"(?:рабочих\s+)?(?:дн\w*|час\w*|сут\w*|недел\w*)"
+        r"|через\s+(?:пару|пары|двух|трех|трёх|нескольких|\d+)\s+"
+        r"(?:рабочих\s+)?(?:дн\w*|час\w*|сут\w*|недел\w*)"
+        r"|(?:обычно\s+)?(?:это\s+)?(?:занимает|потребует)\s+(?:не\s+более\s+)?"
+        r"(?:пару|пары|двух|трех|трёх|нескольких|\d+)\s+"
+        r"(?:рабочих\s+)?(?:дн\w*|час\w*|сут\w*|недел\w*)"
+        r"|(?:within|in)\s+\d+\s+(?:business\s+)?(?:days|hours|weeks)"
+        r"|no\s+more\s+than\s+(?:a\s+)?(?:couple|two|three|\d+)\s+(?:days|hours|weeks)"
+        r"|(?:usually\s+)?takes\s+(?:up\s+to\s+)?(?:a\s+)?(?:couple|two|three|\d+)\s+(?:days|hours|weeks)"
+        r")\b",
+        content_text,
+        re.I,
+    )
+    if timing_promise:
+        _issue(
+            report, "S07", "W",
+            "Проверьте обещание срока: промпт запрещает обещать сроки.",
+            timing_promise.group(0),
+        )
+    for heading in (
+        node for node in nodes
+        if node.tag in {"h1", "h2", "h3", "em", "i"}
+        or _style(node).get("font-style", "").lower() == "italic"
+    ):
+        text = _text(heading)
+        caps = re.search(r"\b[A-ZА-ЯЁ]{3,}\b", text)
+        if caps and not re.search(r"\b(?:USD|ID|PDF|SMS|OK|FAQ)\b", text):
+            _issue(
+                report, "S04", "E", "Не используйте слова целиком заглавными в заголовках и подписи",
+                _fragment(source, heading.start_pos, heading.start_pos + 180),
+            )
     if re.search(r"\b[A-ZА-ЯЁ]{4,}\b", content_case_text):
         _issue(report, "S04", "W", "Проверьте слова целиком заглавными в тексте")
-    if any(_style(node).get("text-transform", "").lower() == "uppercase" for node in nodes):
-        _issue(report, "S04", "W", "Избегайте text-transform:uppercase")
+    uppercase_node = next(
+        (node for node in nodes if re.search(r"\buppercase\b", _style(node).get("text-transform", ""), re.I)),
+        None,
+    )
+    if uppercase_node is not None:
+        _issue(
+            report, "S13", "E", "Удалите text-transform:uppercase",
+            _fragment(source, uppercase_node.start_pos, uppercase_node.start_pos + 160),
+        )
     greeting_node = next((node for node in nodes if "{{name}}" in node.text), None)
     greeting_large = False
     current = greeting_node
@@ -723,7 +979,7 @@ def validate(source: str, currency_method: Optional[int] = None) -> Report:
 
 
 _WARNING_RULES = {
-    "V09", "V10", "V11", "T13", "T14", "T25", "S02", "S08", "S09", "S11", "S12",
+    "V09", "V10", "V11", "V12", "T13", "T14", "T25", "S02", "S07", "S08", "S09", "S11", "S12",
     "A03", "A04", "P01", "P02",
     *(f"M{number:02d}" for number in range(1, 21)),
 }
@@ -739,7 +995,7 @@ RULES: Dict[str, dict] = {
         "V01": "Обязательные переменные", "V02": "Допустимые плейсхолдеры", "V03": "Переменная в title",
         "V04": "Переменная в деталях", "V05": "Название бренда", "V06": "Приветствие и заказ",
         "V07": "Ссылка поддержки и получатель", "V08": "Валюта и сумма", "V09": "Чистый mailto",
-        "V11": "Размер цены", "T01": "Только inline CSS",
+        "V11": "Размер цены", "V12": "Читаемость названия в шапке", "T01": "Только inline CSS",
         "T02": "Нет class", "T03": "Нет запрещённых тегов", "T04": "Безопасный CSS",
         "T05": "Нет внешних ресурсов", "T06": "Документ и метаданные", "T07": "Ширина письма",
         "T08": "Атрибуты email-таблиц", "T16": "Inline-стили сообщения", "T17": "Структура сообщения",
@@ -748,10 +1004,11 @@ RULES: Dict[str, dict] = {
         "T15": "Безопасные шрифты", "T18": "Маркер тела сообщения", "T19": "HTML-комментарии",
         "T20": "Заголовок документа", "T21": "Сбалансированные теги", "T25": "Количество таблиц",
         "T22": "Стили ссылок", "T23": "Размер HTML", "T24": "Маркированный список",
-        "S01": "Запрещённые формулировки", "S02": "Восклицательные знаки", "S04": "Капс в заголовках",
+        "S01": "Запрещённые формулировки", "S02": "Восклицательные знаки", "S04": "Заглавные подписи и стили",
         "S03": "Эмодзи", "S05": "Отсутствие кнопок", "S06": "Канцелярские фразы", "S07": "Обещания сроков",
         "S08": "Нешаблонный заголовок", "S09": "Заметное приветствие", "S10": "Обращение на «ты»",
         "S11": "Ненавязчивый призыв", "S12": "Транзакционный тон",
+        "S13": "Запрещённый text-transform",
         "L01": "Порядок блоков", "L02": "Индикатор этапов", "A01": "Контраст текста",
         "A02": "Контраст знака валюты", "A03": "Индикатор без опоры на цвет", "A04": "Проверка контраста",
         "P01": "Ограниченная палитра", "P02": "Количество цветов",

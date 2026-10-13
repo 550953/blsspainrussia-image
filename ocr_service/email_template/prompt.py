@@ -4,7 +4,7 @@ from dataclasses import asdict, is_dataclass
 from pathlib import Path
 from typing import Sequence
 
-PROMPT_VERSION = "1.0"
+PROMPT_VERSION = "1.2"
 PROMPT_PATH = Path(__file__).with_name("prompt_base.txt")
 
 
@@ -54,7 +54,34 @@ def build_user_message(brief: dict) -> str:
     )
 
 
-def build_repair_message(issues: list, cut_off=False) -> str:
+_REPAIR_INSTRUCTIONS = {
+    "T18": (
+        "Оставь ровно один <!-- Здесь вставляется тело письма --> и поставь его вплотную перед первым "
+        "<h2> после {{transactionalId}}, внутри той же ячейки <td>; между маркером и <h2> не оставляй "
+        "пробелов, тегов или декора. Полоску и отступ поставь до маркера."
+    ),
+    "V07": (
+        "Оставь ровно одну ссылку href=\"mailto:{{supportEmail}}\"; {{supportEmail}} должен встретиться "
+        "только в этом href. Подпись ссылки — «Напишите нам», не адрес и не переменная; другие ссылки "
+        "замени обычным текстом. Поставь {{email}} вне <a> в отдельный <p> или <span> после ссылки."
+    ),
+    "V12": (
+        "Выведи {{brandName}} ровно один раз в шапке как обычный переносимый текст; убери у окружающих "
+        "элементов фиксированные width/height, круги и line-height меньше font-size. Акцент поставь рядом."
+    ),
+    "S04": (
+        "Удали text-transform:uppercase и перепиши заглавные подписи/заголовки обычным регистром "
+        "(кроме стандартных аббревиатур)."
+    ),
+    "S13": "Удали text-transform:uppercase; используй обычный регистр.",
+    "S07": (
+        "Удали обещание срока и замени его нейтральным сообщением без даты или длительности, "
+        "например: «Мы сообщим вам, когда появится обновление»."
+    ),
+}
+
+
+def build_repair_message(issues: list, cut_off=False, compact=False) -> str:
     order = {"T": 0, "S": 0, "V": 0, "X": 0, "L": 1, "A": 2}
     issues = [
         {"rule": item[0], "message": item[1], "where": item[2] if len(item) > 2 else ""}
@@ -63,14 +90,24 @@ def build_repair_message(issues: list, cut_off=False) -> str:
     ]
     issues = sorted(issues, key=lambda item: order.get(str(item.get("rule", "?"))[:1], 3))
     entries = []
-    for issue in issues[:12]:
-        item = "- [{rule}] {message}".format(rule=issue.get("rule", "?"), message=issue.get("message", ""))
-        if issue.get("where"):
-            item += " — фрагмент: " + str(issue["where"])[:120]
+    for issue in issues[:6 if compact else 12]:
+        rule = str(issue.get("rule", "?"))
+        instruction = _REPAIR_INSTRUCTIONS.get(rule) or str(issue.get("message", ""))
+        item = "- [{rule}] Исправление: {instruction}".format(rule=rule, instruction=instruction)
+        excerpt = str(issue.get("where") or "").strip()
+        item += " — проблемный фрагмент: " + (excerpt[:200] if excerpt else "не локализован валидатором")
         entries.append(item)
+    if compact:
+        opening = (
+            "Перезапусти исправление с исходных требований. Не продолжай предыдущую редакцию по памяти; "
+            "исправь только обязательные пункты ниже.\n"
+        )
+    else:
+        opening = "Проверка нашла нарушения. Исправь ТОЛЬКО их; дизайн, палитру, тексты и выбранные параметры не меняй.\n"
     return (
-        "Проверка нашла нарушения. Исправь ТОЛЬКО их; дизайн, палитру, тексты и выбранные параметры не меняй.\n"
-        "Верни ответ в том же формате: концепция, файл template.html целиком, строка с переменными.\n"
+        opening
+        + "Верни весь HTML целиком: полный документ от <!DOCTYPE html> до </html>, не фрагмент и не diff. "
+        "Сохрани формат ответа: концепция, файл template.html целиком, строка с переменными.\n"
         + ("HTML был обрезан: сократи формулировки и заверши полный документ.\n" if cut_off else "")
         + "Нарушения:\n" + "\n".join(entries)
     )

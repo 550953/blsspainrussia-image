@@ -3,6 +3,137 @@ import re
 from .validator import ALLOWED_VARS, MARKER
 
 
+_MARKER_PATTERN = re.compile(
+    r"<!--\s*Здесь\s+вставляется\s+тело\s+письма\s*-->", re.I,
+)
+_ANCHOR_PATTERN = re.compile(r"<a\b([^>]*)>([\s\S]*?)</a\s*>", re.I)
+
+
+def _message_heading(source: str):
+    transaction = source.find("{{transactionalId}}")
+    headings = list(re.finditer(r"<h2\b", source, re.I))
+    if transaction >= 0:
+        heading = next((item for item in headings if item.start() > transaction), None)
+        if heading:
+            return heading
+    body = re.search(r"<body\b[^>]*>", source, re.I)
+    return next((item for item in headings if body is None or item.start() > body.end()), None)
+
+
+def _fix_marker(source: str):
+    heading = _message_heading(source)
+    if not heading:
+        return source, False
+    without_markers = _MARKER_PATTERN.sub("", source)
+    heading = _message_heading(without_markers)
+    if not heading:
+        return source, False
+    before = without_markers[:heading.start()].rstrip()
+    after = without_markers[heading.start():]
+    updated = before + MARKER + after
+    return updated, updated != source
+
+
+def _anchor_href(attrs: str):
+    match = re.search(r"\bhref\s*=\s*([\"'])(.*?)\1", attrs, re.I | re.S)
+    return match.group(2).strip() if match else ""
+
+
+def _visible_anchor_text(inner: str):
+    return re.sub(r"<[^>]*>", "", inner)
+
+
+def _fix_support_links(source: str):
+    anchors = list(_ANCHOR_PATTERN.finditer(source))
+    had_email = "{{email}}" in source
+    canonical = [
+        item for item in anchors
+        if _anchor_href(item.group(1)) == "mailto:{{supportEmail}}"
+    ]
+    if not canonical:
+        return source, False
+
+    keep = canonical[0]
+    pieces = []
+    cursor = 0
+    for item in anchors:
+        pieces.append(source[cursor:item.start()])
+        inner = item.group(2)
+        if item is keep:
+            visible = _visible_anchor_text(inner).strip()
+            if (
+                not visible
+                or "{{supportEmail}}" in inner
+                or re.search(r"[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}", visible)
+            ):
+                inner = "Напишите нам"
+            inner = inner.replace("{{email}}", "")
+            pieces.append("<a" + item.group(1) + ">" + inner + "</a>")
+        else:
+            visible = _visible_anchor_text(inner).replace("{{supportEmail}}", "Напишите нам")
+            pieces.append(visible.replace("{{email}}", ""))
+        cursor = item.end()
+    pieces.append(source[cursor:])
+    updated = "".join(pieces)
+
+    canonical_match = next(
+        (
+            item for item in _ANCHOR_PATTERN.finditer(updated)
+            if _anchor_href(item.group(1)) == "mailto:{{supportEmail}}"
+        ),
+        None,
+    )
+    if canonical_match is None:
+        return source, False
+
+    before, kept_link, after = (
+        updated[:canonical_match.start()],
+        canonical_match.group(0),
+        updated[canonical_match.end():],
+    )
+    updated = before.replace("{{supportEmail}}", "Напишите нам") + kept_link + after.replace(
+        "{{supportEmail}}", "Напишите нам",
+    )
+    canonical_match = next(
+        item for item in _ANCHOR_PATTERN.finditer(updated)
+        if _anchor_href(item.group(1)) == "mailto:{{supportEmail}}"
+    )
+    email_matches = list(re.finditer(r"\{\{email\}\}", updated))
+    if had_email and not email_matches:
+        updated = updated[:canonical_match.end()] + "<span>{{email}}</span>" + updated[canonical_match.end():]
+    elif email_matches:
+        separate_email = None
+        for element in re.finditer(r"<(p|span)\b[^>]*>[\s\S]*?</\1\s*>", updated, re.I):
+            if element.start() < canonical_match.end():
+                continue
+            email = next(
+                (item for item in email_matches if element.start() <= item.start() < element.end()),
+                None,
+            )
+            if email:
+                separate_email = email.start()
+                break
+        if separate_email is None:
+            updated = re.sub(r"\{\{email\}\}", "", updated)
+            canonical_match = next(
+                item for item in _ANCHOR_PATTERN.finditer(updated)
+                if _anchor_href(item.group(1)) == "mailto:{{supportEmail}}"
+            )
+            updated = updated[:canonical_match.end()] + "<span>{{email}}</span>" + updated[canonical_match.end():]
+        else:
+            first = True
+
+            def keep_one_email(_match):
+                nonlocal first
+                if _match.start() == separate_email and first:
+                    first = False
+                    return "{{email}}"
+                return ""
+
+            updated = re.sub(r"\{\{email\}\}", keep_one_email, updated)
+    return updated, updated != source
+
+
 def apply(source: str):
     original = source
     fixes = []
@@ -25,6 +156,14 @@ def apply(source: str):
     updated = re.sub(r"<!--\s*Здесь\s+вставляется\s+тело\s+письма\s*-->", MARKER, source, flags=re.I)
     if updated != source: fixes.append("AF03")
     source = updated
+    updated, marker_changed = _fix_marker(source)
+    if marker_changed:
+        source = updated
+        fixes.append("AF13")
+    updated, links_changed = _fix_support_links(source)
+    if links_changed:
+        source = updated
+        fixes.append("AF14")
     before_tables = source
     source = re.sub(
         r"<table\b([^>]*)>",

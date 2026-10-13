@@ -139,6 +139,13 @@ class GeminiKeyPool:
             self.model_unavailable.add((idx, model))
             print(f"[pid={os.getpid()}][gemini_model] {model} недоступна ключу {self.key_names[idx]} (404), больше не пробую", flush=True)
 
+    def block_model_for_key(self, idx: int, model: str, seconds: Optional[float] = None) -> dict:
+        """Временно закрыть только пару ключ/модель, не влияя на OCR и другие модели."""
+        hold = TEMPLATE_QUOTA_BLOCK_SECONDS if seconds is None else max(0.0, float(seconds))
+        until = time.monotonic() + hold
+        self.key_model_blocked[(idx, model)] = max(self.key_model_blocked.get((idx, model), 0.0), until)
+        return {"state": "MODEL_COOLDOWN", "cooldown_seconds": hold, "model": model}
+
     def pick_model(self, idx: Optional[int] = None, chain=None, respect_key_cooldown: bool = False) -> str:
         """Первая допустимая для ключа модель цепочки, не помеченная перегруженной.
         Если перегружены все, берётся та, что освободится раньше (запросы не блокируются)."""

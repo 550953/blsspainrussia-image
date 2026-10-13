@@ -149,6 +149,7 @@ TEMPLATE_ENABLED = os.getenv("TEMPLATE_ENABLED", "0").strip().lower() in {"1", "
 TEMPLATE_API_KEYS, _TEMPLATE_API_KEYS_SOURCE = _config_secret("TEMPLATE_API_KEYS")
 TEMPLATE_API_KEYS = [item.strip() for item in TEMPLATE_API_KEYS.split(",") if item.strip()]
 TEMPLATE_MODELS = [item.strip() for item in os.getenv("TEMPLATE_MODELS", "").split(",") if item.strip()]
+TEMPLATE_REPAIR_MODEL = os.getenv("TEMPLATE_REPAIR_MODEL", "").strip()
 TEMPLATE_MAX_CONCURRENCY = _template_int("TEMPLATE_MAX_CONCURRENCY", 3, 1)
 TEMPLATE_RESERVE_KEYS_FOR_OCR = _template_int("TEMPLATE_RESERVE_KEYS_FOR_OCR", 5, 0)
 TEMPLATE_YIELD_TO_OCR = os.getenv("TEMPLATE_YIELD_TO_OCR", "1").strip().lower() not in {"0", "false", "no"}

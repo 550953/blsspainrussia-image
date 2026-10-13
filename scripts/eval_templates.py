@@ -4,6 +4,7 @@ import argparse
 import concurrent.futures
 import html
 import json
+import os
 import re
 import statistics
 import time
@@ -112,8 +113,8 @@ def evaluate_one(args, number, out_dir):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--base-url", required=True)
-    parser.add_argument("--api-key", required=True)
+    parser.add_argument("--base-url", default=os.getenv("TEMPLATE_BASE_URL"))
+    parser.add_argument("--api-key", default=os.getenv("TEMPLATE_API_KEY"))
     parser.add_argument("--n", type=int, default=20)
     parser.add_argument("--concurrency", type=int, default=1)
     parser.add_argument("--model")
@@ -125,6 +126,10 @@ def main():
     parser.add_argument("--timeout", type=float, default=45.0)
     parser.add_argument("--deadline", type=float, default=900.0)
     args = parser.parse_args()
+    if not args.base_url:
+        parser.error("Укажите --base-url или задайте TEMPLATE_BASE_URL")
+    if not args.api_key:
+        parser.error("Укажите --api-key или задайте TEMPLATE_API_KEY")
     args.n = max(1, args.n)
     args.concurrency = max(1, args.concurrency)
     out_dir = Path(args.out)

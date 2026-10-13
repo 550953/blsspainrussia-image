@@ -7,7 +7,8 @@ from datetime import datetime, timezone
 
 from ..config import (
     TEMPLATE_DAILY_TOKEN_CAP, TEMPLATE_MAX_ATTEMPTS, TEMPLATE_MAX_HTML_BYTES, TEMPLATE_MAX_OUTPUT_TOKENS,
-    TEMPLATE_MIN_ATTEMPT_SECONDS, TEMPLATE_REPAIR_TEMPERATURE, TEMPLATE_RESULT_TTL_SECONDS,
+    TEMPLATE_MIN_ATTEMPT_SECONDS, TEMPLATE_MODELS, TEMPLATE_REPAIR_MODEL, TEMPLATE_REPAIR_TEMPERATURE,
+    TEMPLATE_RESULT_TTL_SECONDS,
     TEMPLATE_TEMPERATURE,
 )
 from ..telemetry import TEMPLATE_STATS, _job_log, ensure_template_day, record_template_run, record_template_usage
@@ -16,6 +17,28 @@ from .extract import parse
 from .prompt import PROMPT_VERSION, build_repair_message, build_user_message, base_prompt, prompt_sha1
 from .runner import GenerationDeadline, TemplateGenerationError, generate as call_model
 from .validator import validate
+
+
+def _persistent_rules(attempts):
+    if len(attempts) < 2:
+        return set()
+    previous = set(attempts[-2].get("errors", []))
+    current = set(attempts[-1].get("errors", []))
+    return previous & current
+
+
+def _repair_model_candidate(setting, models, current_model):
+    setting = str(setting or "").strip()
+    if not setting:
+        return None
+    models = list(models or [])
+    if setting.lower() in {"1", "true", "yes", "on", "next"}:
+        try:
+            position = models.index(current_model)
+        except ValueError:
+            return None
+        return models[position + 1] if position + 1 < len(models) else None
+    return setting if setting in models and setting != current_model else None
 
 
 async def run_template_job(job_id: str, job: dict):
@@ -34,9 +57,13 @@ async def run_template_job(job_id: str, job: dict):
     best = None
     generation_error = None
     no_progress = 0
+    force_final_attempt = False
+    last_report_errors = []
     max_attempts = int(job.get("max_attempts") or TEMPLATE_MAX_ATTEMPTS)
     try:
         for number in range(1, max_attempts + 1):
+            if force_final_attempt and number < max_attempts:
+                continue
             remaining = deadline_ts - time.monotonic()
             if number > 1 and remaining < TEMPLATE_MIN_ATTEMPT_SECONDS:
                 break
@@ -48,10 +75,35 @@ async def run_template_job(job_id: str, job: dict):
                 "temperature": TEMPLATE_TEMPERATURE if number == 1 else TEMPLATE_REPAIR_TEMPERATURE,
                 "maxOutputTokens": TEMPLATE_MAX_OUTPUT_TOKENS,
             }
+            request_models = [job.get("model")] if job.get("model") else list(job["models"])
+            persistent = _persistent_rules(attempts) if number == max_attempts else set()
+            repair_strategy = None
+            if persistent:
+                setting = TEMPLATE_REPAIR_MODEL
+                if setting and setting.lower() not in {"1", "true", "yes", "on", "next"}:
+                    candidates = list(job.get("models") or [])
+                    if setting not in candidates and setting in TEMPLATE_MODELS:
+                        candidates.append(setting)
+                else:
+                    candidates = list(job.get("models") or [])
+                alternate_model = _repair_model_candidate(setting, candidates, attempts[-1].get("model"))
+                if alternate_model:
+                    request_models = [alternate_model]
+                    repair_strategy = "alternate_model"
+                else:
+                    repair_strategy = "compact_restart"
+                issues = [item for item in last_report_errors if item.get("rule") in persistent]
+                repair = build_repair_message(issues, compact=True)
+                contents = [{"role": "user", "parts": [{"text": initial + "\n\n" + repair}]}]
+                _job_log(
+                    "tpl_repair_strategy", job_id, component="email_template", attempt=number,
+                    strategy=repair_strategy, model=request_models[0] if repair_strategy == "alternate_model" else attempts[-1].get("model"),
+                    persistent_rule_ids=sorted(persistent)[:12],
+                )
             call_started = time.monotonic()
             try:
                 text, metadata, model = await call_model(
-                    contents, system, [job.get("model")] if job.get("model") else job["models"],
+                    contents, system, request_models,
                     job_id, generation_config, deadline_ts=deadline_ts,
                 )
             except GenerationDeadline:
@@ -65,6 +117,8 @@ async def run_template_job(job_id: str, job: dict):
                 break
             except TemplateGenerationError as exc:
                 generation_error = exc.code
+                if exc.error_detail:
+                    job["error_detail"] = dict(exc.error_detail)
                 attempts.append({
                     "n": number, "model": job.get("model") or "",
                     "latency_ms": round((time.monotonic() - call_started) * 1000),
@@ -130,6 +184,7 @@ async def run_template_job(job_id: str, job: dict):
             report_warnings = list(parsed.warnings)
             if report is not None:
                 report_warnings.extend({"rule": issue.rule, "message": issue.message, "where": issue.where} for issue in report.warnings)
+            last_report_errors = list(report_errors)
             current = {
                 "n": number, "model": model, "latency_ms": latency_ms,
                 "finish_reason": metadata.get("finish_reason", ""),
@@ -178,8 +233,11 @@ async def run_template_job(job_id: str, job: dict):
             if valid:
                 break
             if no_progress >= 2:
-                generation_error = "repair_no_progress"
-                break
+                if _persistent_rules(attempts) and number < max_attempts:
+                    force_final_attempt = True
+                else:
+                    generation_error = "repair_no_progress"
+                    break
             ensure_template_day()
             token_usage = sum(int(TEMPLATE_STATS.get(key, 0)) for key in ("tokens_in", "tokens_out", "tokens_thoughts"))
             if token_usage >= TEMPLATE_DAILY_TOKEN_CAP:
@@ -266,6 +324,18 @@ async def run_template_job(job_id: str, job: dict):
         raise
     except Exception as exc:
         job["stage"] = "finished"
+        job["error_detail"] = {
+            "category": "UNKNOWN",
+            "http_status": None,
+            "provider_status": "",
+            "safe_message": "Неизвестная ошибка генерации.",
+            "model": job.get("model") or (job.get("models") or [None])[0],
+            "key_name": None,
+            "api_attempts": 0,
+            "proxy_preflight_failures": 0,
+            "attempt_times_ms": [],
+            "error_code": "generation_unavailable",
+        }
         if job.get("template"):
             job["template"]["generation_error"] = "generation_unavailable"
             job["status"] = "done"

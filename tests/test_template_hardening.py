@@ -145,7 +145,7 @@ def test_best_attempt_survives_infrastructure_failure_and_repair_stops_without_p
     monkeypatch.setattr(generate, "call_model", never_improves)
     asyncio.run(generate.run_template_job("no-progress", job))
     assert job["status"] == "done"
-    assert calls == 3
+    assert calls == 4
     assert job["template"]["generation_error"] == "repair_no_progress"
 
 

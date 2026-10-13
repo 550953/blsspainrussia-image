@@ -101,6 +101,9 @@ def test_rules_endpoint_defines_currency_checks_as_warnings():
     rule_map = {item["id"]: item for item in rules()}
     assert rule_map["M03"]["severity"] == "W"
     assert rule_map["T10"]["severity"] == "E"
+    assert rule_map["S07"]["severity"] == "W"
+    assert rule_map["S13"]["severity"] == "E"
+    assert rule_map["V12"]["severity"] == "W"
 
 
 def test_task_kind_registry_rejects_unknown_kind():

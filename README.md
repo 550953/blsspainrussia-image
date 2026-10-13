@@ -9,11 +9,17 @@
 ```env
 TEMPLATE_ENABLED=1
 TEMPLATE_API_KEYS=<private-client-key>
-TEMPLATE_MODELS=<supported-gemini-model>
+TEMPLATE_MODELS=<copy-model-from-GEMINI_MODELS-or-GEMINI_MODEL>
 GEMINI_API_KEY_1=<gemini-key>
 ```
 
-`TEMPLATE_API_KEYS` и ключи Gemini храните в Replit Secrets/Render/Infisical, а не в репозитории. `TEMPLATE_MODELS` — отдельный allow-list для писем. При включении также можно задать `GEMINI_API_KEY_2` и `GEMINI_PROXIES`.
+`TEMPLATE_MODELS` — отдельный allow-list для писем; начните с модели, уже используемой OCR (`GEMINI_MODELS`, либо `GEMINI_MODEL`, если цепочка не задана). Не копируйте старые примеры с `gemini-2.5-flash`: эта модель закрыта для новых проектов. `TEMPLATE_API_KEYS` и ключи Gemini храните в Replit Secrets/Render/Infisical, а не в репозитории. Перед подключением submit-клиентов проверьте доступность модели через `/template/selfcheck` (HTTP Basic Auth из `STATUS_USER`/`STATUS_PASSWORD`); маршрут регистрируется при `TEMPLATE_ENABLED=1`. При включении также можно задать `GEMINI_API_KEY_2` и `GEMINI_PROXIES`.
+
+Если одинаковые ошибки сохраняются, последняя попытка по умолчанию перезапускает ремонт с коротким списком обязательных исправлений. Необязательный `TEMPLATE_REPAIR_MODEL=next` переключит её на следующую модель из `TEMPLATE_MODELS`; можно также указать точное имя другой модели из списка.
+
+```bash
+curl -u "$STATUS_USER:$STATUS_PASSWORD" http://localhost:8000/template/selfcheck
+```
 
 ```bash
 pip install -r requirements.txt
@@ -33,7 +39,7 @@ curl -X POST http://localhost:8000/template/submit \
   -d '{"account_id":"store-1","client_request_id":"mail-42","seed":12345,"currency_method":14}'
 ```
 
-Опрос `GET /template/result/{job_id}`: обычно раз в 3–5 секунд, используя `poll_after_ms`, если он возвращён сервером; `?html=0` уменьшает ответ до статуса. На `done` проверяйте `template.valid`, `template.report` и `template.attempts`; статус `done` означает, что лучшая версия сохранена, но она может содержать ошибки валидации. Если после рестарта вы получили `404`, повторите `POST` с теми же `account_id` и `client_request_id`, затем продолжите опрос по возвращённому `job_id`. Для отмены используйте `POST /template/cancel/{job_id}` с тем же `X-API-Key`.
+Опрос `GET /template/result/{job_id}`: обычно раз в 3–5 секунд, используя `poll_after_ms`, если он возвращён сервером; `?html=0` уменьшает ответ до статуса. На `done` проверяйте `template.valid`, `template.report` и `template.attempts`; статус `done` означает, что лучшая версия сохранена, но она может содержать ошибки валидации. При `status=error` смотрите публичный `error` и безопасный `error_detail` (категория/HTTP-статус, модель, имя переменной ключа, число и длительность попыток, число отказов preflight); секреты, прокси URL и содержимое промпта не возвращаются. Если после рестарта вы получили `404`, повторите `POST` с теми же `account_id` и `client_request_id`, затем продолжите опрос по возвращённому `job_id`. Для отмены используйте `POST /template/cancel/{job_id}` с тем же `X-API-Key`.
 
 Для внешнего клиента держите polling не дольше **12 минут от принятия задания**: очередь может ждать до 5 минут, после неё генерации даётся до 7 минут. Результат хранится до 60 минут, но рестарт процесса очищает его раньше.
 
@@ -41,6 +47,7 @@ curl -X POST http://localhost:8000/template/submit \
 
 - `POST /template/validate` — локальная проверка переданного HTML без вызова Gemini.
 - `GET /template/rules` — реестр проверок.
+- `GET /template/selfcheck` — один короткий вызов первой модели, закрытый HTTP Basic; не чаще 6 раз в минуту.
 - `GET /template/result/{job_id}/preview` — HTML-превью, закрытое HTTP Basic.
 - `/health` и `/status.json` — состояние сервиса и очередей.
 
@@ -54,7 +61,8 @@ curl -X POST http://localhost:8000/template/submit \
 |---|---:|---|
 | `TEMPLATE_ENABLED` | `0` | Включить API генерации |
 | `TEMPLATE_API_KEYS` | пусто | Список клиентских ключей через запятую |
-| `TEMPLATE_MODELS` | пусто | Разрешённые модели Gemini для писем |
+| `TEMPLATE_MODELS` | пусто | Разрешённые модели для писем; задайте модель, уже используемую OCR, и проверьте через `/template/selfcheck` |
+| `TEMPLATE_REPAIR_MODEL` | пусто | Необязательная модель для последней попытки при повторяющихся ошибках; `next` выбирает следующую модель из `TEMPLATE_MODELS` |
 | `TEMPLATE_MAX_CONCURRENCY` | `3` | Параллельные генерации, ограничиваются доступными ключами |
 | `TEMPLATE_RESERVE_KEYS_FOR_OCR` | `5` | Резерв ключей Gemini для OCR |
 | `TEMPLATE_YIELD_TO_OCR` | `1` | Приоритет ожидающим/активным OCR-заданиям |
@@ -97,7 +105,7 @@ curl -X POST http://localhost:8000/template/submit \
 ```env
 TEMPLATE_ENABLED=0
 TEMPLATE_API_KEYS=replace-with-private-client-key
-TEMPLATE_MODELS=gemini-2.5-flash
+TEMPLATE_MODELS=gemini-3.1-flash-lite
 GEMINI_API_KEY_1=replace-with-secret
 TEMPLATE_MAX_CONCURRENCY=3
 TEMPLATE_RESERVE_KEYS_FOR_OCR=5
@@ -112,7 +120,7 @@ TEMPLATE_THINKING_BUDGET=0
 TEMPLATE_THINKING_LEVEL=low
 ```
 
-Ключи API и модельные ключи берутся из Replit Secrets/Render/Infisical. Не помещайте их в `.env.example`, логи или клиентский код. Клиент не присылает произвольный промпт генерации: сервер строит его из брифа и белых списков. Поле `TEMPLATE_THINKING_BUDGET=0` не превращается в `None`: для Gemini 2.5 Flash передаётся именно нулевой бюджет; `-1` означает динамический бюджет. Для Gemini 2.5 Pro ноль не поддерживается и настройка пропускается — модель сохраняет своё thinking по умолчанию.
+Ключи API и модельные ключи берутся из Replit Secrets/Render/Infisical. Не помещайте их в `.env.example`, логи или клиентский код. Клиент не присылает произвольный промпт генерации: сервер строит его из брифа и белых списков. Поле `TEMPLATE_THINKING_BUDGET=0` не превращается в `None`: для поддерживаемых моделей Gemini 2.5 передаётся именно нулевой бюджет; `-1` означает динамический бюджет. Для Gemini 2.5 Pro ноль не поддерживается и настройка пропускается — модель сохраняет своё thinking по умолчанию.
 
 Thinking-параметр выбирается по модели в `thinkingConfig`, а не отправляется неподходящему семейству:
 
@@ -142,7 +150,7 @@ Thinking-параметр выбирается по модели в `thinkingCon
 | Очередь и дневные ограничения | Общий OCR job pool, результат хранится 300с | До 6 pending/running, 100 принятых заданий и 20 млн учтённых токенов за UTC-день |
 | Результат | Сохраняется в in-memory OCR job | In-memory до 3600с; restart теряет задания |
 
-Локальная проверка интеграции (fake Gemini API и локальные HTTP-прокси, внешний Gemini не вызывается): `PYTHONPATH=. python scripts/smoke_template.py`. Она печатает временную шкалу всех восьми сценариев и завершает работу с ненулевым кодом, если нарушен хотя бы один итоговый инвариант.
+Локальная проверка интеграции (fake Gemini API и локальные HTTP-прокси, внешний Gemini не вызывается): `TEMPLATE_SMOKE_READ_TIMEOUT=0.15 PYTHONPATH=. python scripts/smoke_template.py`. Она печатает временную шкалу всех 13 сценариев, включая 400/403/404, медленный живой ответ и оба исхода отмены, и завершает работу с ненулевым кодом, если нарушен хотя бы один итоговый инвариант. Таймаут здесь искусственно укорочен только для smoke-теста.
 
 ### Ограничения и эксплуатация
 
@@ -167,7 +175,7 @@ Thinking-параметр выбирается по модели в `thinkingCon
      -d "{\"images\":\"$IMAGE_B64\"}"
    ```
 
-3. После установки `TEMPLATE_API_KEYS` и `TEMPLATE_MODELS` включите флаг и перезапустите; проверьте `/template/rules`.
+3. После установки `TEMPLATE_API_KEYS` и `TEMPLATE_MODELS` включите флаг в закрытой/staging-среде и перезапустите; до подключения submit-клиентов проверьте `/template/selfcheck` (Basic Auth) и `/template/rules`.
 4. Проверьте хороший HTML без вызова Gemini, затем создайте одно задание и откройте результат/превью:
 
    ```bash
@@ -196,9 +204,17 @@ pytest -q
 
 `tests/fixtures/good.html` — эталон валидного письма. После деплоя можно проверить HTML без расхода токенов через `/template/validate`; `scripts/eval_templates.py` делает серию живых запусков, сохраняет HTML локально и формирует сводку, а `scripts/isolation_check.py` сравнивает latency OCR до и во время двух email jobs. Эти скрипты обращаются к работающему сервису и могут расходовать токены Gemini.
 
-Пример eval:
+Для `eval_templates.py` базовый URL и клиентский ключ можно задавать через `TEMPLATE_BASE_URL` и `TEMPLATE_API_KEY`, не передавая ключ аргументом процесса. PowerShell-пример сравнения двух моделей:
+
+```powershell
+$env:TEMPLATE_BASE_URL = "https://<service>"
+$env:TEMPLATE_API_KEY = "<client-key>"
+python .\scripts\eval_templates.py --n 10 --model gemini-3.1-flash-lite --out eval_31
+python .\scripts\eval_templates.py --n 10 --model gemini-3.8-flash --out eval_38
+```
+
+Для другой проверки:
 
 ```bash
-python scripts/eval_templates.py --base-url https://<service> --api-key '<client-key>' --n 20 --out eval_out
 python scripts/isolation_check.py --base-url https://<service> --api-key '<client-key>' --image sample.png
 ```
