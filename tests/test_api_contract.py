@@ -289,6 +289,10 @@ def test_health_and_status_include_template_runs_without_changing_ocr_stats(api,
         }
         assert "tokens_thoughts" in status_http.json()["templates"]
         assert health["template"]["enabled"] is True
+        assert isinstance(health["template"]["slow_route_penalties"], int)
+        assert isinstance(health["template"]["warnings"], list)
+        assert "by_key" in status_http.json()["templates"]["api_calls"]
+        assert "by_proxy" in status_http.json()["templates"]["api_calls"]
         assert status["templates"]["runs_24h"] >= 1
         assert health["ocr_job_stats"] == before_stats
         assert status["counters"] == {key: value for key, value in before_stats.items()

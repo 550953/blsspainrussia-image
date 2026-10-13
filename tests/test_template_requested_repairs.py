@@ -43,8 +43,11 @@ def test_v07_diagnostics_point_to_duplicate_anchor_and_email_inside_anchor():
     assert "{{email}}" in issue.where and "<a" in issue.where
 
     address_label = validate(GOOD.replace(">Напишите нам</a>", ">support@example.test</a>", 1))
-    issue = next(item for item in address_label.errors if item.rule == "V07")
-    assert "support@example.test" in issue.where
+    assert not any(item.rule == "V07" for item in address_label.errors)
+
+    variable_label = validate(GOOD.replace(">Напишите нам</a>", ">{{supportEmail}}</a>", 1))
+    assert not any(item.rule == "V07" for item in variable_label.errors)
+    assert any(item.rule == "V07" and item.severity == "W" for item in variable_label.warnings)
 
 
 def test_t18_autofix_inserts_exactly_one_marker_before_message_heading_and_is_idempotent():
@@ -93,18 +96,17 @@ def test_v07_autofix_keeps_first_support_link_flattens_others_and_moves_email_ou
 
     link_token = GOOD.replace(">Напишите нам</a>", ">{{supportEmail}}</a>", 1)
     fixed, fixes = apply(link_token)
-    assert "AF14" in fixes
-    assert ">Напишите нам</a>" in fixed
+    assert "{{supportEmail}}</a>" in fixed
+    assert "AF14" not in fixes
     assert not any(item.rule == "V07" for item in validate(fixed).errors)
 
 
 def test_v07_wraps_email_in_separate_span_when_it_shares_the_link_paragraph():
     source = re.sub(r"<p\b[^>]*>Письмо отправлено на \{\{email\}\}</p>", "", GOOD, count=1, flags=re.I)
     source = source.replace(">Напишите нам</a>", ">Напишите нам</a> {{email}}", 1)
-    assert any(item.rule == "V07" for item in validate(source).errors)
+    assert not any(item.rule == "V07" for item in validate(source).errors)
     fixed, fixes = apply(source)
-    assert "AF14" in fixes
-    assert re.search(r"</a\s*><span>\{\{email\}\}</span>", fixed, re.I)
+    assert "{{email}}" in fixed
     assert not any(item.rule == "V07" for item in validate(fixed).errors)
 
 
@@ -229,3 +231,28 @@ def test_no_progress_skips_to_the_configured_last_attempt_for_final_strategy(mon
 
     assert len(calls) == 4
     assert [item["n"] for item in job["template"]["attempts"]] == [1, 2, 3, 5]
+
+
+def test_repair_is_skipped_when_less_than_minimum_success_p50_remains(monkeypatch):
+    from ocr_service.email_template import generate
+
+    calls = []
+
+    async def fake_model(_contents, _system, models, _job_id, _config, deadline_ts=None):
+        calls.append(deadline_ts)
+        return "No document", {
+            "finish_reason": "STOP", "prompt_block_reason": "",
+            "usage": {"in": 1, "out": 1, "thoughts": 0, "cached": 0},
+        }, models[0]
+
+    monkeypatch.setattr(generate, "call_model", fake_model)
+    monkeypatch.setattr(generate, "template_success_p50_ms", lambda _model: None)
+    job = _job()
+    job["max_attempts"] = 2
+    job["deadline_s"] = 20
+    asyncio.run(generate.run_template_job(job["job_id"], job))
+
+    assert len(calls) == 1
+    assert job["status"] == "done"
+    assert job["template"]["generation_error"] == "repair_skipped_no_time"
+    assert job["template"]["html"] == ""

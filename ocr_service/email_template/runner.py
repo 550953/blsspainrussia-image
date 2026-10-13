@@ -10,12 +10,70 @@ from ..config import (
     TEMPLATE_HTTP_READ_TIMEOUT, TEMPLATE_LEASE_TTL, TEMPLATE_MODELS, TEMPLATE_PROXY_PREFLIGHT_TIMEOUT,
     TEMPLATE_MODEL_COOLDOWN, TEMPLATE_RESERVE_KEYS_FOR_OCR, TEMPLATE_THINKING_BUDGET,
     TEMPLATE_THINKING_LEVEL, TEMPLATE_QUOTA_BLOCK_SECONDS, TEMPLATE_YIELD_TO_OCR,
+    TEMPLATE_SLOW_ROUTE_COOLDOWN,
 )
 from ..gemini_client import GenerationTimeout, call_gemini_generate, preflight_template_proxy
 from ..gemini_errors import GeminiAPIError, _safe_gemini_message
 from ..key_pool import gemini_pool
-from ..proxies import ProxyGeoBlocked, ProxyUnavailable, smart_proxy_pool
-from ..telemetry import _job_log, record_template_proxy_error
+from ..proxies import ProxyGeoBlocked, ProxyUnavailable, _proxy_label, smart_proxy_pool
+from ..telemetry import _job_log, record_template_api_call, record_template_proxy_error
+
+SLOW_ROUTE_PENALTIES = {}
+
+
+def _active_slow_penalties(now=None):
+    now = time.monotonic() if now is None else now
+    expired = [pair for pair, item in SLOW_ROUTE_PENALTIES.items() if item["until"] <= now]
+    for pair in expired:
+        SLOW_ROUTE_PENALTIES.pop(pair, None)
+    return SLOW_ROUTE_PENALTIES
+
+
+def slow_route_penalty_count():
+    return len(_active_slow_penalties())
+
+
+def _penalize_slow_route(key_index, proxy):
+    pair = (int(key_index), proxy)
+    previous = SLOW_ROUTE_PENALTIES.get(pair)
+    hits = int(previous.get("hits", 0)) + 1 if previous else 1
+    cooldown = float(TEMPLATE_SLOW_ROUTE_COOLDOWN) * (2 ** min(hits - 1, 8))
+    SLOW_ROUTE_PENALTIES[pair] = {
+        "hits": hits,
+        "cooldown_s": cooldown,
+        "until": time.monotonic() + cooldown,
+    }
+    return hits, cooldown
+
+
+def _clear_slow_route(key_index, proxy):
+    SLOW_ROUTE_PENALTIES.pop((int(key_index), proxy), None)
+    _active_slow_penalties()
+
+
+def _set_job_stage(job_id, stage):
+    try:
+        from ..routers.template import TEMPLATE_JOBS
+        job = TEMPLATE_JOBS.get(job_id)
+        if job is not None and job.get("status") == "running":
+            job["stage"] = stage
+    except Exception:
+        pass
+
+
+def _append_job_api_trace(job_id, trace):
+    try:
+        from ..routers.template import TEMPLATE_JOBS
+        job = TEMPLATE_JOBS.get(job_id)
+        if job is not None:
+            rows = job.setdefault("api_trace", [])
+            item = dict(trace)
+            item["n"] = len(rows) + 1
+            rows.append(item)
+            return item
+    except Exception:
+        pass
+    return trace
 
 
 class GenerationDeadline(TimeoutError):
@@ -103,6 +161,7 @@ def _error_detail(
     contents=None,
     system_instruction="",
     error_code=None,
+    api_trace=(),
 ) -> dict:
     api_error = error if isinstance(error, GeminiAPIError) else None
     provider_status = (
@@ -119,6 +178,7 @@ def _error_detail(
         "api_attempts": int(api_attempts),
         "proxy_preflight_failures": int(proxy_preflight_failures),
         "attempt_times_ms": [max(0, int(value)) for value in attempt_times_ms],
+        "api_trace": [dict(item) for item in api_trace],
         **({"error_code": error_code} if error_code else {}),
     }
 
@@ -288,6 +348,11 @@ async def generate(contents, system_instruction, model_chain, job_id, generation
     excluded_proxies = set()
     preflight_passed = set()
     attempt_times_ms = []
+    api_trace = []
+    wait_ocr_ms = 0
+    wait_key_ms = 0
+    previous_slow_key = None
+    previous_slow_proxy = None
     previous_model_rejection = None
 
     def detail_for(code, category=None, error=None, model=None, key_name=None):
@@ -297,7 +362,7 @@ async def generate(contents, system_instruction, model_chain, job_id, generation
             proxy_preflight_failures=len(excluded_proxies),
             attempt_times_ms=attempt_times_ms,
             contents=contents, system_instruction=system_instruction,
-            error_code=code,
+            error_code=code, api_trace=api_trace,
         )
 
     while api_attempts < TEMPLATE_INFRA_RETRIES:
@@ -312,6 +377,7 @@ async def generate(contents, system_instruction, model_chain, job_id, generation
         if TEMPLATE_YIELD_TO_OCR:
             while _ocr_busy():
                 yielded_to_ocr = True
+                _set_job_stage(job_id, "waiting_ocr")
                 if time.monotonic() + TEMPLATE_MIN_CALL_SECONDS >= deadline - TEMPLATE_DEADLINE_MARGIN:
                     code = "ocr_priority_timeout"
                     detail = dict(last_error_detail or detail_for(code, "OCR_PRIORITY_TIMEOUT",
@@ -320,10 +386,12 @@ async def generate(contents, system_instruction, model_chain, job_id, generation
                                   proxy_preflight_failures=len(excluded_proxies),
                                   attempt_times_ms=list(attempt_times_ms))
                     raise TemplateGenerationError(code, detail)
+                wait_started = time.monotonic()
                 await asyncio.sleep(min(
                     2.0,
                     max(0.1, deadline - time.monotonic() - TEMPLATE_DEADLINE_MARGIN - TEMPLATE_MIN_CALL_SECONDS),
                 ))
+                wait_ocr_ms += round((time.monotonic() - wait_started) * 1000)
         remaining = deadline - time.monotonic() - TEMPLATE_DEADLINE_MARGIN
         if remaining < TEMPLATE_MIN_CALL_SECONDS:
             code = "ocr_priority_timeout" if yielded_to_ocr else "deadline"
@@ -332,20 +400,28 @@ async def generate(contents, system_instruction, model_chain, job_id, generation
                           proxy_preflight_failures=len(excluded_proxies),
                           attempt_times_ms=list(attempt_times_ms))
             raise TemplateGenerationError(code, detail)
+        route_exclusions = set(excluded_proxies)
+        if previous_slow_key is not None and len(smart_proxy_pool.routes) > 1:
+            route_exclusions.add(previous_slow_proxy)
         try:
-            proxy = smart_proxy_pool.next(excluded=excluded_proxies)
+            proxy = smart_proxy_pool.next(excluded=route_exclusions)
         except LookupError as exc:
-            code = "no_proxy"
-            detail = dict(last_error_detail or detail_for(code, "NO_PROXY", model=(model_chain or [None])[0]))
-            detail.update(error_code=code, api_attempts=api_attempts,
-                          proxy_preflight_failures=len(excluded_proxies),
-                          attempt_times_ms=list(attempt_times_ms))
-            raise TemplateGenerationError(code, detail) from exc
+            if route_exclusions != excluded_proxies:
+                proxy = smart_proxy_pool.next(excluded=excluded_proxies)
+            else:
+                code = "no_proxy"
+                detail = dict(last_error_detail or detail_for(code, "NO_PROXY", model=(model_chain or [None])[0]))
+                detail.update(error_code=code, api_attempts=api_attempts,
+                              proxy_preflight_failures=len(excluded_proxies),
+                              attempt_times_ms=list(attempt_times_ms))
+                raise TemplateGenerationError(code, detail) from exc
+        preflight_ms = 0
         if proxy is not None and proxy not in preflight_passed:
             preflight_started = time.monotonic()
             try:
                 await preflight_template_proxy(proxy, timeout=TEMPLATE_PROXY_PREFLIGHT_TIMEOUT)
                 preflight_passed.add(proxy)
+                preflight_ms = round((time.monotonic() - preflight_started) * 1000)
             except ProxyUnavailable as exc:
                 excluded_proxies.add(proxy)
                 smart_proxy_pool.mark_failed(proxy, exc)
@@ -365,10 +441,25 @@ async def generate(contents, system_instruction, model_chain, job_id, generation
                 continue
         live = sum(1 for idx in range(len(gemini_pool.keys)) if not gemini_pool.dead[idx] and not gemini_pool._is_operator_hold(idx))
         reserve = min(TEMPLATE_RESERVE_KEYS_FOR_OCR, max(live - 1, 0))
+        wait_key_started = time.monotonic()
+        _set_job_stage(job_id, "waiting_key")
+        active_penalties = _active_slow_penalties()
+        excluded_keys = {
+            key_idx for (key_idx, route), penalty in active_penalties.items()
+            if route == proxy and penalty["until"] > time.monotonic()
+        }
+        if previous_slow_key is not None:
+            excluded_keys.add(previous_slow_key)
         idx, key_name = gemini_pool.acquire(
             lease_ttl=TEMPLATE_LEASE_TTL, reserve=reserve, model_chain=model_chain,
-            respect_key_cooldown=True,
+            respect_key_cooldown=True, exclude_indices=excluded_keys,
         )
+        if idx is None and excluded_keys:
+            idx, key_name = gemini_pool.acquire(
+                lease_ttl=TEMPLATE_LEASE_TTL, reserve=reserve, model_chain=model_chain,
+                respect_key_cooldown=True,
+            )
+        wait_key_ms += round((time.monotonic() - wait_key_started) * 1000)
         if idx is None:
             if not gemini_pool.keys:
                 detail = dict(last_error_detail or detail_for(
@@ -417,9 +508,18 @@ async def generate(contents, system_instruction, model_chain, job_id, generation
                 detail.update(error_code="model_rejected",
                               safe_message="Нет ключа Gemini, которому доступна выбранная модель.")
                 raise TemplateGenerationError("model_rejected", detail)
-            if _ocr_busy():
+            ocr_busy_now = _ocr_busy()
+            if ocr_busy_now:
                 yielded_to_ocr = True
+                _set_job_stage(job_id, "waiting_ocr")
+            else:
+                _set_job_stage(job_id, "waiting_key")
+            wait_started = time.monotonic()
             await asyncio.sleep(min(GEMINI_ACQUIRE_POLL, max(0.05, deadline - time.monotonic())))
+            waited = round((time.monotonic() - wait_started) * 1000)
+            wait_key_ms += waited
+            if ocr_busy_now:
+                wait_ocr_ms += waited
             continue
         api_attempts += 1
         model = gemini_pool.pick_model(idx, chain=model_chain, respect_key_cooldown=True)
@@ -427,6 +527,13 @@ async def generate(contents, system_instruction, model_chain, job_id, generation
         request_error = None
         error_category = None
         model_rejected_twice = False
+        succeeded = False
+        text = ""
+        metadata = {}
+        http_status = None
+        timed_out = False
+        cancelled = False
+        _set_job_stage(job_id, "calling")
         try:
             timeout = min(TEMPLATE_HARD_TIMEOUT, remaining)
             request_config = dict(generation_config or {})
@@ -442,11 +549,22 @@ async def generate(contents, system_instruction, model_chain, job_id, generation
             metadata["thinking_setting"] = thinking_setting
             smart_proxy_pool.mark_ok(proxy)
             gemini_pool.release(idx)
-            return text, metadata, model
+            _clear_slow_route(idx, proxy)
+            succeeded = True
         except GenerationTimeout as exc:
             last_error = exc
             request_error = exc
             error_category = "generation_timeout"
+            timed_out = True
+            record_template_proxy_error("generation_timeout")
+            previous_slow_key, previous_slow_proxy = idx, proxy
+            penalty_hits, penalty_seconds = _penalize_slow_route(idx, proxy)
+            _job_log(
+                "tpl_slow_route_penalty", job_id, component="email_template",
+                key_name=key_name, proxy=_proxy_label(proxy),
+                hits=penalty_hits, cooldown_s=round(penalty_seconds),
+                slow_route_penalties=slow_route_penalty_count(),
+            )
             # Не удерживаем ключ на дополнительную проверку канала.
             gemini_pool.release(idx)
             if proxy is not None:
@@ -467,6 +585,7 @@ async def generate(contents, system_instruction, model_chain, job_id, generation
         except GeminiAPIError as exc:
             last_error = exc
             request_error = exc
+            http_status = exc.http_status
             if exc.category == "RATE_LIMIT_OR_QUOTA":
                 gemini_pool.release(idx, error=exc, model=model)
             elif (
@@ -488,10 +607,38 @@ async def generate(contents, system_instruction, model_chain, job_id, generation
                 gemini_pool.release(idx, error=exc)
             if exc.http_status in (500, 502, 503, 504):
                 gemini_pool.mark_model_overloaded(model, TEMPLATE_MODEL_COOLDOWN)
+        except asyncio.CancelledError as exc:
+            request_error = exc
+            cancelled = True
         finally:
             gemini_pool.ensure_released(idx)
-            attempt_times_ms.append(round((time.monotonic() - started) * 1000))
-        if error_category:
+            call_ms = round((time.monotonic() - started) * 1000)
+            attempt_times_ms.append(call_ms)
+        trace_item = {
+            "n": api_attempts, "wait_ocr_ms": wait_ocr_ms,
+            "wait_key_ms": wait_key_ms, "preflight_ms": preflight_ms,
+            "call_ms": call_ms, "key_name": key_name or "",
+            "proxy": _proxy_label(proxy), "model": model,
+            "outcome": "success" if succeeded else "cancelled" if cancelled else (
+                "timeout" if timed_out
+                else "api_error" if isinstance(request_error, GeminiAPIError)
+                else "proxy_error"
+            ),
+            "http_status": http_status,
+        }
+        trace_item = _append_job_api_trace(job_id, trace_item)
+        api_trace.append(trace_item)
+        record_template_api_call(trace_item)
+        _job_log("tpl_api_attempt", job_id, component="email_template", **trace_item)
+        wait_ocr_ms = 0
+        wait_key_ms = 0
+        if cancelled:
+            raise asyncio.CancelledError
+        if succeeded:
+            metadata["api_trace"] = list(api_trace)
+            _set_job_stage(job_id, "retrying")
+            return text, metadata, model
+        if error_category and error_category != "generation_timeout":
             record_template_proxy_error(error_category)
         code = _public_error_code(request_error) if request_error else "generation_unavailable"
         if isinstance(request_error, GeminiAPIError):
@@ -514,7 +661,9 @@ async def generate(contents, system_instruction, model_chain, job_id, generation
             api_attempts=api_attempts, proxy_preflight_failures=len(excluded_proxies),
             attempt_times_ms=attempt_times_ms, contents=contents,
             system_instruction=system_instruction, error_code=code,
+            api_trace=api_trace,
         )
+        _set_job_stage(job_id, "retrying")
         if (
             previous_model_rejection
             and previous_model_rejection["model"] == model

@@ -29,6 +29,7 @@ from .telemetry import (
     TEMPLATE_RUNS,
     TEMPLATE_PROXY_ERROR_CATEGORIES,
     TEMPLATE_STATS,
+    TEMPLATE_API_CALLS,
     _percentile,
     betterstack_queue_size,
 )
@@ -274,6 +275,7 @@ def build_status() -> dict:
         from .config import TEMPLATE_ENABLED
         if TEMPLATE_ENABLED:
             from .routers.template import TEMPLATE_JOBS, effective_concurrency
+            from .email_template.runner import slow_route_penalty_count
             status_payload["queue_by_kind"] = {
                 "ocr_sheet": {
                     "pending": len(pending), "running": len(running),
@@ -288,6 +290,25 @@ def build_status() -> dict:
             })
             durations = [int(item[4]) for item in template_runs]
             valid_runs = sum(1 for item in template_runs if item[2])
+            api_calls = [item for item in TEMPLATE_API_CALLS if item["ts"] >= wall - STATS_WINDOW_SECONDS]
+
+            def api_group(rows):
+                values = [int(item["call_ms"]) for item in rows if item.get("call_ms") is not None]
+                outcomes = Counter(item.get("outcome", "unknown") for item in rows)
+                return {
+                    "calls": len(rows), "success": outcomes["success"],
+                    "timeouts": outcomes["timeout"],
+                    "p50_ms": _percentile(values, 0.5),
+                    "p95_ms": _percentile(values, 0.95),
+                }
+
+            api_by_key, api_by_proxy, api_by_key_proxy, api_by_model = {}, {}, {}, {}
+            for item in api_calls:
+                api_by_key.setdefault(item["key_name"] or "(unknown)", []).append(item)
+                api_by_proxy.setdefault(item["proxy"] or "DIRECT", []).append(item)
+                route_name = (item["key_name"] or "(unknown)") + " @ " + (item["proxy"] or "DIRECT")
+                api_by_key_proxy.setdefault(route_name, []).append(item)
+                api_by_model.setdefault(item["model"] or "(unknown)", []).append(item)
             status_payload["templates"] = {
                 "runs_24h": len(template_runs),
                 "valid_rate": round(valid_runs / len(template_runs), 3) if template_runs else None,
@@ -302,6 +323,14 @@ def build_status() -> dict:
                     category: int(TEMPLATE_STATS.get(category, 0))
                     for category in TEMPLATE_PROXY_ERROR_CATEGORIES
                 },
+                "api_calls": {
+                    **api_group(api_calls),
+                    "by_key": {name: api_group(rows) for name, rows in sorted(api_by_key.items())},
+                    "by_proxy": {name: api_group(rows) for name, rows in sorted(api_by_proxy.items())},
+                    "by_key_proxy": {name: api_group(rows) for name, rows in sorted(api_by_key_proxy.items())},
+                    "by_model": {name: api_group(rows) for name, rows in sorted(api_by_model.items())},
+                },
+                "slow_route_penalties": slow_route_penalty_count(),
                 "top_rules": [{"rule": key, "count": value} for key, value in template_rules.most_common(10)],
                 "last_runs": [
                     {"id": item[1], "valid": item[2], "attempts": item[3], "total_ms": item[4],

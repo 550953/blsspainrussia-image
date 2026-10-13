@@ -22,7 +22,7 @@ class Parsed:
 
 
 def parse(text: str, finish_reason: str = "", prompt_block_reason: str = "") -> Parsed:
-    text = (text or "").lstrip("\ufeff").replace("\r\n", "\n").replace("\r", "\n")
+    text = (text or "").lstrip("\ufeff \t\r\n").replace("\r\n", "\n").replace("\r", "\n")
     finish = str(finish_reason or "").upper()
     if prompt_block_reason or finish in {"SAFETY", "PROHIBITED_CONTENT", "BLOCKLIST"}:
         return Parsed("", "", "", [{"rule": "X03", "message": "Модель заблокировала ответ"}], [])

@@ -120,6 +120,17 @@ def _text(node):
     return "".join(result)
 
 
+def _outer_footer_row(mail_node, main_table=None):
+    """Внешний tr основной таблицы, в котором находится mailto-ссылка."""
+    rows = []
+    current = mail_node
+    while current is not None and current is not main_table:
+        if current.tag == "tr":
+            rows.append(current)
+        current = current.parent
+    return rows[-1] if rows else None
+
+
 def _style(node):
     return dict((m.group(1).strip().lower(), m.group(2).strip()) for m in re.finditer(r"([\w-]+)\s*:\s*([^;]+)", node.attrs.get("style", "")))
 
@@ -160,7 +171,7 @@ def _contrast_message(label, foreground, background, observed):
 
 
 def validate(source: str, currency_method: Optional[int] = None) -> Report:
-    source = source or ""
+    source = (source or "").lstrip("\ufeff \t\r\n")
     report = Report(ok=False)
     byte_size = len(source.encode("utf-8"))
     report.stats = {"bytes": byte_size, "tables": len(re.findall(r"<table\b", source, re.I)),
@@ -334,112 +345,74 @@ def validate(source: str, currency_method: Optional[int] = None) -> Report:
         ),
         None,
     )
-    support_token_count = source.count("{{supportEmail}}")
     support_label = _text(support_anchors[0]).strip() if support_anchors else ""
-    bad_support_label = not support_label or bool(
-        re.search(r"\{\{supportEmail\}\}|mailto:|[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}", support_label, re.I)
-    )
-    if (
-        len(support_anchors) != 1
-        or len(anchors) != 1
-        or support_token_count != 1
-        or bad_support_label
-    ):
-        duplicate = source_anchors[1] if len(support_anchors) > 1 and len(source_anchors) > 1 else None
-        if support_token_count > 1:
-            tokens = list(re.finditer(r"\{\{supportEmail\}\}", source))
-            duplicate = next(
-                (source_anchor for source_anchor in source_anchors
-                 if source_anchor.start() <= tokens[1].start() < source_anchor.end()),
-                None,
-            )
-        if duplicate is None and source_anchors:
-            duplicate = next(
-                (item for item in source_anchors
-                 if not re.search(r"\bhref\s*=\s*([\"'])mailto:\{\{supportEmail\}\}\1", item.group(0), re.I)),
-                source_anchors[0],
-            )
-        if duplicate is None and support_anchors and bad_support_label:
-            duplicate = next(
-                (item for item in source_anchors
-                 if item.start() <= support_anchors[0].start_pos < item.end()),
-                None,
-            )
-        where = _fragment(source, duplicate.start(), duplicate.end()) if duplicate else ""
-        if support_token_count != 1:
-            tokens = list(re.finditer(r"\{\{supportEmail\}\}", source))
-            if tokens:
-                token = tokens[1] if len(tokens) > 1 else tokens[0]
-                where = _fragment(source, token.start(), token.end())
-            elif source_anchors:
-                where = _fragment(source, source_anchors[0].start(), source_anchors[0].end())
-            else:
-                where = _fragment(source, body_start_pos, body_start_pos + 100)
+    if len(anchors) != 1 or len(support_anchors) != 1:
+        duplicate = next(
+            (
+                item for item in source_anchors
+                if not re.search(
+                    r"\bhref\s*=\s*([\"'])mailto:\{\{supportEmail\}\}\1",
+                    item.group(0), re.I,
+                )
+            ),
+            source_anchors[1] if len(source_anchors) > 1 else (
+                source_anchors[0] if source_anchors else None
+            ),
+        )
+        where = _fragment(source, duplicate.start(), duplicate.end()) if duplicate else (
+            _fragment(source, body_start_pos, body_start_pos + 100)
+        )
         _issue(
             report, "V07", "E",
-            "Нужна одна ссылка mailto:{{supportEmail}} с обычной подписью; переменная — только в href",
+            "Нужен ровно один <a> и его href должен быть mailto:{{supportEmail}}",
             where,
+        )
+    if support_anchors and "{{supportEmail}}" in support_label:
+        support_match = next(
+            (
+                item for item in source_anchors
+                if re.search(
+                    r"\bhref\s*=\s*([\"'])mailto:\{\{supportEmail\}\}\1",
+                    item.group(0), re.I,
+                )
+            ),
+            None,
+        )
+        _issue(
+            report, "V07", "W",
+            "Предпочтительнее обычная подпись ссылки; {{supportEmail}} в её тексте допустим",
+            _fragment(source, support_match.start(), support_match.end()) if support_match else "",
         )
 
     anchor_spans = [(match.start(), match.end()) for match in source_anchors]
     email_locations = [match.start() for match in re.finditer(r"\{\{email\}\}", source)]
-    footer_root = support_anchors[0] if support_anchors else None
-    while footer_root is not None and footer_root.tag not in {"tr", "table"}:
-        footer_root = footer_root.parent
-
-    def in_footer(position):
-        if footer_root is None:
-            return False
-        for node in nodes:
-            if "{{email}}" not in node.text:
-                continue
-            node_position = source.find("{{email}}", node.start_pos)
-            if node_position != position:
-                continue
-            current = node
-            while current is not None and current is not footer_root:
-                current = current.parent
-            if current is footer_root:
-                return True
-        return False
-
     support_end = support_source.end() if support_source else -1
-    separate_email_locations = set()
-    for element in re.finditer(r"<(p|span)\b[^>]*>", source, re.I):
-        if element.start() < support_end:
-            continue
-        close_tag = re.search(r"</" + element.group(1) + r"\s*>", source[element.end():], re.I)
-        if close_tag is None:
-            continue
-        element_end = element.end() + close_tag.end()
-        separate_email_locations.update(
-            item for item in email_locations
-            if element.start() <= item < element_end
-        )
-
-    email_outside_footer = next(
-        (
-            position for position in email_locations
-            if support_anchors and position > support_end
-            and not any(start <= position < end for start, end in anchor_spans)
-            and in_footer(position)
-            and position in separate_email_locations
-        ),
-        None,
-    )
-    if email_outside_footer is None:
-        offending = next(
-            (
-                position for position in email_locations
-                if any(start <= position < end for start, end in anchor_spans)
-            ),
-            email_locations[0] if email_locations else (
-                support_anchors[0].start_pos if support_anchors else body_start_pos
-            ),
+    allowed_email_tags = {"td", "p", "span", "div"}
+    invalid_email_locations = []
+    for position in email_locations:
+        in_anchor = any(start <= position < end for start, end in anchor_spans)
+        allowed_text_node = False
+        for node in nodes:
+            if node.tag not in allowed_email_tags or "{{email}}" not in node.text:
+                continue
+            first_email = source.find("{{email}}", node.start_pos)
+            if first_email < 0 or first_email > position:
+                continue
+            ancestor = node
+            while ancestor is not None and ancestor.tag != "a":
+                ancestor = ancestor.parent
+            if ancestor is None:
+                allowed_text_node = True
+                break
+        if in_anchor or position <= support_end or not allowed_text_node:
+            invalid_email_locations.append(position)
+    if not email_locations or invalid_email_locations:
+        offending = invalid_email_locations[0] if invalid_email_locations else (
+            support_anchors[0].start_pos if support_anchors else body_start_pos
         )
         _issue(
             report, "V07", "E",
-            "{{email}} должен быть обычным текстом в отдельном <p> или <span> после ссылки",
+            "{{email}} должен находиться вне <a> и после ссылки в td, p, span или div",
             _fragment(source, offending, offending + len("{{email}}")),
         )
     if any(re.search(r"mailto:[^\"'>]*\?", node.attrs.get("href", ""), re.I) for node in anchors):
@@ -526,7 +499,11 @@ def validate(source: str, currency_method: Optional[int] = None) -> Report:
             or not _style(node).get("background-color")
         ):
             _issue(report, "T09", "E", "Для " + label + " нужны bgcolor и background-color")
-    if tree.comments != ["Здесь вставляется тело письма"]:
+    nonconditional_comments = [
+        comment for comment in tree.comments
+        if not re.match(r"(?:\[if\b|<!\[endif\])", comment, re.I)
+    ]
+    if nonconditional_comments != ["Здесь вставляется тело письма"]:
         _issue(report, "T19", "E", "Разрешён только обязательный HTML-комментарий перед телом сообщения")
     if len(titles) != 1 or not _text(titles[0]).strip(): _issue(report, "T20", "E", "Нужен непустой title")
     if re.search(r"<ol\b", source, re.I): _issue(report, "T24", "E", "Для шагов используйте маркированный список")
@@ -538,7 +515,10 @@ def validate(source: str, currency_method: Optional[int] = None) -> Report:
         for node in nodes
     ):
         _issue(report, "T25", "W", "Задавайте размер шрифта в px")
-    preheader = re.search(r"<body\b[^>]*>\s*<(div|span)\b([^>]*)>([\s\S]*?)</\1\s*>", source, re.I)
+    preheader = re.search(
+        r"<body\b[^>]*>(?:(?:\s)|<!--[\s\S]*?-->)*<(div|span)\b([^>]*)>([\s\S]*?)</\1\s*>",
+        source, re.I,
+    )
     if not preheader:
         _issue(report, "T10", "E", "Скрытый прехедер должен быть первым элементом body")
     else:
@@ -557,9 +537,7 @@ def validate(source: str, currency_method: Optional[int] = None) -> Report:
             _issue(report, "T10", "E", "В конце прехедера нужны минимум три пары &nbsp;&zwnj;")
     email_node = next((node for node in nodes if "{{email}}" in node.text), None)
     mail_node = anchors[0] if anchors else None
-    footer_root = mail_node
-    while footer_root is not None and footer_root.tag not in {"tr", "table"}:
-        footer_root = footer_root.parent
+    footer_root = _outer_footer_row(mail_node, main_table) if mail_node else None
     footer_nodes = set()
     if footer_root is not None:
         for node in nodes:
@@ -587,7 +565,12 @@ def validate(source: str, currency_method: Optional[int] = None) -> Report:
             if parent_table is None or "separate" not in _style(parent_table).get("border-collapse", "").lower():
                 _issue(report, "T11", "E", "Для border-radius требуется border-collapse:separate")
         size = re.search(r"(\d+(?:\.\d+)?)\s*px", st.get("font-size", ""))
-        if size and float(size.group(1)) < 12 and id(node) != id(preheader_node):
+        size_value = float(size.group(1)) if size else None
+        zero_spacer = bool(
+            size_value == 0
+            and not html.unescape(node.text or "").replace("\xa0", " ").strip()
+        )
+        if size and size_value < 12 and id(node) != id(preheader_node) and not zero_spacer:
             _issue(report, "T12", "E", "Размер текста не должен быть меньше 12 px", node.tag)
         elif size and 12 <= float(size.group(1)) < 15 and id(node) not in footer_nodes and not (
             detail_start >= 0 and detail_start <= node.start_pos < marker_pos
@@ -709,18 +692,16 @@ def validate(source: str, currency_method: Optional[int] = None) -> Report:
         ):
             _issue(report, "M20", "W", "Для способа 20 нужен знак 14–20px и вертикальная черта справа")
     mailto_node = next((node for node in nodes if node.tag == "a" and node.attrs.get("href", "").lower().startswith("mailto:")), None)
-    footer_container = mailto_node.parent if mailto_node else None
-    while footer_container is not None and footer_container.tag not in {"tr", "table"}:
-        footer_container = footer_container.parent
+    footer_container = _outer_footer_row(mailto_node, main_table) if mailto_node else None
     message_end = footer_container.start_pos if footer_container is not None else len(source)
     for node in nodes:
         if marker_pos >= 0 and marker_pos <= node.start_pos < message_end:
-            if node.tag in {"h1", "h2", "h3", "p", "ul", "li", "hr", "table", "td"} and "style" not in node.attrs:
+            if node.tag in {"h1", "h2", "h3", "p", "ul", "li", "hr"} and "style" not in node.attrs:
                 _issue(report, "T16", "E", "Теги тела сообщения должны иметь inline style", node.tag)
             elif node.tag in {"strong", "em", "i", "b"} and "style" not in node.attrs:
                 _issue(report, "T16", "W", "Добавьте inline style на выделение текста", node.tag)
     if marker_pos >= 0:
-        message_area = source[marker_pos:source.lower().find("mailto:", marker_pos) if "mailto:" in source[marker_pos:].lower() else len(source)]
+        message_area = source[marker_pos:message_end]
         for tag, expression, message in (
             ("h2", r"<h2\b", "В блоке сообщения обязателен h2"),
             ("p", r"<p\b", "В блоке сообщения обязателен абзац"),
@@ -732,11 +713,6 @@ def validate(source: str, currency_method: Optional[int] = None) -> Report:
             if not re.search(expression, message_area, re.I): _issue(report, "T17", "E", message)
         lis = re.findall(r"<li\b", message_area, re.I)
         if len(lis) != 3: _issue(report, "T17", "E", "В списке сообщения должно быть ровно три пункта")
-        mailto_node = next((node for node in nodes if node.tag == "a" and node.attrs.get("href", "").lower().startswith("mailto:")), None)
-        footer_container = mailto_node.parent if mailto_node else None
-        while footer_container is not None and footer_container.tag not in {"tr", "table"}:
-            footer_container = footer_container.parent
-        message_end = footer_container.start_pos if footer_container is not None else len(source)
         message_paragraphs = [
             node for node in nodes
             if node.tag == "p" and marker_pos <= node.start_pos < message_end

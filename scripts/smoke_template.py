@@ -181,7 +181,13 @@ class LocalProxyHandler(BaseHTTPRequestHandler):
         if target.query:
             path += "?" + target.query
         event(f"proxy {self.behavior}: {self.command} {path}")
-        if self.command == "POST":
+        is_generate_content = (
+            self.command == "POST"
+            and ":generateContent" in target.path
+            and ":streamGenerateContent" not in target.path
+        )
+        post_number = None
+        if is_generate_content:
             handler_type = type(self)
             with handler_type.post_count_lock:
                 post_number = handler_type.post_count
@@ -191,8 +197,8 @@ class LocalProxyHandler(BaseHTTPRequestHandler):
         if self.behavior == "blackhole":
             time.sleep(1.5)
             return
-        if self.behavior == "stall_generate" and self.command == "POST" and post_number >= 1:
-            event("proxy stall_generate: second Gemini request held open")
+        if self.behavior == "stall_generate" and is_generate_content and post_number >= 1:
+            event("proxy stall_generate: second generateContent call held open")
             if self.stall_seen is not None:
                 self.stall_seen.set()
             time.sleep(8)

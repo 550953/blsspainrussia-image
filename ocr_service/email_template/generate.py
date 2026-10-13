@@ -7,11 +7,14 @@ from datetime import datetime, timezone
 
 from ..config import (
     TEMPLATE_DAILY_TOKEN_CAP, TEMPLATE_MAX_ATTEMPTS, TEMPLATE_MAX_HTML_BYTES, TEMPLATE_MAX_OUTPUT_TOKENS,
-    TEMPLATE_MIN_ATTEMPT_SECONDS, TEMPLATE_MODELS, TEMPLATE_REPAIR_MODEL, TEMPLATE_REPAIR_TEMPERATURE,
+    TEMPLATE_MODELS, TEMPLATE_REPAIR_MODEL, TEMPLATE_REPAIR_TEMPERATURE,
     TEMPLATE_RESULT_TTL_SECONDS,
     TEMPLATE_TEMPERATURE,
 )
-from ..telemetry import TEMPLATE_STATS, _job_log, ensure_template_day, record_template_run, record_template_usage
+from ..telemetry import (
+    TEMPLATE_STATS, _job_log, ensure_template_day, record_template_run,
+    record_template_usage, template_success_p50_ms,
+)
 from . import autofix
 from .extract import parse
 from .prompt import PROMPT_VERSION, build_repair_message, build_user_message, base_prompt, prompt_sha1
@@ -49,6 +52,12 @@ async def run_template_job(job_id: str, job: dict):
     started = time.monotonic()
     deadline_ts = started + max(1.0, float(job.get("deadline_s", 420)) - 10.0)
     job["deadline_monotonic"] = deadline_ts
+    candidate_models = [job.get("model")] if job.get("model") else list(job.get("models") or [""])
+    candidate_p50s = [template_success_p50_ms(model) for model in candidate_models if model]
+    model_p50_ms = max((value for value in candidate_p50s if value), default=None)
+    expected_model = candidate_models[0] if candidate_models else ""
+    repair_budget_seconds = max(60.0, (model_p50_ms / 1000.0) if model_p50_ms else 0.0)
+    first_generation_deadline = max(started + 1.0, deadline_ts - repair_budget_seconds)
     system = base_prompt()
     initial = build_user_message(job["brief"])
     contents = [{"role": "user", "parts": [{"text": initial}]}]
@@ -65,7 +74,16 @@ async def run_template_job(job_id: str, job: dict):
             if force_final_attempt and number < max_attempts:
                 continue
             remaining = deadline_ts - time.monotonic()
-            if number > 1 and remaining < TEMPLATE_MIN_ATTEMPT_SECONDS:
+            minimum_repair_seconds = max(60.0, (model_p50_ms / 1000.0) if model_p50_ms else 0.0)
+            if number > 1 and remaining < minimum_repair_seconds:
+                generation_error = "repair_skipped_no_time"
+                _job_log(
+                    "tpl_repair_skipped", job_id, component="email_template",
+                    attempt=number, reason="repair_skipped_no_time",
+                    remaining_s=round(max(0.0, remaining), 1),
+                    required_s=round(minimum_repair_seconds, 1),
+                    model=attempts[-1].get("model") if attempts else expected_model,
+                )
                 break
             if remaining <= 0:
                 break
@@ -101,16 +119,18 @@ async def run_template_job(job_id: str, job: dict):
                     persistent_rule_ids=sorted(persistent)[:12],
                 )
             call_started = time.monotonic()
+            call_deadline = first_generation_deadline if number == 1 and max_attempts > 1 else deadline_ts
             try:
                 text, metadata, model = await call_model(
                     contents, system, request_models,
-                    job_id, generation_config, deadline_ts=deadline_ts,
+                    job_id, generation_config, deadline_ts=call_deadline,
                 )
             except GenerationDeadline:
                 generation_error = "deadline"
                 attempts.append({
                     "n": number, "model": job.get("model") or "",
                     "latency_ms": round((time.monotonic() - call_started) * 1000),
+                    "api_trace": [],
                     "finish_reason": "DEADLINE", "tokens": {"in": 0, "out": 0, "thoughts": 0, "cached": 0},
                     "raw_errors": [], "autofixes": [], "errors": [], "warnings": [],
                 })
@@ -122,6 +142,7 @@ async def run_template_job(job_id: str, job: dict):
                 attempts.append({
                     "n": number, "model": job.get("model") or "",
                     "latency_ms": round((time.monotonic() - call_started) * 1000),
+                    "api_trace": list((exc.error_detail or {}).get("api_trace") or []),
                     "finish_reason": exc.code.upper(),
                     "tokens": {"in": 0, "out": 0, "thoughts": 0, "cached": 0},
                     "raw_errors": [], "autofixes": [], "errors": [], "warnings": [],
@@ -130,6 +151,7 @@ async def run_template_job(job_id: str, job: dict):
             latency_ms = round((time.monotonic() - call_started) * 1000)
             usage = metadata.get("usage", {})
             record_template_usage(usage)
+            model_p50_ms = template_success_p50_ms(model) or model_p50_ms
             _job_log(
                 "tpl_gemini_attempt", job_id, component="email_template", attempt=number,
                 model=model, latency_ms=latency_ms, tokens=usage,
@@ -187,6 +209,7 @@ async def run_template_job(job_id: str, job: dict):
             last_report_errors = list(report_errors)
             current = {
                 "n": number, "model": model, "latency_ms": latency_ms,
+                "api_trace": list(metadata.get("api_trace") or []),
                 "finish_reason": metadata.get("finish_reason", ""),
                 "thinking": metadata.get("thinking_setting", "model-default"),
                 "tokens": metadata.get("usage", {}),
@@ -216,6 +239,9 @@ async def run_template_job(job_id: str, job: dict):
                     "stats": {"bytes": output_bytes},
                 },
                 "tail": parsed.tail,
+                "api_trace": [
+                    trace for item in attempts for trace in item.get("api_trace", [])
+                ],
             }
             score = (len(report_errors), len(report_warnings), number)
             if best is None or score < best[0]:
@@ -224,6 +250,9 @@ async def run_template_job(job_id: str, job: dict):
             # A router timeout or cancellation must not erase useful HTML.
             if best is not None:
                 best[1]["attempts"] = list(attempts)
+                best[1]["api_trace"] = [
+                    trace for item in attempts for trace in item.get("api_trace", [])
+                ]
                 job["template"] = best[1]
             _job_log(
                 "tpl_validated", job_id, component="email_template", attempt=number,
@@ -243,6 +272,16 @@ async def run_template_job(job_id: str, job: dict):
             if token_usage >= TEMPLATE_DAILY_TOKEN_CAP:
                 break
             if number < max_attempts and report_errors:
+                remaining = deadline_ts - time.monotonic()
+                if remaining < minimum_repair_seconds:
+                    generation_error = "repair_skipped_no_time"
+                    _job_log(
+                        "tpl_repair_skipped", job_id, component="email_template",
+                        attempt=number + 1, reason="repair_skipped_no_time",
+                        remaining_s=round(max(0.0, remaining), 1),
+                        required_s=round(minimum_repair_seconds, 1), model=model,
+                    )
+                    break
                 priority = {"T": 0, "S": 0, "V": 0, "L": 1, "A": 2, "X": -1}
                 report_errors.sort(key=lambda issue: (priority.get(issue["rule"][:1], 3), issue["rule"]))
                 repair = build_repair_message(
@@ -268,6 +307,9 @@ async def run_template_job(job_id: str, job: dict):
         if best:
             result = best[1]
             result["attempts"] = attempts
+            result["api_trace"] = [
+                trace for item in attempts for trace in item.get("api_trace", [])
+            ]
             if generation_error:
                 result["generation_error"] = generation_error
             job["template"] = result
@@ -290,6 +332,7 @@ async def run_template_job(job_id: str, job: dict):
         error_code = "deadline"
         if job.get("template"):
             job["template"]["generation_error"] = error_code
+            job["template"]["api_trace"] = list(job.get("api_trace") or job["template"].get("api_trace") or [])
             job["status"] = "done"
             job["error"] = None
             _job_log("tpl_done", job_id, component="email_template",
@@ -307,6 +350,7 @@ async def run_template_job(job_id: str, job: dict):
     except asyncio.CancelledError:
         if job.get("template"):
             job["template"]["generation_error"] = "cancelled"
+            job["template"]["api_trace"] = list(job.get("api_trace") or job["template"].get("api_trace") or [])
             job["status"] = "done"
             job["error"] = None
             _job_log("tpl_done", job_id, component="email_template",

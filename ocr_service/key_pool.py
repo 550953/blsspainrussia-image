@@ -90,15 +90,17 @@ class GeminiKeyPool:
         return category in self._BILLING_HOLD_CATEGORIES or category in self._PROJECT_HOLD_CATEGORIES
 
     def acquire(self, lease_ttl: Optional[float] = None, reserve: int = 0, model_chain=None,
-                respect_key_cooldown: bool = False) -> tuple:
+                respect_key_cooldown: bool = False, exclude_indices=None) -> tuple:
         """Резервирует следующий свободный ключ по кругу. (None, None), если свободных нет."""
         if not self.keys:
             return None, None
         n = len(self.keys)
         now = time.monotonic()
         reserve = max(0, int(reserve or 0))
+        excluded = set(exclude_indices or ())
         eligible = [
             i for i in range(n)
+            if i not in excluded
             if not self.dead[i] and not self._is_operator_hold(i)
             and not self.reserved[i] and now >= self.blocked[i]
         ]

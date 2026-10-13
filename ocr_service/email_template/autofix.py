@@ -1,12 +1,201 @@
 """Ограниченные механические исправления разметки без изменения текста письма."""
 import re
-from .validator import ALLOWED_VARS, MARKER
+from ..config import TEMPLATE_AUTOFIX_CONTRAST
+from .contrast import color_tokens, parse_color, ratio, suggest_fix
+from .validator import ALLOWED_VARS, MARKER, _Tree, _style, _text, _walk
 
 
 _MARKER_PATTERN = re.compile(
     r"<!--\s*Здесь\s+вставляется\s+тело\s+письма\s*-->", re.I,
 )
 _ANCHOR_PATTERN = re.compile(r"<a\b([^>]*)>([\s\S]*?)</a\s*>", re.I)
+_COMMENT_PATTERN = re.compile(r"<!--[\s\S]*?-->", re.I)
+
+
+def _tag_end(source, start):
+    quote = None
+    for position in range(start, len(source)):
+        char = source[position]
+        if quote:
+            if char == quote:
+                quote = None
+        elif char in "\"'":
+            quote = char
+        elif char == ">":
+            return position + 1
+    return min(len(source), start + 1)
+
+
+def _style_value(tag):
+    return re.search(r"\bstyle\s*=\s*([\"'])(.*?)\1", tag, re.I | re.S)
+
+
+def _set_style_property(tag, name, value):
+    style = _style_value(tag)
+    if style:
+        old = style.group(2)
+        prop = re.compile(r"(^|;)\s*" + re.escape(name) + r"\s*:\s*[^;]*", re.I)
+        if prop.search(old):
+            updated = prop.sub(lambda match: match.group(1) + name + ":" + value, old, count=1)
+        else:
+            updated = old.rstrip().rstrip(";") + ";" + name + ":" + value
+        if updated == old:
+            return tag, False
+        return tag[:style.start(2)] + updated + tag[style.end(2):], True
+    return tag[:-1].rstrip() + ' style="' + name + ":" + value + '">' , True
+
+
+def _edit_node_tags(source, transforms):
+    """Apply opening-tag transforms from right to left so stored offsets stay valid."""
+    changes = []
+    for start, callback in transforms:
+        end = _tag_end(source, start)
+        tag = source[start:end]
+        updated, changed = callback(tag)
+        if changed:
+            changes.append((start, end, updated))
+    for start, end, updated in sorted(changes, reverse=True):
+        source = source[:start] + updated + source[end:]
+    return source, bool(changes)
+
+
+def _tree(source):
+    tree = _Tree(source)
+    tree.feed(source)
+    tree.close()
+    return tree
+
+
+def _fix_comments(source):
+    def keep_or_remove(match):
+        comment = match.group(0)
+        content = comment[4:-3].strip()
+        if _MARKER_PATTERN.fullmatch(comment):
+            return MARKER
+        if re.match(r"\[if\b", content, re.I) or re.match(r"<!\[endif\]", content, re.I):
+            return comment
+        return ""
+    return _COMMENT_PATTERN.sub(keep_or_remove, source)
+
+
+def _fix_rounded_table_cells(source):
+    tree = _tree(source)
+    targets = {}
+    has_cell_radius = False
+    for node in _walk(tree.root):
+        if node.tag not in {"table", "td"} or "border-radius" not in _style(node):
+            continue
+        table = node
+        if node.tag != "table":
+            has_cell_radius = True
+            table = node.parent
+            while table is not None and table.tag != "table":
+                table = table.parent
+        if table is None:
+            continue
+        styles = _style(table)
+        if "separate" in styles.get("border-collapse", "").lower():
+            continue
+        targets.setdefault(table.start_pos, "border-collapse")
+
+    source, changed = _edit_node_tags(
+        source,
+        [
+            (position, lambda tag: _set_style_property(tag, "border-collapse", "separate"))
+            for position in targets
+        ],
+    )
+    return source, changed, has_cell_radius and changed
+
+
+def _hidden_preheader(node):
+    current = node
+    while current is not None:
+        style = _style(current)
+        if (
+            current.tag in {"div", "span"}
+            and style.get("display", "").replace(" ", "").lower() == "none"
+            and style.get("font-size", "").replace(" ", "").lower() == "1px"
+        ):
+            return True
+        current = current.parent
+    return False
+
+
+def _fix_small_fonts(source):
+    tree = _tree(source)
+    edits = []
+    for node in _walk(tree.root):
+        value = _style(node).get("font-size", "")
+        match = re.search(r"(\d+(?:\.\d+)?)\s*px", value, re.I)
+        if not match or _hidden_preheader(node):
+            continue
+        size = float(match.group(1))
+        if size >= 12 or (size == 0 and not _text(node).replace("\xa0", " ").strip()):
+            continue
+        edits.append((node.start_pos, lambda tag: (
+            re.subn(
+                r"(\bfont-size\s*:\s*)\d+(?:\.\d+)?\s*px",
+                lambda found: found.group(1) + "12px",
+                tag, count=1, flags=re.I,
+            )[0],
+            True,
+        )))
+    return _edit_node_tags(source, edits)
+
+
+def _known_background(node):
+    current = node
+    while current is not None:
+        styles = _style(current)
+        candidate = styles.get("background-color") or current.attrs.get("bgcolor", "")
+        if candidate and candidate.strip().lower() not in {"transparent", "inherit", "initial", "unset"}:
+            if parse_color(candidate) is not None:
+                return candidate
+        shorthand = styles.get("background", "")
+        if shorthand:
+            if "gradient(" in shorthand.lower() and ratio("#000000", shorthand) is not None:
+                return shorthand
+            colors = color_tokens(shorthand)
+            if colors and parse_color(colors[0]) is not None:
+                return colors[0]
+        current = current.parent
+    return None
+
+
+def _fix_contrast(source):
+    if not TEMPLATE_AUTOFIX_CONTRAST:
+        return source, False
+    tree = _tree(source)
+    edits = []
+    for node in _walk(tree.root):
+        if not (node.text or "").strip() or _hidden_preheader(node):
+            continue
+        foreground = _style(node).get("color")
+        background = _known_background(node)
+        if not foreground or not background or ratio(foreground, background) is None:
+            continue
+        if ratio(foreground, background) >= 4.5:
+            continue
+        replacement = suggest_fix(foreground, background, 4.5)
+        if not replacement or ratio(replacement, background) is None or ratio(replacement, background) < 4.5:
+            continue
+
+        def recolor(tag, old=foreground, new=replacement):
+            style = _style_value(tag)
+            if not style:
+                return tag, False
+            updated, count = re.subn(
+                r"(\bcolor\s*:\s*)" + re.escape(old) + r"(?=\s*(?:;|$))",
+                lambda match: match.group(1) + new,
+                style.group(2), count=1, flags=re.I,
+            )
+            if not count:
+                return tag, False
+            return tag[:style.start(2)] + updated + tag[style.end(2):], True
+
+        edits.append((node.start_pos, recolor))
+    return _edit_node_tags(source, edits)
 
 
 def _message_heading(source: str):
@@ -43,9 +232,21 @@ def _visible_anchor_text(inner: str):
     return re.sub(r"<[^>]*>", "", inner)
 
 
+def _email_has_allowed_container(source, position, support_end):
+    anchor_spans = [(item.start(), item.end()) for item in _ANCHOR_PATTERN.finditer(source)]
+    if position <= support_end or any(start <= position < end for start, end in anchor_spans):
+        return False
+    for item in re.finditer(r"<(td|p|span|div)\b[^>]*>", source, re.I):
+        if item.start() > position:
+            continue
+        close = re.search(r"</" + item.group(1) + r"\s*>", source[item.end():], re.I)
+        if close and item.end() + close.end() > position:
+            return True
+    return False
+
+
 def _fix_support_links(source: str):
     anchors = list(_ANCHOR_PATTERN.finditer(source))
-    had_email = "{{email}}" in source
     canonical = [
         item for item in anchors
         if _anchor_href(item.group(1)) == "mailto:{{supportEmail}}"
@@ -61,11 +262,7 @@ def _fix_support_links(source: str):
         inner = item.group(2)
         if item is keep:
             visible = _visible_anchor_text(inner).strip()
-            if (
-                not visible
-                or "{{supportEmail}}" in inner
-                or re.search(r"[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}", visible)
-            ):
+            if not visible:
                 inner = "Напишите нам"
             inner = inner.replace("{{email}}", "")
             pieces.append("<a" + item.group(1) + ">" + inner + "</a>")
@@ -91,46 +288,33 @@ def _fix_support_links(source: str):
         canonical_match.group(0),
         updated[canonical_match.end():],
     )
-    updated = before.replace("{{supportEmail}}", "Напишите нам") + kept_link + after.replace(
-        "{{supportEmail}}", "Напишите нам",
-    )
+    updated = before + kept_link + after
     canonical_match = next(
         item for item in _ANCHOR_PATTERN.finditer(updated)
         if _anchor_href(item.group(1)) == "mailto:{{supportEmail}}"
     )
     email_matches = list(re.finditer(r"\{\{email\}\}", updated))
-    if had_email and not email_matches:
+    valid_email = next(
+        (
+            item for item in email_matches
+            if _email_has_allowed_container(updated, item.start(), canonical_match.end())
+        ),
+        None,
+    )
+    if valid_email is None:
         updated = updated[:canonical_match.end()] + "<span>{{email}}</span>" + updated[canonical_match.end():]
     elif email_matches:
-        separate_email = None
-        for element in re.finditer(r"<(p|span)\b[^>]*>[\s\S]*?</\1\s*>", updated, re.I):
-            if element.start() < canonical_match.end():
-                continue
-            email = next(
-                (item for item in email_matches if element.start() <= item.start() < element.end()),
-                None,
-            )
-            if email:
-                separate_email = email.start()
-                break
-        if separate_email is None:
-            updated = re.sub(r"\{\{email\}\}", "", updated)
-            canonical_match = next(
-                item for item in _ANCHOR_PATTERN.finditer(updated)
-                if _anchor_href(item.group(1)) == "mailto:{{supportEmail}}"
-            )
-            updated = updated[:canonical_match.end()] + "<span>{{email}}</span>" + updated[canonical_match.end():]
-        else:
-            first = True
+        valid_position = valid_email.start()
+        keep = True
 
-            def keep_one_email(_match):
-                nonlocal first
-                if _match.start() == separate_email and first:
-                    first = False
-                    return "{{email}}"
-                return ""
+        def keep_one_email(match):
+            nonlocal keep
+            if match.start() == valid_position and keep:
+                keep = False
+                return "{{email}}"
+            return ""
 
-            updated = re.sub(r"\{\{email\}\}", keep_one_email, updated)
+        updated = re.sub(r"\{\{email\}\}", keep_one_email, updated)
     return updated, updated != source
 
 
@@ -164,6 +348,10 @@ def apply(source: str):
     if links_changed:
         source = updated
         fixes.append("AF14")
+    updated = _fix_comments(source)
+    if updated != source:
+        source = updated
+        fixes.append("AF15")
     before_tables = source
     source = re.sub(
         r"<table\b([^>]*)>",
@@ -199,6 +387,17 @@ def apply(source: str):
     if updated != source:
         source = updated
         fixes.append("AF07")
+    updated, rounded_cell_changed, cell_fix = _fix_rounded_table_cells(source)
+    if rounded_cell_changed:
+        source = updated
+        if cell_fix:
+            fixes.append("AF16")
+        else:
+            fixes.append("AF07")
+    updated, font_changed = _fix_small_fonts(source)
+    if font_changed:
+        source = updated
+        fixes.append("AF17")
     html_tag = re.search(r"<html\b([^>]*)>", source, re.I)
     lang_fixed = False
     if html_tag:
@@ -306,4 +505,8 @@ def apply(source: str):
         fixes.append("AF11")
     if quotes_changed:
         fixes.append("AF12")
+    updated, contrast_changed = _fix_contrast(source)
+    if contrast_changed:
+        source = updated
+        fixes.append("AF18")
     return source, list(dict.fromkeys(fixes))

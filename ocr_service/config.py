@@ -148,6 +148,14 @@ def _template_float(name: str, default: float, minimum: float = 0.0) -> float:
 TEMPLATE_ENABLED = os.getenv("TEMPLATE_ENABLED", "0").strip().lower() in {"1", "true", "yes", "on"}
 TEMPLATE_API_KEYS, _TEMPLATE_API_KEYS_SOURCE = _config_secret("TEMPLATE_API_KEYS")
 TEMPLATE_API_KEYS = [item.strip() for item in TEMPLATE_API_KEYS.split(",") if item.strip()]
+TEMPLATE_API_KEY_MIN_LENGTH = _template_int("TEMPLATE_API_KEY_MIN_LENGTH", 24, 1)
+TEMPLATE_API_KEY_WARNINGS = [
+    f"TEMPLATE_API_KEYS[{index + 1}] is shorter than {TEMPLATE_API_KEY_MIN_LENGTH} characters"
+    for index, value in enumerate(TEMPLATE_API_KEYS)
+    if len(value) < TEMPLATE_API_KEY_MIN_LENGTH
+]
+if TEMPLATE_API_KEY_WARNINGS:
+    print(f"[pid={os.getpid()}] Template auth warning: {len(TEMPLATE_API_KEY_WARNINGS)} short client API key(s)")
 TEMPLATE_MODELS = [item.strip() for item in os.getenv("TEMPLATE_MODELS", "").split(",") if item.strip()]
 TEMPLATE_REPAIR_MODEL = os.getenv("TEMPLATE_REPAIR_MODEL", "").strip()
 TEMPLATE_MAX_CONCURRENCY = _template_int("TEMPLATE_MAX_CONCURRENCY", 3, 1)
@@ -178,11 +186,15 @@ if TEMPLATE_THINKING_LEVEL not in {"minimal", "low", "medium", "high"}:
 TEMPLATE_HTTP_READ_TIMEOUT = _template_float("TEMPLATE_HTTP_READ_TIMEOUT", 130, 15)
 TEMPLATE_CONNECT_TIMEOUT = _template_float("TEMPLATE_CONNECT_TIMEOUT", 8, 1)
 TEMPLATE_HARD_TIMEOUT = _template_float("TEMPLATE_HARD_TIMEOUT", 150, 15)
+TEMPLATE_STREAM_FIRST_BYTE_TIMEOUT = _template_float("TEMPLATE_STREAM_FIRST_BYTE_TIMEOUT", 25, 1)
+TEMPLATE_STREAM_STALL_TIMEOUT = _template_float("TEMPLATE_STREAM_STALL_TIMEOUT", 30, 1)
 TEMPLATE_PROXY_PREFLIGHT_TIMEOUT = _template_float("TEMPLATE_PROXY_PREFLIGHT_TIMEOUT", 7, 1)
 TEMPLATE_LEASE_TTL = max(TEMPLATE_HARD_TIMEOUT + 30, _template_float("TEMPLATE_LEASE_TTL", 180, 1))
 TEMPLATE_MODEL_COOLDOWN = _template_float("TEMPLATE_MODEL_COOLDOWN", 60, 1)
+TEMPLATE_SLOW_ROUTE_COOLDOWN = _template_float("TEMPLATE_SLOW_ROUTE_COOLDOWN", 600, 1)
 TEMPLATE_QUOTA_BLOCK_SECONDS = _template_int("TEMPLATE_QUOTA_BLOCK_SECONDS", 900, 60)
 TEMPLATE_CONTRAST_SUGGEST = os.getenv("TEMPLATE_CONTRAST_SUGGEST", "1").strip().lower() not in {"0", "false", "no"}
+TEMPLATE_AUTOFIX_CONTRAST = os.getenv("TEMPLATE_AUTOFIX_CONTRAST", "0").strip().lower() in {"1", "true", "yes", "on"}
 TEMPLATE_HISTORY = _template_int("TEMPLATE_HISTORY", 12, 1)
 TEMPLATE_STORE_MAX = _template_int("TEMPLATE_STORE_MAX", 100, 1)
 TEMPLATE_VALIDATE_RATE_PER_MIN = _template_int("TEMPLATE_VALIDATE_RATE_PER_MIN", 30, 1)

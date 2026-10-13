@@ -1,0 +1,184 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta http-equiv="X-UA-Compatible" content="IE=edge">
+  <title>{{productName}}</title>
+</head>
+<body bgcolor="#F0F7F6" style="margin:0;padding:0;background-color:#F0F7F6;-webkit-text-size-adjust:100%;-ms-text-size-adjust:100%;">
+  <!-- Скрытый прехедер -->
+  <div style="display:none;font-size:1px;line-height:1px;max-height:0;max-width:0;opacity:0;overflow:hidden;mso-hide:all;">
+    Заказ {{transactionalId}} уже у нас в работе, готовим к отправке&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;
+  </div>
+
+  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" bgcolor="#F0F7F6" style="background-color:#F0F7F6;width:100%;table-layout:fixed;">
+    <tr>
+      <td align="center" style="padding:28px 16px;">
+        <!-- Основной контейнер письма -->
+        <table role="presentation" width="560" cellpadding="0" cellspacing="0" border="0" bgcolor="#FFFFFF" style="width:100%;max-width:560px;background-color:#FFFFFF;border-collapse:separate;border-radius:14px;border:1px solid #D6E8E6;">
+          
+          <!-- 1. Шапка с начальной буквой бренда в круге -->
+          <tr>
+            <td style="padding:28px 32px 20px 32px;border-bottom:1px solid #EBF4F3;">
+              <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0">
+                <tr>
+                  <td width="42" valign="middle" style="width:42px;">
+                    <table role="presentation" cellpadding="0" cellspacing="0" border="0">
+                      <tr>
+                        <td align="center" valign="middle" width="38" height="38" bgcolor="#10374A" style="width:38px;height:38px;background-color:#10374A;border-radius:19px;font-family:Georgia,serif;font-size:20px;line-height:38px;color:#FFFFFF;font-weight:bold;">
+                          &bull;
+                        </td>
+                      </tr>
+                    </table>
+                  </td>
+                  <td valign="middle" style="padding-left:12px;">
+                    <span style="font-family:Georgia,serif;font-size:21px;font-weight:bold;color:#10374A;letter-spacing:0.2px;">{{brandName}}</span>
+                  </td>
+                </tr>
+              </table>
+            </td>
+          </tr>
+
+          <!-- 2. Приветствие по имени + живой текст -->
+          <tr>
+            <td style="padding:28px 32px 20px 32px;">
+              <h1 style="margin:0 0 12px 0;font-family:Georgia,serif;font-size:23px;line-height:1.35;font-weight:normal;color:#10374A;">
+                Здравствуйте, {{name}}
+              </h1>
+              <p style="margin:0;font-family:Tahoma,sans-serif;font-size:15px;line-height:1.55;color:#2D5262;">
+                Всё в порядке: покупка прошла успешно, и мы уже приступили к формированию вашей посылки. Собрали основные параметры ниже, чтобы они всегда оставались под рукой.
+              </p>
+            </td>
+          </tr>
+
+          <!-- 3. Блок деталей заказа -->
+          <tr>
+            <td style="padding:0 32px 28px 32px;">
+              <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" bgcolor="#E5F5F3" style="width:100%;background-color:#E5F5F3;border-collapse:separate;border-radius:10px;border-left:4px solid #74A608;">
+                <tr>
+                  <td style="padding:20px 22px;">
+                    <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0">
+                      <tr>
+                        <td valign="top" style="padding-bottom:12px;">
+                          <div style="font-family:Tahoma,sans-serif;font-size:12px;color:#4B7280;line-height:1.3;padding-bottom:2px;">Выбранный товар</div>
+                          <div style="font-family:Georgia,serif;font-size:17px;font-weight:bold;color:#10374A;line-height:1.4;">{{productName}}</div>
+                        </td>
+                      </tr>
+                      <tr>
+                        <td valign="top" style="padding-top:8px;border-top:1px dashed #BFDFDB;">
+                          <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0">
+                            <tr>
+                              <td valign="middle" style="width:50%;">
+                                <div style="font-family:Tahoma,sans-serif;font-size:12px;color:#4B7280;line-height:1.3;padding-bottom:2px;">Номер заказа</div>
+                                <div style="font-family:Tahoma,sans-serif;font-size:15px;font-weight:bold;color:#10374A;line-height:1.4;">{{transactionalId}}</div>
+                              </td>
+                              <td align="right" valign="middle" style="width:50%;">
+                                <div style="font-family:Tahoma,sans-serif;font-size:12px;color:#4B7280;line-height:1.3;padding-bottom:2px;">Сумма к оплате</div>
+                                <div style="font-family:Tahoma,sans-serif;line-height:1.3;">
+                                  <!-- Способ оформления знака валюты №18: скруглённая плашка акцентного цвета с белым знаком -->
+                                  <span style="display:inline-block;width:22px;height:22px;background-color:#74A608;border-radius:6px;color:#FFFFFF;font-family:Tahoma,sans-serif;font-size:14px;font-weight:bold;line-height:22px;text-align:center;vertical-align:middle;margin-right:4px;">$</span><span style="font-family:Georgia,serif;font-size:24px;font-weight:bold;color:#10374A;vertical-align:middle;">{{price}}</span>
+                                </div>
+                              </td>
+                            </tr>
+                          </table>
+                        </td>
+                      </tr>
+                    </table>
+                  </td>
+                </tr>
+              </table>
+            </td>
+          </tr>
+
+          <!-- 4. Визуальный индикатор статуса (точки с соединяющими линиями) -->
+          <tr>
+            <td style="padding:0 32px 30px 32px;">
+              <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0">
+                <!-- Линия индикаторов -->
+                <tr>
+                  <td align="center" valign="middle" width="28" style="width:28px;">
+                    <div style="width:24px;height:24px;line-height:24px;border-radius:12px;background-color:#157366;color:#FFFFFF;text-align:center;font-family:Tahoma,sans-serif;font-size:12px;font-weight:bold;">&#10003;</div>
+                  </td>
+                  <td valign="middle" style="padding:0 4px;">
+                    <div style="height:3px;background-color:#157366;line-height:3px;font-size:0;">&nbsp;</div>
+                  </td>
+                  <td align="center" valign="middle" width="28" style="width:28px;">
+                    <div style="width:24px;height:24px;line-height:20px;border-radius:12px;background-color:#FFFFFF;border:2px solid #74A608;color:#74A608;text-align:center;font-family:Tahoma,sans-serif;font-size:14px;font-weight:bold;box-sizing:border-box;">&bull;</div>
+                  </td>
+                  <td valign="middle" style="padding:0 4px;">
+                    <div style="height:3px;background-color:#D6E8E6;line-height:3px;font-size:0;">&nbsp;</div>
+                  </td>
+                  <td align="center" valign="middle" width="28" style="width:28px;">
+                    <div style="width:24px;height:24px;line-height:20px;border-radius:12px;background-color:#FFFFFF;border:2px solid #B7D3D0;color:#94B7B3;text-align:center;font-family:Tahoma,sans-serif;font-size:11px;box-sizing:border-box;">3</div>
+                  </td>
+                </tr>
+                <!-- Подписи к этапам -->
+                <tr>
+                  <td align="left" valign="top" style="width:28%;padding-top:8px;">
+                    <span style="font-family:Tahoma,sans-serif;font-size:12px;line-height:1.3;color:#157366;font-weight:bold;">Подтверждён</span>
+                  </td>
+                  <td colspan="1" style="width:6%;">&nbsp;</td>
+                  <td align="center" valign="top" style="width:32%;padding-top:8px;">
+                    <span style="font-family:Tahoma,sans-serif;font-size:12px;line-height:1.3;color:#10374A;font-weight:bold;">В обработке</span>
+                  </td>
+                  <td colspan="1" style="width:6%;">&nbsp;</td>
+                  <td align="right" valign="top" style="width:28%;padding-top:8px;">
+                    <span style="font-family:Tahoma,sans-serif;font-size:12px;line-height:1.3;color:#859F9C;">Скоро отправка</span>
+                  </td>
+                </tr>
+              </table>
+            </td>
+          </tr>
+
+          <!-- 5. Блок для произвольного сообщения -->
+          <!-- Здесь вставляется тело письма -->
+          <tr>
+            <td style="padding:0 32px 32px 32px;border-top:1px solid #EBF4F3;">
+              <div style="padding-top:24px;">
+                <h2 style="margin:0 0 14px 0;font-family:Georgia,serif;font-size:19px;line-height:1.35;font-weight:bold;color:#10374A;">
+                  Что происходит дальше
+                </h2>
+                <p style="margin:0 0 12px 0;font-family:Tahoma,sans-serif;font-size:15px;line-height:1.55;color:#2D5262;">
+                  Наш склад бережно проверяет комплектацию и готовит коробку к передаче в курьерскую службу. Мы уделяем внимание надежности упаковки, чтобы каждая деталь добралась в целости.
+                </p>
+                <p style="margin:0 0 14px 0;font-family:Tahoma,sans-serif;font-size:15px;line-height:1.55;color:#2D5262;">
+                  Отслеживать перемещение можно будет сразу после отправления: мы пришлём отдельное письмо со ссылкой на трекинг. <strong style="color:#10374A;">Вот ключевые этапы:</strong>
+                </p>
+                <ul style="margin:0 0 20px 0;padding-left:20px;font-family:Tahoma,sans-serif;font-size:15px;line-height:1.55;color:#2D5262;">
+                  <li style="margin-bottom:6px;">Сверка наименования на центральном складе.</li>
+                  <li style="margin-bottom:6px;">Упаковка в защитные материалы и пломбирование.</li>
+                  <li style="margin-bottom:0;">Передача посылки в логистическую компанию.</li>
+                </ul>
+                <hr style="border:none;border-top:1px solid #D6E8E6;margin:20px 0;">
+                <p style="margin:0;font-family:Georgia,serif;font-size:14px;line-height:1.5;font-style:italic;color:#527572;">
+                  С заботой и вниманием к деталям,<br>служба заботы о клиентах
+                </p>
+              </div>
+            </td>
+          </tr>
+
+          <!-- 6. Подвал с поддержкой и адресом получателя -->
+          <tr>
+            <td bgcolor="#F6FBFA" style="padding:22px 32px;background-color:#F6FBFA;border-top:1px solid #E3EFEF;border-bottom-left-radius:14px;border-bottom-right-radius:14px;">
+              <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0">
+                <tr>
+                  <td style="font-family:Tahoma,sans-serif;font-size:13px;line-height:1.5;color:#5A7E8C;text-align:center;">
+                    Если у вас есть пожелания или вопросы, ответьте на это письмо или напишите нам на <a href="mailto:{{supportEmail}}" style="color:#157366;text-decoration:underline;font-weight:bold;">{{supportEmail}}</a>.
+                  </td>
+                </tr>
+                <tr>
+                  <td style="font-family:Tahoma,sans-serif;font-size:12px;line-height:1.4;color:#8AA4AF;text-align:center;padding-top:10px;">
+                    Это уведомление сформировано автоматически для адреса {{email}}
+                  </td>
+                </tr>
+              </table>
+            </td>
+          </tr>
+
+        </table>
+      </td>
+    </tr>
+  </table>
+</body>
+</html>

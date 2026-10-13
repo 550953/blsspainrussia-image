@@ -16,6 +16,7 @@ from .config import BETTERSTACK_BEARER, BETTERSTACK_ENABLED, BETTERSTACK_SERVICE
 JOB_STATS = Counter()
 TEMPLATE_RUNS: deque = deque(maxlen=2000)
 TEMPLATE_STATS = Counter()
+TEMPLATE_API_CALLS: deque = deque(maxlen=20000)
 TEMPLATE_STATS["date_utc"] = time.strftime("%Y-%m-%d", time.gmtime())
 TEMPLATE_PROXY_ERROR_CATEGORIES = (
     "proxy_preflight_failed", "generation_timeout", "proxy_unavailable",
@@ -142,6 +143,34 @@ def _percentile(values: list, q: float) -> Optional[int]:
         return None
     ordered = sorted(values)
     return int(ordered[min(len(ordered) - 1, int(round(q * (len(ordered) - 1))))])
+
+
+def record_template_api_call(fields: dict) -> None:
+    """Keep only bounded, secret-free timing fields for actual template API calls."""
+    row = {
+        "ts": time.time(),
+        "n": int(fields.get("n") or 0),
+        "wait_ocr_ms": max(0, int(fields.get("wait_ocr_ms") or 0)),
+        "wait_key_ms": max(0, int(fields.get("wait_key_ms") or 0)),
+        "preflight_ms": max(0, int(fields.get("preflight_ms") or 0)),
+        "call_ms": max(0, int(fields.get("call_ms") or 0)),
+        "key_name": str(fields.get("key_name") or "")[:128],
+        "proxy": str(fields.get("proxy") or "DIRECT")[:160],
+        "model": str(fields.get("model") or "")[:100],
+        "outcome": str(fields.get("outcome") or "unknown")[:40],
+        "http_status": fields.get("http_status"),
+    }
+    TEMPLATE_API_CALLS.append(row)
+
+
+def template_success_p50_ms(model: str) -> Optional[int]:
+    cutoff = time.time() - 86400
+    values = [
+        item["call_ms"] for item in TEMPLATE_API_CALLS
+        if item["ts"] >= cutoff and item["model"] == str(model)
+        and item["outcome"] == "success" and item["call_ms"] > 0
+    ][-200:]
+    return _percentile(values, 0.5)
 
 
 def _utc_iso(timestamp: Optional[float] = None) -> str:

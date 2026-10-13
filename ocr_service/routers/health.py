@@ -22,7 +22,7 @@ from ..config import (
     TEMPLATE_ENABLED,
     TEMPLATE_MAX_CONCURRENCY,
     TEMPLATE_MODELS,
-    TEMPLATE_RESERVE_KEYS_FOR_OCR, TEMPLATE_DAILY_CAP,
+    TEMPLATE_RESERVE_KEYS_FOR_OCR, TEMPLATE_DAILY_CAP, TEMPLATE_API_KEY_WARNINGS,
 )
 from ..jobs import JOB_RESULT_TTL_SECONDS, JOBS, _cleanup_expired_jobs
 from ..key_pool import GEMINI_KEYS, gemini_model_name, gemini_pool
@@ -88,6 +88,7 @@ async def health():
     }
     if TEMPLATE_ENABLED:
         from ..email_template.prompt import PROMPT_VERSION
+        from ..email_template.runner import slow_route_penalty_count
         from ..routers.template import TEMPLATE_JOBS, _BREAKER_UNTIL, effective_concurrency
         from ..telemetry import TEMPLATE_PROXY_ERROR_CATEGORIES, TEMPLATE_STATS
         result["template"] = {
@@ -106,6 +107,8 @@ async def health():
             },
             "breaker_open": time.monotonic() < _BREAKER_UNTIL,
             "prompt_version": PROMPT_VERSION,
+            "slow_route_penalties": slow_route_penalty_count(),
+            "warnings": list(TEMPLATE_API_KEY_WARNINGS),
         }
     return result
 
