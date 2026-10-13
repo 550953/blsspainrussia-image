@@ -7,6 +7,7 @@ BETTERSTACK_FORCE_RENDER_kj123664=true: значение Render главнее I
 """
 import os
 import time
+import math
 from pathlib import Path
 from typing import Optional
 
@@ -124,6 +125,66 @@ for _part in os.getenv("GEMINI_MODEL_KEYS", "").split(";"):
 # На сколько секунд модель считается перегруженной после 503/500/504.
 GEMINI_MODEL_COOLDOWN = float(os.getenv("GEMINI_MODEL_COOLDOWN", "30"))
 GEMINI_ACQUIRE_POLL = 0.15
+
+# ---------------------------------------------------------------------------
+# Генерация HTML-писем (функция отключена по умолчанию)
+# ---------------------------------------------------------------------------
+def _template_int(name: str, default: int, minimum: int = 0) -> int:
+    try:
+        value = int(os.getenv(name, str(default)))
+        return max(minimum, value)
+    except (TypeError, ValueError, OverflowError):
+        return default
+
+
+def _template_float(name: str, default: float, minimum: float = 0.0) -> float:
+    try:
+        value = float(os.getenv(name, str(default)))
+        return max(minimum, value) if math.isfinite(value) else default
+    except (TypeError, ValueError, OverflowError):
+        return default
+
+
+TEMPLATE_ENABLED = os.getenv("TEMPLATE_ENABLED", "0").strip().lower() in {"1", "true", "yes", "on"}
+TEMPLATE_API_KEYS, _TEMPLATE_API_KEYS_SOURCE = _config_secret("TEMPLATE_API_KEYS")
+TEMPLATE_API_KEYS = [item.strip() for item in TEMPLATE_API_KEYS.split(",") if item.strip()]
+TEMPLATE_MODELS = [item.strip() for item in os.getenv("TEMPLATE_MODELS", "").split(",") if item.strip()]
+TEMPLATE_MAX_CONCURRENCY = _template_int("TEMPLATE_MAX_CONCURRENCY", 1, 1)
+TEMPLATE_RESERVE_KEYS_FOR_OCR = _template_int("TEMPLATE_RESERVE_KEYS_FOR_OCR", 1, 0)
+TEMPLATE_YIELD_TO_OCR = os.getenv("TEMPLATE_YIELD_TO_OCR", "1").strip().lower() not in {"0", "false", "no"}
+TEMPLATE_MAX_ATTEMPTS = min(5, _template_int("TEMPLATE_MAX_ATTEMPTS", 3, 1))
+TEMPLATE_INFRA_RETRIES = _template_int("TEMPLATE_INFRA_RETRIES", 4, 1)
+TEMPLATE_JOB_DEADLINE_SECONDS = _template_float("TEMPLATE_JOB_DEADLINE_SECONDS", 420, 45)
+TEMPLATE_QUEUE_MAX_WAIT_SECONDS = _template_float("TEMPLATE_QUEUE_MAX_WAIT_SECONDS", 300, 1)
+TEMPLATE_MIN_ATTEMPT_SECONDS = _template_float("TEMPLATE_MIN_ATTEMPT_SECONDS", 90, 1)
+TEMPLATE_DEADLINE_MARGIN = _template_float("TEMPLATE_DEADLINE_MARGIN", 5, 0)
+TEMPLATE_MIN_CALL_SECONDS = _template_float("TEMPLATE_MIN_CALL_SECONDS", 45, 1)
+TEMPLATE_RESULT_TTL_SECONDS = _template_int("TEMPLATE_RESULT_TTL_SECONDS", 3600, 60)
+TEMPLATE_MAX_PENDING = _template_int("TEMPLATE_MAX_PENDING", 3, 1)
+TEMPLATE_DAILY_CAP = _template_int("TEMPLATE_DAILY_CAP", 100, 1)
+TEMPLATE_DAILY_TOKEN_CAP = _template_int("TEMPLATE_DAILY_TOKEN_CAP", 1500000, 1000)
+TEMPLATE_BREAKER_FAILS = _template_int("TEMPLATE_BREAKER_FAILS", 5, 1)
+TEMPLATE_BREAKER_PAUSE_SECONDS = _template_int("TEMPLATE_BREAKER_PAUSE_SECONDS", 120, 1)
+TEMPLATE_MAX_HTML_BYTES = _template_int("TEMPLATE_MAX_HTML_BYTES", 300000, 1024)
+TEMPLATE_HTML_ERROR_BYTES = _template_int("TEMPLATE_HTML_ERROR_BYTES", 98000, 1024)
+TEMPLATE_MAX_OUTPUT_TOKENS = _template_int("TEMPLATE_MAX_OUTPUT_TOKENS", 16384, 1024)
+TEMPLATE_TEMPERATURE = _template_float("TEMPLATE_TEMPERATURE", 1.0)
+TEMPLATE_REPAIR_TEMPERATURE = _template_float("TEMPLATE_REPAIR_TEMPERATURE", 0.4)
+TEMPLATE_THINKING_BUDGET = _template_int("TEMPLATE_THINKING_BUDGET", 0, 0) or None
+TEMPLATE_HTTP_READ_TIMEOUT = _template_float("TEMPLATE_HTTP_READ_TIMEOUT", 130, 15)
+TEMPLATE_CONNECT_TIMEOUT = _template_float("TEMPLATE_CONNECT_TIMEOUT", 8, 1)
+TEMPLATE_HARD_TIMEOUT = _template_float("TEMPLATE_HARD_TIMEOUT", 150, 15)
+TEMPLATE_LEASE_TTL = max(TEMPLATE_HARD_TIMEOUT + 30, _template_float("TEMPLATE_LEASE_TTL", 180, 1))
+TEMPLATE_MODEL_COOLDOWN = _template_float("TEMPLATE_MODEL_COOLDOWN", 60, 1)
+TEMPLATE_QUOTA_BLOCK_SECONDS = _template_int("TEMPLATE_QUOTA_BLOCK_SECONDS", 900, 60)
+TEMPLATE_CONTRAST_SUGGEST = os.getenv("TEMPLATE_CONTRAST_SUGGEST", "1").strip().lower() not in {"0", "false", "no"}
+TEMPLATE_HISTORY = _template_int("TEMPLATE_HISTORY", 12, 1)
+TEMPLATE_STORE_MAX = _template_int("TEMPLATE_STORE_MAX", 100, 1)
+TEMPLATE_VALIDATE_RATE_PER_MIN = _template_int("TEMPLATE_VALIDATE_RATE_PER_MIN", 30, 1)
+TEMPLATE_SUBMIT_RATE_PER_MIN = _template_int("TEMPLATE_SUBMIT_RATE_PER_MIN", 20, 1)
+TEMPLATE_DISABLED_RULES = {
+    item.strip().upper() for item in os.getenv("TEMPLATE_DISABLED_RULES", "").split(",") if item.strip()
+}
 
 # ---------------------------------------------------------------------------
 # Contact sheet

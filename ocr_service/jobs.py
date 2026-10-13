@@ -166,9 +166,13 @@ def _watchdog_tick() -> dict:
             # Таска уже нет, а статус не финальный: пометить, чтобы не висело вечно.
             _finish_job_error(job, "watchdog: задание потеряно (нет активной задачи)")
             killed += 1
-    reaped = gemini_pool.reap_stale()
+    reaped = gemini_pool.reap_stale_detailed()
     if reaped:
-        _job_log("watchdog_key_reaped", keys=reaped, ttl_seconds=gemini_pool_lease_ttl())
+        _job_log(
+            "watchdog_key_reaped",
+            keys=[name for name, _ttl in reaped],
+            leases=[{"key": name, "ttl_seconds": ttl} for name, ttl in reaped],
+        )
     return {"killed": killed, "keys_reaped": len(reaped)}
 
 
@@ -280,3 +284,23 @@ async def _run_job_inner(job_id: str, images: List[str]) -> None:
                 result_ttl_seconds=JOB_RESULT_TTL_SECONDS,
                 **_job_queue_metrics(job_id, job, finished_at),
             )
+
+
+async def _run_registered_ocr(job_id: str, payload: dict) -> None:
+    await _run_job_inner(job_id, payload.get("images") or [])
+
+
+from .task_kinds import TaskKind, register
+
+register(TaskKind(
+    name="ocr_sheet",
+    runner=_run_registered_ocr,
+    deadline_s=lambda: JOB_MAX_SECONDS,
+    deadline_from="created",
+    queue_max_wait_s=0,
+    watchdog_grace_s=0,
+    result_ttl_s=lambda: JOB_RESULT_TTL_SECONDS,
+    max_concurrency=lambda: max(len(GEMINI_KEYS), 1),
+    store_max=lambda: 0,
+    stats_prefix="",
+))

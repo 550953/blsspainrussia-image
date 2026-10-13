@@ -77,6 +77,8 @@ def _classify_gemini_http_error(http_status: int, provider_status: str, message:
         return {
             "category": "RATE_LIMIT_OR_QUOTA",
             "cooldown_seconds": max(30.0, retry_after) + random.uniform(0.0, 3.0),
+            "retry_delay_seconds": retry_after,
+            "daily_quota": retry_after > 120 or "per day" in text or "daily" in text,
             "permanent_key_failure": False,
             "hold_until_restart": False,
             "action": "temporary_key_pause; no proxy cooldown",
@@ -120,6 +122,8 @@ class GeminiAPIError(RuntimeError):
         self.message = _safe_gemini_message(message)
         self.category = str(policy.get("category") or "API_RESPONSE_ERROR")
         self.cooldown_seconds = float(policy.get("cooldown_seconds") or 0.0)
+        self.retry_delay_seconds = float(policy.get("retry_delay_seconds") or 0.0)
+        self.daily_quota = bool(policy.get("daily_quota"))
         self.permanent_key_failure = bool(policy.get("permanent_key_failure"))
         self.hold_until_restart = bool(policy.get("hold_until_restart"))
         self.action = str(policy.get("action") or "")

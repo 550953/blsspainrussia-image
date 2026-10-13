@@ -1,0 +1,53 @@
+{
+  "top_keys": [
+    "attempts",
+    "clients",
+    "config",
+    "counters",
+    "jobs",
+    "keys",
+    "model",
+    "models",
+    "now",
+    "pid",
+    "proxies",
+    "quality",
+    "queue",
+    "recent_errors",
+    "supabase",
+    "timeline",
+    "uptime_s",
+    "window_s"
+  ],
+  "keys": {
+    "total": 0,
+    "usable": 0,
+    "by_state": {},
+    "list": []
+  },
+  "queue": {
+    "pending": 0,
+    "running": 0,
+    "max_concurrency": 1,
+    "in_memory": 0,
+    "result_ttl_s": 300
+  },
+  "attempts": {
+    "ok": 0,
+    "api_err": 0,
+    "n429": 0,
+    "proxy_err": 0,
+    "total": 0,
+    "ok_pct": null
+  },
+  "quality": {
+    "cells": 0,
+    "first_pass_zero": 0,
+    "variant_saved": 0,
+    "dddd_used": 0,
+    "dddd_saved": 0,
+    "final_zero": 0,
+    "all_zero_jobs_total": 0
+  },
+  "has_template_fields": false
+}

@@ -1,0 +1,13 @@
+{
+  "status": "error",
+  "stage": "finished",
+  "queue_position": null,
+  "queued_jobs": 0,
+  "running_jobs": 0,
+  "max_concurrency": 1,
+  "job_age_ms": "<TIME>",
+  "queue_wait_ms": "<TIME>",
+  "processing_ms": "<TIME>",
+  "results": null,
+  "error": "upstream unavailable"
+}

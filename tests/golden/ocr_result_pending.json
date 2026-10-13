@@ -1,0 +1,13 @@
+{
+  "status": "pending",
+  "stage": "queued",
+  "queue_position": 1,
+  "queued_jobs": 1,
+  "running_jobs": 0,
+  "max_concurrency": 1,
+  "job_age_ms": "<TIME>",
+  "queue_wait_ms": "<TIME>",
+  "processing_ms": null,
+  "results": null,
+  "error": null
+}

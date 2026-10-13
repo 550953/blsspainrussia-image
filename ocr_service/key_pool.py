@@ -3,7 +3,10 @@ import os
 import time
 from typing import List, Optional
 
-from .config import GEMINI_MODEL, GEMINI_MODELS, GEMINI_MODEL_COOLDOWN, GEMINI_MODEL_KEYS, _read_infisical_secrets_once
+from .config import (
+    GEMINI_MODEL, GEMINI_MODELS, GEMINI_MODEL_COOLDOWN, GEMINI_MODEL_KEYS,
+    TEMPLATE_MODEL_COOLDOWN, TEMPLATE_QUOTA_BLOCK_SECONDS, _read_infisical_secrets_once,
+)
 from .gemini_errors import GeminiAPIError, set_known_keys
 
 
@@ -33,10 +36,13 @@ class GeminiKeyPool:
         self.last_used: List[float] = []
         self.reserved_at: List[float] = []
         self.last_error: List[Optional[dict]] = []
+        self.lease_ttl: List[float] = []
         self.blackout_until: float = 0.0
         self.rr_index: int = 0
         self.model_blocked_until: dict = {}
         self.model_unavailable: set = set()   # (idx, model): модель закрыта для этого ключа (404)
+        self.key_model_blocked: dict = {}     # (idx, model) -> monotonic deadline
+        self.key_model_daily_blocked: dict = {}  # (idx, model) -> daily quota deadline (template calls)
 
     def init_from_env(self, prefix: str = "GEMINI_API_KEY") -> None:
         seen = set()
@@ -68,6 +74,7 @@ class GeminiKeyPool:
         self.last_used = [0.0] * len(keys)
         self.reserved_at = [0.0] * len(keys)
         self.last_error = [None] * len(keys)
+        self.lease_ttl = [KEY_LEASE_TTL] * len(keys)
         self.blackout_until = 0.0
         self.rr_index = 0
         print(f"[pid={os.getpid()}] Gemini pool: инициализирован, {len(keys)} ключ(ей)")
@@ -82,27 +89,47 @@ class GeminiKeyPool:
         category = (self.last_error[idx] or {}).get("category")
         return category in self._BILLING_HOLD_CATEGORIES or category in self._PROJECT_HOLD_CATEGORIES
 
-    def acquire(self) -> tuple:
+    def acquire(self, lease_ttl: Optional[float] = None, reserve: int = 0, model_chain=None,
+                respect_key_cooldown: bool = False) -> tuple:
         """Резервирует следующий свободный ключ по кругу. (None, None), если свободных нет."""
         if not self.keys:
             return None, None
         n = len(self.keys)
         now = time.monotonic()
+        reserve = max(0, int(reserve or 0))
+        eligible = [
+            i for i in range(n)
+            if not self.dead[i] and not self._is_operator_hold(i)
+            and not self.reserved[i] and now >= self.blocked[i]
+        ]
+        if len(eligible) <= reserve:
+            return None, None
         for _ in range(n):
             idx = self.rr_index % n
             self.rr_index += 1
-            if not self.dead[idx] and not self.reserved[idx] and now >= self.blocked[idx]:
+            if idx in eligible:
+                # OCR keeps its historical model routing when no explicit chain is requested.
+                # Template requests pass a chain and obey per-key model access/quota controls.
+                if model_chain is not None and not any(
+                    self.model_allowed(idx, name, respect_key_cooldown) for name in model_chain
+                ):
+                    continue
                 self.reserved[idx] = True
                 self.reserved_at[idx] = now
                 self.last_used[idx] = now
+                self.lease_ttl[idx] = max(1.0, float(lease_ttl or KEY_LEASE_TTL))
                 return idx, self.key_names[idx]
         return None, None
 
-    def model_allowed(self, idx: Optional[int], model: str) -> bool:
+    def model_allowed(self, idx: Optional[int], model: str, respect_key_cooldown: bool = False) -> bool:
         """Можно ли этому ключу работать с моделью (ограничение GEMINI_MODEL_KEYS и 404-память)."""
         if idx is None:
             return True
         if (idx, model) in self.model_unavailable:
+            return False
+        if respect_key_cooldown and time.monotonic() < self.key_model_daily_blocked.get((idx, model), 0.0):
+            return False
+        if respect_key_cooldown and time.monotonic() < self.key_model_blocked.get((idx, model), 0.0):
             return False
         prefixes = GEMINI_MODEL_KEYS.get(model)
         return prefixes is None or any(self.key_names[idx].startswith(p) for p in prefixes)
@@ -112,15 +139,23 @@ class GeminiKeyPool:
             self.model_unavailable.add((idx, model))
             print(f"[pid={os.getpid()}][gemini_model] {model} недоступна ключу {self.key_names[idx]} (404), больше не пробую", flush=True)
 
-    def pick_model(self, idx: Optional[int] = None) -> str:
+    def pick_model(self, idx: Optional[int] = None, chain=None, respect_key_cooldown: bool = False) -> str:
         """Первая допустимая для ключа модель цепочки, не помеченная перегруженной.
         Если перегружены все, берётся та, что освободится раньше (запросы не блокируются)."""
-        candidates = [m for m in GEMINI_MODELS if self.model_allowed(idx, m)] or list(GEMINI_MODELS)
+        model_chain = list(chain or GEMINI_MODELS)
+        candidates = [m for m in model_chain if self.model_allowed(idx, m, respect_key_cooldown)] or model_chain
         now = time.monotonic()
         for model in candidates:
-            if now >= self.model_blocked_until.get(model, 0.0):
+            until = self.model_blocked_until.get(model, 0.0)
+            if respect_key_cooldown:
+                until = max(until, self.key_model_blocked.get((idx, model), 0.0))
+            if now >= until:
                 return model
-        return min(candidates, key=lambda m: self.model_blocked_until.get(m, 0.0))
+        return min(
+            candidates,
+            key=lambda m: max(self.model_blocked_until.get(m, 0.0),
+                              self.key_model_blocked.get((idx, m), 0.0) if respect_key_cooldown else 0.0),
+        )
 
     def mark_model_overloaded(self, model: str, seconds: Optional[float] = None) -> None:
         seconds = GEMINI_MODEL_COOLDOWN if seconds is None else seconds
@@ -141,18 +176,39 @@ class GeminiKeyPool:
 
     def reap_stale(self, max_age: Optional[float] = None) -> List[str]:
         """Снять аренды старше max_age (потерянные). Возвращает имена снятых ключей."""
-        max_age = KEY_LEASE_TTL if max_age is None else max_age
+        return [name for name, _ttl in self.reap_stale_detailed(max_age)]
+
+    def reap_stale_detailed(self, max_age: Optional[float] = None) -> list:
+        """Снять аренды и вернуть (имя, фактический TTL) для безопасной диагностики."""
         now = time.monotonic()
         reaped = []
         for idx, held in enumerate(self.reserved):
-            if held and now - self.reserved_at[idx] > max_age:
+            effective_age = (self.lease_ttl[idx] if idx < len(self.lease_ttl) else KEY_LEASE_TTL) if max_age is None else max_age
+            if held and now - self.reserved_at[idx] > effective_age:
                 self.reserved[idx] = False
-                reaped.append(self.key_names[idx])
+                reaped.append((self.key_names[idx], float(effective_age)))
         return reaped
 
-    def release(self, idx: int, error: Optional[GeminiAPIError] = None) -> dict:
+    def release(self, idx: int, error: Optional[GeminiAPIError] = None, model: Optional[str] = None) -> dict:
         self.reserved[idx] = False
         key_name = self.key_names[idx] if idx < len(self.key_names) else f"key_{idx}"
+        if error is not None and model and error.category == "RATE_LIMIT_OR_QUOTA":
+            now = time.monotonic()
+            if getattr(error, "daily_quota", False):
+                hold = TEMPLATE_QUOTA_BLOCK_SECONDS
+                self.key_model_daily_blocked[(idx, model)] = max(
+                    self.key_model_daily_blocked.get((idx, model), 0.0), now + hold
+                )
+            else:
+                hold = max(TEMPLATE_MODEL_COOLDOWN, getattr(error, "retry_delay_seconds", 0.0))
+            self.key_model_blocked[(idx, model)] = max(
+                self.key_model_blocked.get((idx, model), 0.0),
+                now + hold,
+            )
+            return {
+                "state": "MODEL_COOLDOWN", "cooldown_seconds": hold,
+                "model": model, "daily_quota": bool(getattr(error, "daily_quota", False)),
+            }
         if error is None:
             self.blocked[idx] = 0.0
             self.dead[idx] = False

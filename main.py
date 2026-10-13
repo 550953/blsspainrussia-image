@@ -1,4 +1,4 @@
-"""Digit OCR Service v4.6 (Gemini contact sheet + очередь заданий + защищённый /status).
+"""Digit OCR Service v4.7 (Gemini contact sheet + email templates + защищённый /status).
 
 Точка входа: uvicorn main:app. Вся логика лежит в пакете ocr_service/:
 
@@ -33,6 +33,7 @@ from ocr_service.config import (  # config первым: тут PROCESS_START_TI
     STARTUP_TIMING_FILE,
     STATUS_PASSWORD,
     STATUS_USER,
+    TEMPLATE_ENABLED,
 )
 from ocr_service import jobs, telemetry
 from ocr_service.dddd_ocr import EXECUTOR
@@ -40,12 +41,15 @@ from ocr_service.gemini_client import close_http_clients
 from ocr_service.key_pool import GEMINI_KEYS
 from ocr_service.routers import health, ocr, status
 
-app = FastAPI(title="Digit OCR Service", version="4.6")
+app = FastAPI(title="Digit OCR Service", version="4.7")
 
 # Порядок как в исходнике: /status, /ocr/*, /health, /favicon.ico
 app.include_router(status.router)
 app.include_router(ocr.router)
 app.include_router(health.router)
+if TEMPLATE_ENABLED:
+    from ocr_service.routers import template
+    app.include_router(template.router)
 
 
 @app.on_event("startup")

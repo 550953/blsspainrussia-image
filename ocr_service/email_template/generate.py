@@ -1,0 +1,286 @@
+"""Асинхронная генерация письма, валидация и ограниченный цикл ремонта."""
+import asyncio
+import hashlib
+import re
+import time
+from datetime import datetime, timezone
+
+from ..config import (
+    TEMPLATE_DAILY_TOKEN_CAP, TEMPLATE_MAX_ATTEMPTS, TEMPLATE_MAX_HTML_BYTES, TEMPLATE_MAX_OUTPUT_TOKENS,
+    TEMPLATE_MIN_ATTEMPT_SECONDS, TEMPLATE_REPAIR_TEMPERATURE, TEMPLATE_RESULT_TTL_SECONDS,
+    TEMPLATE_TEMPERATURE, TEMPLATE_THINKING_BUDGET,
+)
+from ..telemetry import TEMPLATE_STATS, _job_log, ensure_template_day, record_template_run, record_template_usage
+from . import autofix
+from .extract import parse
+from .prompt import PROMPT_VERSION, build_repair_message, build_user_message, base_prompt, prompt_sha1
+from .runner import GenerationDeadline, TemplateGenerationError, generate as call_model
+from .validator import validate
+
+
+async def run_template_job(job_id: str, job: dict):
+    job["status"] = "running"
+    job["stage"] = "generating"
+    job["started_at"] = time.time()
+    _job_log("tpl_started", job_id, component="email_template", attempt=1, model=job.get("model"))
+    started = time.monotonic()
+    deadline_ts = started + max(1.0, float(job.get("deadline_s", 420)) - 10.0)
+    job["deadline_monotonic"] = deadline_ts
+    system = base_prompt()
+    initial = build_user_message(job["brief"])
+    contents = [{"role": "user", "parts": [{"text": initial}]}]
+    history = []
+    attempts = []
+    best = None
+    generation_error = None
+    no_progress = 0
+    max_attempts = int(job.get("max_attempts") or TEMPLATE_MAX_ATTEMPTS)
+    try:
+        for number in range(1, max_attempts + 1):
+            remaining = deadline_ts - time.monotonic()
+            if number > 1 and remaining < TEMPLATE_MIN_ATTEMPT_SECONDS:
+                break
+            if remaining <= 0:
+                break
+            job["stage"] = "generating" if number == 1 else "repairing"
+            job["attempt"] = number
+            generation_config = {
+                "temperature": TEMPLATE_TEMPERATURE if number == 1 else TEMPLATE_REPAIR_TEMPERATURE,
+                "maxOutputTokens": TEMPLATE_MAX_OUTPUT_TOKENS,
+            }
+            if TEMPLATE_THINKING_BUDGET:
+                generation_config["thinkingConfig"] = {"thinkingBudget": TEMPLATE_THINKING_BUDGET}
+            call_started = time.monotonic()
+            try:
+                text, metadata, model = await call_model(
+                    contents, system, [job.get("model")] if job.get("model") else job["models"],
+                    job_id, generation_config, deadline_ts=deadline_ts,
+                )
+            except GenerationDeadline:
+                generation_error = "deadline"
+                attempts.append({
+                    "n": number, "model": job.get("model") or "",
+                    "latency_ms": round((time.monotonic() - call_started) * 1000),
+                    "finish_reason": "DEADLINE", "tokens": {"in": 0, "out": 0, "thoughts": 0, "cached": 0},
+                    "raw_errors": [], "autofixes": [], "errors": [], "warnings": [],
+                })
+                break
+            except TemplateGenerationError as exc:
+                generation_error = exc.code
+                attempts.append({
+                    "n": number, "model": job.get("model") or "",
+                    "latency_ms": round((time.monotonic() - call_started) * 1000),
+                    "finish_reason": exc.code.upper(),
+                    "tokens": {"in": 0, "out": 0, "thoughts": 0, "cached": 0},
+                    "raw_errors": [], "autofixes": [], "errors": [], "warnings": [],
+                })
+                break
+            latency_ms = round((time.monotonic() - call_started) * 1000)
+            usage = metadata.get("usage", {})
+            record_template_usage(usage)
+            _job_log(
+                "tpl_gemini_attempt", job_id, component="email_template", attempt=number,
+                model=model, latency_ms=latency_ms, tokens=usage,
+            )
+            parsed = parse(text, metadata.get("finish_reason", ""), metadata.get("prompt_block_reason", ""))
+            if parsed.html and not re.search(
+                r"№\s*" + str(job["brief"]["currency_method"]) + r"\b",
+                parsed.tail,
+                re.I,
+            ):
+                parsed.warnings.append({
+                    "rule": "V10",
+                    "message": "Строка после HTML должна указывать выбранный способ оформления валюты",
+                })
+            raw_html = parsed.html
+            fixes = []
+            report = None
+            raw_report = None
+            output_bytes = len(raw_html.encode("utf-8"))
+            if raw_html and output_bytes > TEMPLATE_MAX_HTML_BYTES:
+                parsed.errors.append({
+                    "rule": "T23",
+                    "message": "Размер HTML превышает установленный лимит; содержимое не сохраняется",
+                })
+                raw_html = ""
+            if raw_html and len(raw_html.encode("utf-8")) <= TEMPLATE_MAX_HTML_BYTES:
+                job["stage"] = "validating"
+                if len(raw_html.encode("utf-8")) > 40000:
+                    fixed, fixes = await asyncio.to_thread(autofix.apply, raw_html)
+                    raw_report = await asyncio.to_thread(validate, raw_html, job["brief"]["currency_method"])
+                    after = await asyncio.to_thread(validate, fixed, job["brief"]["currency_method"])
+                else:
+                    fixed, fixes = autofix.apply(raw_html)
+                    raw_report = validate(raw_html, job["brief"]["currency_method"])
+                    after = validate(fixed, job["brief"]["currency_method"])
+                if len(after.errors) > len(raw_report.errors):
+                    fixed, fixes, after = raw_html, [], raw_report
+                report = after
+                if fixes:
+                    _job_log("tpl_autofix", job_id, component="email_template", attempt=number, fix_ids=fixes)
+            report_errors = [dict(rule=x["rule"], message=x["message"], where=x.get("where", "")) for x in parsed.errors]
+            raw_errors = list(report_errors)
+            if raw_report is not None:
+                raw_errors.extend(
+                    {"rule": issue.rule, "message": issue.message, "where": issue.where}
+                    for issue in raw_report.errors
+                )
+            if report is not None:
+                report_errors.extend({"rule": issue.rule, "message": issue.message, "where": issue.where} for issue in report.errors)
+            report_warnings = list(parsed.warnings)
+            if report is not None:
+                report_warnings.extend({"rule": issue.rule, "message": issue.message, "where": issue.where} for issue in report.warnings)
+            current = {
+                "n": number, "model": model, "latency_ms": latency_ms,
+                "finish_reason": metadata.get("finish_reason", ""),
+                "tokens": metadata.get("usage", {}),
+                "raw_errors": sorted(set(issue["rule"] for issue in raw_errors)),
+                "autofixes": fixes, "errors": sorted(set(issue["rule"] for issue in report_errors)),
+                "warnings": sorted(set(issue["rule"] for issue in report_warnings)),
+            }
+            attempts.append(current)
+            if number > 1 and len(current["errors"]) >= len(attempts[-2].get("errors", [])):
+                no_progress += 1
+            else:
+                no_progress = 0
+            valid = bool(report is not None and report.ok and not parsed.errors)
+            result = {
+                "html": fixed if report is not None else raw_html,
+                "bytes": len((fixed if report is not None else raw_html).encode("utf-8")),
+                "sha1": hashlib.sha1((fixed if report is not None else raw_html).encode("utf-8")).hexdigest(),
+                "valid": valid,
+                "concept": parsed.concept,
+                "brief": {key: value for key, value in job["brief"].items() if key != "avoid_palettes"},
+                "prompt_version": PROMPT_VERSION,
+                "prompt_sha1": prompt_sha1(),
+                "model": model,
+                "attempts": list(attempts),
+                "report": report.to_dict() if report is not None else {
+                    "ok": False, "errors": report_errors, "warnings": report_warnings,
+                    "stats": {"bytes": output_bytes},
+                },
+                "tail": parsed.tail,
+            }
+            score = (len(report_errors), len(report_warnings), number)
+            if best is None or score < best[0]:
+                best = (score, result)
+            # Keep the best completed attempt available while repairs continue.
+            # A router timeout or cancellation must not erase useful HTML.
+            if best is not None:
+                best[1]["attempts"] = list(attempts)
+                job["template"] = best[1]
+            _job_log(
+                "tpl_validated", job_id, component="email_template", attempt=number,
+                model=model, bytes=len((result["html"] or "").encode("utf-8")),
+                valid=valid, rule_ids=current["errors"][:20],
+            )
+            if valid:
+                break
+            if no_progress >= 2:
+                generation_error = "repair_no_progress"
+                break
+            ensure_template_day()
+            token_usage = sum(int(TEMPLATE_STATS.get(key, 0)) for key in ("tokens_in", "tokens_out", "tokens_thoughts"))
+            if token_usage >= TEMPLATE_DAILY_TOKEN_CAP:
+                break
+            if number < max_attempts and report_errors:
+                priority = {"T": 0, "S": 0, "V": 0, "L": 1, "A": 2, "X": -1}
+                report_errors.sort(key=lambda issue: (priority.get(issue["rule"][:1], 3), issue["rule"]))
+                repair = build_repair_message(
+                    report_errors,
+                    any(x["rule"] == "X02" for x in parsed.errors),
+                )
+                if any(x["rule"] == "X03" for x in parsed.errors):
+                    history = []
+                    contents = [{"role": "user", "parts": [{"text": initial + "\n\n" + repair}]}]
+                else:
+                    _job_log(
+                        "tpl_repair", job_id, component="email_template", attempt=number,
+                        rule_ids=sorted(set(issue["rule"] for issue in report_errors))[:12],
+                    )
+                    history.extend([
+                        {"role": "model", "parts": [{"text": text}]},
+                        {"role": "user", "parts": [{"text": repair}]},
+                    ])
+                    contents = [{"role": "user", "parts": [{"text": initial}]}] + history
+            else:
+                break
+        finished = time.time()
+        if best:
+            result = best[1]
+            result["attempts"] = attempts
+            if generation_error:
+                result["generation_error"] = generation_error
+            job["template"] = result
+            job["status"] = "done"
+            job["stage"] = "finished"
+            job["finished_at"] = finished
+            job["expires_at"] = finished + TEMPLATE_RESULT_TTL_SECONDS
+            _job_log("tpl_done", job_id, component="email_template", valid=result["valid"], attempts=len(attempts),
+                     bytes=len((result["html"] or "").encode("utf-8")))
+            record_template_run(job)
+        else:
+            job["status"] = "error"
+            job["stage"] = "finished"
+            job["error"] = generation_error or ("deadline" if time.monotonic() >= deadline_ts else "generation_failed")
+            job["finished_at"] = finished
+            job["expires_at"] = finished + TEMPLATE_RESULT_TTL_SECONDS
+            _job_log("tpl_error", job_id, component="email_template", error=job["error"])
+            record_template_run(job, job["error"])
+    except asyncio.TimeoutError:
+        error_code = "deadline"
+        if job.get("template"):
+            job["template"]["generation_error"] = error_code
+            job["status"] = "done"
+            job["error"] = None
+            _job_log("tpl_done", job_id, component="email_template",
+                     valid=job["template"].get("valid", False),
+                     attempts=len(job["template"].get("attempts", [])),
+                     bytes=len((job["template"].get("html") or "").encode("utf-8")))
+            record_template_run(job)
+        else:
+            job["status"] = "error"
+            job["error"] = error_code
+            record_template_run(job, error_code)
+        job["stage"] = "finished"
+        job["finished_at"] = time.time()
+        job["expires_at"] = job["finished_at"] + TEMPLATE_RESULT_TTL_SECONDS
+    except asyncio.CancelledError:
+        if job.get("template"):
+            job["template"]["generation_error"] = "cancelled"
+            job["status"] = "done"
+            job["error"] = None
+            _job_log("tpl_done", job_id, component="email_template",
+                     valid=job["template"].get("valid", False),
+                     attempts=len(job["template"].get("attempts", [])),
+                     bytes=len((job["template"].get("html") or "").encode("utf-8")))
+            record_template_run(job)
+        else:
+            job["status"] = "error"
+            job["error"] = "cancelled"
+            record_template_run(job, job["error"])
+        job["stage"] = "finished"
+        job["finished_at"] = time.time()
+        job["expires_at"] = job["finished_at"] + TEMPLATE_RESULT_TTL_SECONDS
+        raise
+    except Exception as exc:
+        job["stage"] = "finished"
+        if job.get("template"):
+            job["template"]["generation_error"] = "generation_unavailable"
+            job["status"] = "done"
+            job["error"] = None
+            record_template_run(job)
+        else:
+            job["status"] = "error"
+            # Не выдаём наружу текст исключения: там могут быть данные провайдера.
+            job["error"] = "generation_unavailable"
+            record_template_run(job, job["error"])
+        job["finished_at"] = time.time()
+        job["expires_at"] = job["finished_at"] + TEMPLATE_RESULT_TTL_SECONDS
+        if job.get("status") == "done":
+            _job_log("tpl_done", job_id, component="email_template",
+                     valid=job["template"].get("valid", False),
+                     attempts=len(job["template"].get("attempts", [])),
+                     bytes=len((job["template"].get("html") or "").encode("utf-8")))
+        else:
+            _job_log("tpl_error", job_id, component="email_template", error_type=type(exc).__name__)

@@ -14,6 +14,56 @@ import httpx
 from .config import BETTERSTACK_BEARER, BETTERSTACK_ENABLED, BETTERSTACK_SERVICE, BETTERSTACK_URL
 
 JOB_STATS = Counter()
+TEMPLATE_RUNS: deque = deque(maxlen=2000)
+TEMPLATE_STATS = Counter()
+TEMPLATE_STATS["date_utc"] = time.strftime("%Y-%m-%d", time.gmtime())
+
+
+def ensure_template_day() -> None:
+    today = time.strftime("%Y-%m-%d", time.gmtime())
+    if TEMPLATE_STATS.get("date_utc") != today:
+        for key in ("tokens_in", "tokens_out", "tokens_thoughts", "daily_tokens", "daily_jobs"):
+            TEMPLATE_STATS[key] = 0
+        TEMPLATE_STATS["date_utc"] = today
+
+
+def record_template_run(job: dict, error_code: str = "") -> None:
+    """Хранит только сводные показатели письма, не сам HTML или промпт."""
+    now = time.time()
+    ensure_template_day()
+    template = job.get("template") or {}
+    attempts = template.get("attempts") or []
+    token_in = sum(int(item.get("tokens", {}).get("in", 0) or 0) for item in attempts)
+    token_out = sum(int(item.get("tokens", {}).get("out", 0) or 0) for item in attempts)
+    token_thoughts = sum(int(item.get("tokens", {}).get("thoughts", 0) or 0) for item in attempts)
+    stats = template.get("report", {}).get("stats", {})
+    TEMPLATE_RUNS.append((
+        now, str(job.get("job_id", ""))[:8], bool(template.get("valid")),
+        len(attempts), int((job.get("finished_at", now) - job.get("started_at", now)) * 1000),
+        token_in, token_out, str(template.get("model", "")), int(stats.get("bytes", 0)),
+        error_code, tuple(
+            item.get("rule", "") for item in template.get("report", {}).get("errors", [])[:20]
+            if isinstance(item, dict)
+        ),
+    ))
+    if error_code:
+        TEMPLATE_STATS["tpl_error"] += 1
+    elif template.get("valid"):
+        TEMPLATE_STATS["tpl_done_valid"] += 1
+    else:
+        TEMPLATE_STATS["tpl_done_invalid"] += 1
+
+
+def record_template_usage(usage: dict) -> None:
+    """Учёт токенов сразу после ответа API: лимит действует между ремонтными попытками."""
+    ensure_template_day()
+    incoming = int(usage.get("in", 0) or 0)
+    outgoing = int(usage.get("out", 0) or 0)
+    thoughts = int(usage.get("thoughts", 0) or 0)
+    TEMPLATE_STATS["tokens_in"] += incoming
+    TEMPLATE_STATS["tokens_out"] += outgoing
+    TEMPLATE_STATS["tokens_thoughts"] += thoughts
+    TEMPLATE_STATS["daily_tokens"] += incoming + outgoing + thoughts
 
 ATTEMPTS: deque = deque(maxlen=20000)   # (ts, key, proxy, category, latency_ms, images, zeros, model)
 QUALITY: deque = deque(maxlen=20000)    # (ts, kind, n)
@@ -140,9 +190,30 @@ def betterstack_queue_size() -> int:
     return _BETTERSTACK_QUEUE.qsize() if _BETTERSTACK_QUEUE is not None else 0
 
 
+_SENSITIVE_LOG_FIELDS = {
+    "where", "html", "raw_html", "prompt", "prompt_text", "response",
+    "response_text", "contents", "body", "request_body", "api_key",
+    "key_value", "token", "tokens_text", "proxy_url", "full_url",
+}
+
+
+def _safe_log_fields(value):
+    """Удаляет сырой контент и секреты даже если новый call site передал их случайно."""
+    if isinstance(value, dict):
+        return {
+            key: _safe_log_fields(item)
+            for key, item in value.items()
+            if str(key).casefold() not in _SENSITIVE_LOG_FIELDS
+        }
+    if isinstance(value, (list, tuple)):
+        return [_safe_log_fields(item) for item in value]
+    return value
+
+
 def _job_log(event: str, job_id: str = "", **fields) -> None:
     """Одна компактная JSON-строка. Никогда не передавать сюда картинки, ключи, пароли, полные URL прокси."""
-    JOB_STATS[f"event_{event}"] += 1
+    if not event.startswith("tpl_"):
+        JOB_STATS[f"event_{event}"] += 1
     payload = {
         "ts": _utc_iso(),
         "pid": os.getpid(),
@@ -153,7 +224,7 @@ def _job_log(event: str, job_id: str = "", **fields) -> None:
     }
     if job_id:
         payload["job_id"] = job_id
-    payload.update(fields)
+    payload.update(_safe_log_fields(fields))
     payload["message"] = f"{event} job={job_id}" if job_id else event
     print(json.dumps(payload, ensure_ascii=False, separators=(",", ":")), flush=True)
 

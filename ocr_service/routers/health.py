@@ -19,6 +19,10 @@ from ..config import (
     STARTUP_TIMING_FILE,
     STATUS_PASSWORD,
     STATUS_USER,
+    TEMPLATE_ENABLED,
+    TEMPLATE_MAX_CONCURRENCY,
+    TEMPLATE_MODELS,
+    TEMPLATE_RESERVE_KEYS_FOR_OCR, TEMPLATE_DAILY_CAP,
 )
 from ..jobs import JOB_RESULT_TTL_SECONDS, JOBS, _cleanup_expired_jobs
 from ..key_pool import GEMINI_KEYS, gemini_model_name, gemini_pool
@@ -51,7 +55,7 @@ async def health():
             return 0
         return round(max(0.0, wall_now - min(float(job.get("created_at", wall_now)) for job in jobs)), 1)
 
-    return {
+    result = {
         "status": "ok",
         "pid": os.getpid(),
         "gemini_keys_count": len(GEMINI_KEYS),
@@ -82,6 +86,24 @@ async def health():
         "status_page_enabled": bool(STATUS_USER and STATUS_PASSWORD),
         "startup_timing": startup_info,
     }
+    if TEMPLATE_ENABLED:
+        from ..email_template.prompt import PROMPT_VERSION
+        from ..routers.template import TEMPLATE_JOBS, _BREAKER_UNTIL, effective_concurrency
+        from ..telemetry import TEMPLATE_STATS
+        result["template"] = {
+            "enabled": True,
+            "models": TEMPLATE_MODELS,
+            "pending": sum(1 for job in TEMPLATE_JOBS.values() if job.get("status") == "pending"),
+            "running": sum(1 for job in TEMPLATE_JOBS.values() if job.get("status") == "running"),
+            "max_concurrency": effective_concurrency(),
+            "ocr_key_reserve": TEMPLATE_RESERVE_KEYS_FOR_OCR,
+            "daily_jobs": int(TEMPLATE_STATS.get("daily_jobs", 0)),
+            "daily_cap": TEMPLATE_DAILY_CAP,
+            "daily_tokens": sum(int(TEMPLATE_STATS.get(key, 0)) for key in ("tokens_in", "tokens_out", "tokens_thoughts")),
+            "breaker_open": time.monotonic() < _BREAKER_UNTIL,
+            "prompt_version": PROMPT_VERSION,
+        }
+    return result
 
 
 @router.get("/favicon.ico", include_in_schema=False)

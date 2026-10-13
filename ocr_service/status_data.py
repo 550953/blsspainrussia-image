@@ -26,6 +26,8 @@ from .telemetry import (
     LAST_EVENT,
     NO_ACCOUNT,
     QUALITY,
+    TEMPLATE_RUNS,
+    TEMPLATE_STATS,
     _percentile,
     betterstack_queue_size,
 )
@@ -212,7 +214,7 @@ def build_status() -> dict:
         c.pop("_seen")
 
     overloaded, overloaded_left = gemini_pool.is_overloaded()
-    return {
+    status_payload = {
         "now": wall,
         "pid": os.getpid(),
         "uptime_s": round(wall - PROCESS_START_TIME),
@@ -263,3 +265,44 @@ def build_status() -> dict:
         },
         "supabase": {"enabled": False},
     }
+    template_cutoff = wall - 86400
+    template_runs = [item for item in TEMPLATE_RUNS if item[0] >= template_cutoff]
+    first_attempt = [item for item in template_runs if item[3] > 0]
+    template_rules = Counter(rule for item in template_runs for rule in item[10])
+    try:
+        from .config import TEMPLATE_ENABLED
+        if TEMPLATE_ENABLED:
+            from .routers.template import TEMPLATE_JOBS, effective_concurrency
+            status_payload["queue_by_kind"] = {
+                "ocr_sheet": {
+                    "pending": len(pending), "running": len(running),
+                    "max_concurrency": max(len(GEMINI_KEYS), 1),
+                },
+                "email_template": {"pending": 0, "running": 0, "max_concurrency": 0},
+            }
+            status_payload["queue_by_kind"]["email_template"].update({
+                "pending": sum(1 for item in TEMPLATE_JOBS.values() if item.get("status") == "pending"),
+                "running": sum(1 for item in TEMPLATE_JOBS.values() if item.get("status") == "running"),
+                "max_concurrency": effective_concurrency(),
+            })
+            durations = [int(item[4]) for item in template_runs]
+            valid_runs = sum(1 for item in template_runs if item[2])
+            status_payload["templates"] = {
+                "runs_24h": len(template_runs),
+                "valid_rate": round(valid_runs / len(template_runs), 3) if template_runs else None,
+                "first_attempt_valid_rate": round(sum(1 for item in first_attempt if item[2] and item[3] == 1) / len(first_attempt), 3) if first_attempt else None,
+                "avg_attempts": round(sum(item[3] for item in template_runs) / len(template_runs), 2) if template_runs else None,
+                "latency_p50": _percentile(durations, 0.5),
+                "latency_p95": _percentile(durations, 0.95),
+                "tokens_in": int(TEMPLATE_STATS.get("tokens_in", 0)),
+                "tokens_out": int(TEMPLATE_STATS.get("tokens_out", 0)),
+                "top_rules": [{"rule": key, "count": value} for key, value in template_rules.most_common(10)],
+                "last_runs": [
+                    {"id": item[1], "valid": item[2], "attempts": item[3], "total_ms": item[4],
+                     "model": item[7], "bytes": item[8], "error": item[9]}
+                    for item in template_runs[-20:]
+                ],
+            }
+    except Exception:
+        pass
+    return status_payload

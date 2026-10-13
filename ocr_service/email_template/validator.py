@@ -1,0 +1,770 @@
+"""Детерминированная проверка HTML по требованиям шаблона письма."""
+import html
+import re
+from dataclasses import asdict, dataclass, field
+from html.parser import HTMLParser
+from typing import Dict, List, Optional
+
+from ..config import (
+    TEMPLATE_CONTRAST_SUGGEST, TEMPLATE_DISABLED_RULES, TEMPLATE_HTML_ERROR_BYTES, TEMPLATE_MAX_HTML_BYTES,
+)
+from .contrast import color_tokens, is_red_orange, node_bg, node_fg, ratio, suggest_fix
+
+ALLOWED_VARS = ("brandName", "name", "productName", "transactionalId", "price", "supportEmail", "email")
+MARKER = "<!-- Здесь вставляется тело письма -->"
+BANNED = (
+    "urgent", "action required", "act now", "act fast", "limited time", "don't delay", "dont delay",
+    "verify now", "verify immediately", "get paid now", "unlock funds", "funds on hold", "payment hold",
+    "delays may apply", "within 24 hours", "last chance", "sold", "hot", "срочн*", "немедленн*", "прямо сейчас",
+    "не откладыва*", "успейте", "успей", "быстрее", "последний шанс", "иначе потеря*",
+    "в течение 24 час*", "средства под блокировк*", "заблокир*", "не упустите", "торопитесь", "поторопитесь",
+)
+
+
+@dataclass
+class Issue:
+    rule: str
+    severity: str
+    message: str
+    where: str = ""
+
+
+@dataclass
+class Report:
+    ok: bool
+    errors: List[Issue] = field(default_factory=list)
+    warnings: List[Issue] = field(default_factory=list)
+    stats: dict = field(default_factory=dict)
+
+    def to_dict(self) -> dict:
+        return {
+            "ok": self.ok,
+            "errors": [asdict(item) for item in self.errors],
+            "warnings": [asdict(item) for item in self.warnings],
+            "stats": self.stats,
+        }
+
+
+class _Node:
+    def __init__(self, tag: str, attrs: dict, parent=None, start_pos: int = 0):
+        self.tag, self.attrs, self.children = tag, attrs, []
+        self.text = ""
+        self.parent = parent
+        self.start_pos = start_pos
+
+
+class _Tree(HTMLParser):
+    VOID = {"area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param", "source", "track", "wbr"}
+
+    def __init__(self, source: str):
+        super().__init__(convert_charrefs=True)
+        self.root = _Node("root", {})
+        self.stack = [self.root]
+        self.tags = []
+        self.comments = []
+        self.source = source
+        self._line_starts = [0]
+        self._line_starts.extend(idx + 1 for idx, char in enumerate(source) if char == "\n")
+        self.handle_data(" ")
+
+    def _position(self):
+        line, column = self.getpos()
+        if line <= len(self._line_starts):
+            return self._line_starts[line - 1] + column
+        return len(self.source)
+
+    def handle_starttag(self, tag, attrs):
+        values = {k.lower(): (v or "") for k, v in attrs}
+        node = _Node(tag.lower(), values, self.stack[-1], self._position())
+        self.stack[-1].children.append(node)
+        self.tags.append((tag.lower(), values))
+        if tag.lower() not in self.VOID:
+            self.stack.append(node)
+
+    def handle_startendtag(self, tag, attrs):
+        self.handle_starttag(tag, attrs)
+        if tag.lower() not in self.VOID and len(self.stack) > 1:
+            self.stack.pop()
+
+    def handle_endtag(self, tag):
+        tag = tag.lower()
+        for idx in range(len(self.stack) - 1, 0, -1):
+            if self.stack[idx].tag == tag:
+                del self.stack[idx:]
+                break
+
+    def handle_data(self, data):
+        if len(self.stack) > 1:
+            self.stack[-1].text += data
+
+    def handle_comment(self, data):
+        self.comments.append(data.strip())
+
+
+def _walk(node):
+    stack = [node]
+    while stack:
+        current = stack.pop()
+        yield current
+        stack.extend(reversed(current.children))
+
+
+def _text(node):
+    result = []
+    stack = [node]
+    while stack:
+        current = stack.pop()
+        if current.text:
+            result.append(current.text)
+        stack.extend(reversed(current.children))
+    return "".join(result)
+
+
+def _style(node):
+    return dict((m.group(1).strip().lower(), m.group(2).strip()) for m in re.finditer(r"([\w-]+)\s*:\s*([^;]+)", node.attrs.get("style", "")))
+
+
+def _issue(report, rule, severity, message, where=""):
+    if rule in TEMPLATE_DISABLED_RULES and severity == "W":
+        return
+    target = report.errors if severity == "E" else report.warnings
+    target.append(Issue(rule, severity, message, str(where).replace("\n", " ")[:120]))
+
+
+def _contrast_message(label, foreground, background, observed):
+    message = f"{label}: контраст {observed:.1f}:1, требуется не менее 4.5:1."
+    if TEMPLATE_CONTRAST_SUGGEST:
+        suggested = suggest_fix(foreground, background, 4.5)
+        if suggested:
+            if ratio(suggested, background) is not None and ratio(suggested, background) >= 4.5:
+                message += f" Замените цвет текста {foreground} на {suggested}."
+            elif ratio(foreground, suggested) is not None and ratio(foreground, suggested) >= 4.5:
+                message += f" Замените цвет фона {background} на {suggested}."
+    return message
+
+
+def validate(source: str, currency_method: Optional[int] = None) -> Report:
+    source = source or ""
+    report = Report(ok=False)
+    byte_size = len(source.encode("utf-8"))
+    report.stats = {"bytes": byte_size, "tables": len(re.findall(r"<table\b", source, re.I)),
+                    "placeholders": 0, "colors": len(set(re.findall(r"#[0-9a-fA-F]{3,8}\b", source))),
+                    "contrast_checked": 0, "contrast_unverified": 0}
+    if byte_size > TEMPLATE_MAX_HTML_BYTES:
+        _issue(report, "T23", "E", "Размер HTML превышает установленный лимит")
+        return report
+    if byte_size > TEMPLATE_HTML_ERROR_BYTES:
+        _issue(report, "T23", "E", "HTML слишком велик для надёжной доставки в почтовых клиентах")
+    elif byte_size > 80000:
+        _issue(report, "T23", "W", "Размер HTML приближается к лимиту обрезки Gmail")
+
+    try:
+        tree = _Tree(source)
+        tree.feed(source)
+        tree.close()
+    except Exception:
+        _issue(report, "T21", "E", "HTML не удалось безопасно разобрать")
+        return report
+    nodes = list(_walk(tree.root))
+    tags = [node.tag for node in nodes]
+    lower = source.lower()
+    normalized_text = html.unescape(re.sub(r"<[^>]*>", " ", source))
+    visible_case_text = html.unescape(re.sub(r"<[^>]*>", " ", source))
+    for invisible in ("\u00a0", "\u200b", "\u200c", "\u200d", "\u2060", "\ufeff"):
+        normalized_text = normalized_text.replace(invisible, " ")
+        visible_case_text = visible_case_text.replace(invisible, " ")
+    normalized_text = normalized_text.casefold().replace("ё", "е")
+    normalized_text = re.sub(r"\{\{[^}]*\}\}", " ", normalized_text)
+    auxiliary_text = " ".join(
+        value for node in nodes for name, value in node.attrs.items() if name in {"alt", "title"}
+    )
+    content_text = (normalized_text + " " + html.unescape(auxiliary_text)).replace("ё", "е").casefold()
+    content_case_text = visible_case_text + " " + html.unescape(auxiliary_text)
+
+    # Переменные и плейсхолдеры
+    allowed_tokens = ["{{" + name + "}}" for name in ALLOWED_VARS]
+    for name, token in zip(ALLOWED_VARS, allowed_tokens):
+        if token not in source:
+            _issue(report, "V01", "E", "Отсутствует обязательная переменная " + token)
+    found = re.findall(r"\{\{[\s\S]*?\}\}", source)
+    report.stats["placeholders"] = len(found)
+    bad = [token for token in found if token not in allowed_tokens]
+    if bad or re.search(r"\{\s|\s\}|\{\{\{|{%|\$\{|\[\[|&#123;|(?<!\{)\{(?!\{)|(?<!\})\}(?!\})", source):
+        _issue(report, "V02", "E", "Обнаружен неизвестный или некорректный плейсхолдер")
+    titles = [node for node in nodes if node.tag == "title"]
+    if not titles or "{{productName}}" not in _text(titles[0]):
+        _issue(report, "V03", "E", "{{productName}} должен быть в <title>")
+    marker_pos = source.find(MARKER)
+    body_start_pos = next((node.start_pos for node in nodes if node.tag == "body"), 0)
+    detail_start = source.find("{{productName}}", body_start_pos)
+    if detail_start < 0 or (marker_pos >= 0 and detail_start >= marker_pos):
+        detail_start = -1
+    if marker_pos < 0:
+        _issue(report, "T18", "E", "Нет обязательного комментария-маркера")
+    elif source.count(MARKER) != 1:
+        _issue(report, "T18", "E", "Маркер должен присутствовать ровно один раз")
+    elif not re.match(r"\s*<h2\b", source[marker_pos + len(MARKER):], re.I):
+        _issue(report, "T18", "E", "Маркер должен стоять непосредственно перед <h2> сообщения")
+    body_before_marker = source[:marker_pos] if marker_pos >= 0 else source
+    if detail_start < 0:
+        _issue(report, "V04", "E", "{{productName}} должен быть в деталях заказа")
+    if "{{brandName}}" not in body_before_marker or body_before_marker.find("{{brandName}}") > body_before_marker.find("{{name}}") >= 0:
+        _issue(report, "V05", "E", "{{brandName}} должен быть в шапке до приветствия")
+    body_name_pos = source.find("{{name}}", body_start_pos)
+    body_transaction_pos = source.find("{{transactionalId}}", body_name_pos + 1) if body_name_pos >= 0 else -1
+    if not (0 <= body_name_pos < body_transaction_pos < marker_pos and marker_pos >= 0):
+        _issue(report, "V06", "E", "Приветствие и детали заказа должны содержать имя и номер")
+    anchors = [node for node in nodes if node.tag == "a"]
+    if len(anchors) != 1 or (anchors and anchors[0].attrs.get("href") != "mailto:{{supportEmail}}") or source.count("{{supportEmail}}") != 1:
+        _issue(report, "V07", "E", "Допустима только одна ссылка mailto:{{supportEmail}}")
+    email_after_link = bool(
+        anchors and any("{{email}}" in node.text and node.start_pos > anchors[0].start_pos for node in nodes)
+    )
+    if not email_after_link:
+        _issue(report, "V07", "E", "{{email}} должен быть текстом в подвале")
+    if any(re.search(r"mailto:[^\"'>]*\?", node.attrs.get("href", ""), re.I) for node in anchors):
+        _issue(report, "V09", "W", "Уберите параметры запроса из mailto-ссылки")
+    price_at = source.find("{{price}}")
+    row_start = source.rfind("<tr", 0, price_at) if price_at >= 0 else -1
+    row_end = source.lower().find("</tr", price_at) if price_at >= 0 else -1
+    price_row = source[row_start:row_end + 5] if row_start >= 0 and row_end >= 0 else (
+        source[max(0, price_at - 300):price_at + 300] if price_at >= 0 else ""
+    )
+    visible_price_row = html.unescape(re.sub(r"<[^>]*>", " ", price_row))
+    marker_in_row = visible_price_row.find("{{price}}")
+    price_context = visible_price_row[max(0, marker_in_row - 300):marker_in_row + 307] if marker_in_row >= 0 else ""
+    has_currency_sign = (
+        re.search(r"\$\s*\{\{price\}\}|\{\{price\}\}[\s\S]{0,300}\$", price_context, re.I)
+        if currency_method in (8, 15)
+        else re.search(r"\$\s*\{\{price\}\}", price_context, re.I)
+    )
+    if not has_currency_sign and not (currency_method == 15 and re.search(r"\{\{price\}\}[\s\S]{0,300}\bUSD\b", price_context, re.I)):
+        _issue(report, "V08", "E", "Рядом с суммой должен быть знак $ или подпись USD")
+    if price_at >= 0:
+        price_node = next((node for node in nodes if "{{price}}" in node.text), None)
+        current = price_node
+        font_size = None
+        while current is not None and font_size is None:
+            font_size = _style(current).get("font-size")
+            current = current.parent
+        price_size = re.search(r"(\d+(?:\.\d+)?)\s*px", font_size or "", re.I)
+        if not price_size or not 24 <= float(price_size.group(1)) <= 30:
+            _issue(report, "V11", "W", "Для суммы рекомендуется размер текста 24–30 px")
+
+    # Безопасность и почтовая разметка
+    if re.search(r"<style\b", source, re.I): _issue(report, "T01", "E", "Использовать только inline-стили")
+    if re.search(r"\bclass\s*=", source, re.I): _issue(report, "T02", "E", "Атрибут class запрещён")
+    blocked = {"img", "svg", "picture", "video", "audio", "canvas", "iframe", "object", "embed", "form", "input", "select", "textarea", "script", "link", "base", "noscript", "button"}
+    for tag in sorted(blocked.intersection(tags)):
+        _issue(report, "T03", "E", "Запрещённый тег <" + tag + ">")
+    for node in nodes:
+        attrs = node.attrs
+        external_values = [value for name, value in attrs.items() if name in {"href", "src", "action"}]
+        style_value = attrs.get("style", "")
+        if any(re.search(r"(?:https?:)?//|javascript:|data:", value, re.I) and not re.search(r"^mailto:", value.strip(), re.I)
+               for value in external_values):
+            _issue(report, "T05", "E", "Внешние адреса и схемы запрещены", node.tag)
+        if re.search(r"url\s*\(\s*['\"]?(?:https?:)?//|url\s*\(\s*['\"]?(?:javascript|data):", style_value, re.I):
+            _issue(report, "T05", "E", "Внешние ресурсы в CSS запрещены", node.tag)
+        st = style_value.lower()
+        if re.search(r"display\s*:\s*(?:inline-flex|flex|grid|inline-grid)|position\s*:\s*(?:absolute|fixed|sticky)|@media|@import|@font-face|url\s*\(|expression\s*\(|var\s*\(", st):
+            _issue(report, "T04", "E", "Недопустимое CSS-свойство", node.tag)
+        if re.search(r"(?:^|;)\s*float\s*:", st):
+            _issue(report, "T04", "W", "Избегайте float в почтовой вёрстке", node.tag)
+    if not re.match(r"\s*<!doctype\s+html", source, re.I): _issue(report, "T06", "E", "Документ должен начинаться с <!DOCTYPE html>")
+    html_nodes = [node for node in nodes if node.tag == "html"]
+    if len(html_nodes) != 1 or html_nodes[0].attrs.get("lang", "").lower() != "ru": _issue(report, "T06", "E", "Нужен один <html lang=\"ru\">")
+    if len([n for n in nodes if n.tag == "head"]) != 1 or len([n for n in nodes if n.tag == "body"]) != 1: _issue(report, "T06", "E", "Нужны ровно по одному head и body")
+    if not re.search(r'<meta\b[^>]*charset\s*=\s*["\']?utf-8', source, re.I): _issue(report, "T06", "E", "Отсутствует meta charset UTF-8")
+    viewport_ok = any(
+        node.tag == "meta" and node.attrs.get("name", "").lower() == "viewport"
+        and "width=device-width" in node.attrs.get("content", "").replace(" ", "").lower()
+        for node in nodes
+    )
+    if not viewport_ok: _issue(report, "T06", "E", "Отсутствует viewport для мобильных")
+    if not re.search(r"X-UA-Compatible", source, re.I): _issue(report, "T06", "E", "Отсутствует X-UA-Compatible")
+    for table in (node for node in nodes if node.tag == "table"):
+        if table.attrs.get("role") != "presentation" or table.attrs.get("cellpadding") != "0" or table.attrs.get("cellspacing") != "0" or table.attrs.get("border") != "0":
+            _issue(report, "T08", "E", "У каждой таблицы должны быть email-атрибуты role/cellpadding/cellspacing/border")
+    main_table = next(
+        (node for node in nodes if node.tag == "table" and re.fullmatch(r"\d+", node.attrs.get("width", ""))
+         and 520 <= int(node.attrs["width"]) <= 600), None
+    )
+    if main_table is None:
+        _issue(report, "T07", "E", "Основная таблица должна иметь ширину 520–600 px")
+    else:
+        table_width = int(main_table.attrs["width"])
+        style = _style(main_table)
+        max_width = re.fullmatch(r"(\d+(?:\.\d+)?)px", style.get("max-width", ""), re.I)
+        width_percent = re.fullmatch(r"(\d+(?:\.\d+)?)%", style.get("width", ""), re.I)
+        if not 520 <= table_width <= 600 or not max_width or float(max_width.group(1)) != table_width or not width_percent or float(width_percent.group(1)) != 100:
+            _issue(report, "T07", "E", "Основная таблица должна иметь width 520–600 и width:100% с совпадающим max-width")
+    body_node = next((node for node in nodes if node.tag == "body"), None)
+    for label, node in (("body", body_node), ("основная таблица", main_table)):
+        if node is not None and (
+            not node.attrs.get("bgcolor")
+            or not _style(node).get("background-color")
+        ):
+            _issue(report, "T09", "E", "Для " + label + " нужны bgcolor и background-color")
+    if tree.comments != ["Здесь вставляется тело письма"]:
+        _issue(report, "T19", "E", "Разрешён только обязательный HTML-комментарий перед телом сообщения")
+    if len(titles) != 1 or not _text(titles[0]).strip(): _issue(report, "T20", "E", "Нужен непустой title")
+    if re.search(r"<ol\b", source, re.I): _issue(report, "T24", "E", "Для шагов используйте маркированный список")
+    if len([node for node in nodes if node.tag == "a"]) and any(not _style(n).get("color") or _style(n).get("text-decoration", "").lower() != "underline" for n in anchors):
+        _issue(report, "T22", "E", "Ссылки должны иметь цвет и подчёркивание")
+    if len(re.findall(r"<table\b", source, re.I)) > 60: _issue(report, "T25", "W", "В письме более 60 таблиц")
+    if any(
+        "font-size" in _style(node) and not re.search(r"(?:px|rem|em|%)\s*$", _style(node)["font-size"], re.I)
+        for node in nodes
+    ):
+        _issue(report, "T25", "W", "Задавайте размер шрифта в px")
+    preheader = re.search(r"<body\b[^>]*>\s*<(div|span)\b([^>]*)>([\s\S]*?)</\1\s*>", source, re.I)
+    if not preheader:
+        _issue(report, "T10", "E", "Скрытый прехедер должен быть первым элементом body")
+    else:
+        pre_style = re.search(r"\bstyle\s*=\s*([\"'])(.*?)\1", preheader.group(2), re.I | re.S)
+        style_text = (pre_style.group(2) if pre_style else "").lower().replace(" ", "")
+        required = ("display:none", "font-size:1px", "line-height:1px", "max-height:0", "max-width:0",
+                    "opacity:0", "overflow:hidden", "mso-hide:all")
+        if any(item not in style_text for item in required):
+            _issue(report, "T10", "E", "Прехедер должен содержать полный набор скрывающих стилей")
+        visible = re.sub(r"&nbsp;&zwnj;|&#160;&#8204;", "", preheader.group(3), flags=re.I)
+        visible = html.unescape(re.sub(r"<[^>]*>", "", visible)).replace("{{transactionalId}}", "1234567890").strip()
+        report.stats["preheader_chars"] = len(visible)
+        if not 50 <= len(visible) <= 110:
+            _issue(report, "T10", "E", "Текст прехедера должен быть длиной 50–110 символов")
+        if len(re.findall(r"(?:&nbsp;&zwnj;|&#160;&#8204;)", preheader.group(3), re.I)) < 3:
+            _issue(report, "T10", "E", "В конце прехедера нужны минимум три пары &nbsp;&zwnj;")
+    email_node = next((node for node in nodes if "{{email}}" in node.text), None)
+    mail_node = anchors[0] if anchors else None
+    footer_root = mail_node
+    while footer_root is not None and footer_root.tag not in {"tr", "table"}:
+        footer_root = footer_root.parent
+    footer_nodes = set()
+    if footer_root is not None:
+        for node in nodes:
+            current = node
+            while current is not None and current is not footer_root:
+                current = current.parent
+            if current is footer_root:
+                footer_nodes.add(id(node))
+    else:
+        current = email_node
+        while current is not None:
+            footer_nodes.add(id(current))
+            current = current.parent
+    preheader_node = next(
+        (node for node in nodes if node.tag in {"div", "span"} and _style(node).get("display", "").replace(" ", "").lower() == "none"
+         and _style(node).get("font-size", "").replace(" ", "").lower() == "1px"),
+        None,
+    )
+    for node in nodes:
+        st = _style(node)
+        if node.tag in {"table", "td"} and ("border-radius" in st):
+            parent_table = node
+            while parent_table is not None and parent_table.tag != "table":
+                parent_table = parent_table.parent
+            if parent_table is None or "separate" not in _style(parent_table).get("border-collapse", "").lower():
+                _issue(report, "T11", "E", "Для border-radius требуется border-collapse:separate")
+        size = re.search(r"(\d+(?:\.\d+)?)\s*px", st.get("font-size", ""))
+        if size and float(size.group(1)) < 12 and id(node) != id(preheader_node):
+            _issue(report, "T12", "E", "Размер текста не должен быть меньше 12 px", node.tag)
+        elif size and 12 <= float(size.group(1)) < 15 and id(node) not in footer_nodes and not (
+            detail_start >= 0 and detail_start <= node.start_pos < marker_pos
+            and len((node.text or "").strip()) <= 30
+        ):
+            _issue(report, "T13", "W", "Для основного текста рекомендуется не менее 15 px", node.tag)
+        family = st.get("font-family")
+        if family:
+            allowed_fonts = {"arial", "georgia", "trebuchet ms", "verdana", "tahoma", "helvetica", "serif", "sans-serif"}
+            normalized_family = re.sub(r"&quot;([^&]+)&quot;", r"'\1'", family, flags=re.I)
+            families = [part.strip().lower().replace('"', "").replace("'", "") for part in normalized_family.split(",")]
+            if any(part not in allowed_fonts for part in families) or families[-1] not in {"serif", "sans-serif"}:
+                _issue(report, "T15", "E", "Используйте безопасные почтовые шрифты с fallback", node.tag)
+        line_height = st.get("line-height")
+        font_size = re.search(r"(\d+(?:\.\d+)?)px", st.get("font-size", ""), re.I)
+        line_px = re.fullmatch(r"(\d+(?:\.\d+)?)px", line_height or "", re.I)
+        line_ratio = float(line_height) if line_height and re.fullmatch(r"\d+(?:\.\d+)?", line_height) else (
+            float(line_px.group(1)) / float(font_size.group(1))
+            if line_px and font_size and float(font_size.group(1)) > 0 else None
+        )
+        if line_ratio is not None and id(node) != id(preheader_node) and not 1.4 <= line_ratio <= 1.6:
+            _issue(report, "T14", "W", "Рекомендуемый межстрочный интервал: 1.4–1.6", node.tag)
+        if node.tag == "a" and ("padding" in st or "background" in st):
+            _issue(report, "S05", "E", "Ссылка не должна выглядеть как кнопка")
+    if re.search(r"\brole\s*=\s*['\"]?button", source, re.I):
+        _issue(report, "S05", "E", "Кнопки запрещены в письме")
+    if currency_method:
+        sign_node = next((node for node in nodes if "$" in node.text), None)
+        price_node = next((node for node in nodes if "{{price}}" in node.text), None)
+        price_pos = source.find("{{price}}")
+        sign_pos = source.find("$")
+        price_area = source[max(0, price_pos - 300):price_pos + 300] if price_pos >= 0 else ""
+        sign_area = source[max(0, sign_pos - 300):sign_pos + 150] if sign_pos >= 0 else ""
+        if currency_method not in (8, 15):
+            if sign_pos < 0 or price_pos < 0 or abs(sign_pos - price_pos) > 300:
+                _issue(report, "V08", "E", "Знак валюты должен находиться рядом с {{price}}")
+        elif price_pos >= 0 and not re.search(r"\{\{price\}\}[\s\S]{0,300}(?:\$|\bUSD\b)", price_area, re.I):
+            _issue(report, "M08", "W", "Для способа 8 или 15 знак или USD должны идти после суммы")
+        if currency_method == 15 and price_pos >= 0 and not re.search(r"\{\{price\}\}[\s\S]{0,300}\bUSD\b", price_area, re.I):
+            _issue(report, "M15", "W", "Для способа 15 добавьте подпись USD после суммы")
+
+        def inherited_style(node):
+            chain = []
+            while node is not None:
+                chain.append(node)
+                node = node.parent
+            values = {}
+            for item in reversed(chain):
+                values.update(_style(item))
+            return values
+
+        sign_style = inherited_style(sign_node) if sign_node else {}
+        price_style = inherited_style(price_node) if price_node else {}
+        sign_inline_style = _style(sign_node) if sign_node else {}
+        price_inline_style = _style(price_node) if price_node else {}
+        sign_css = ";".join(f"{key}:{value}" for key, value in sign_inline_style.items())
+        price_css = ";".join(f"{key}:{value}" for key, value in price_inline_style.items())
+        sign_size = re.search(r"font-size\s*:\s*(\d+(?:\.\d+)?)px", sign_css, re.I)
+        amount_size = re.search(r"font-size\s*:\s*(\d+(?:\.\d+)?)px", price_css, re.I)
+        width = re.search(r"width\s*:\s*(\d+(?:\.\d+)?)px", sign_css, re.I)
+        height = re.search(r"height\s*:\s*(\d+(?:\.\d+)?)px", sign_css, re.I)
+        radius_px = re.search(r"border-radius\s*:\s*(\d+(?:\.\d+)?)px", sign_css, re.I)
+        radius_pct = re.search(r"border-radius\s*:\s*(\d+(?:\.\d+)?)%", sign_css, re.I)
+        circular = bool(
+            width and height and abs(float(width.group(1)) - float(height.group(1))) < 0.01
+            and ((radius_px and float(radius_px.group(1)) >= float(width.group(1)) / 2)
+                 or (radius_pct and float(radius_pct.group(1)) >= 50))
+            and re.search(r"display\s*:\s*inline-block", sign_css, re.I)
+            and re.search(r"line-height\s*:\s*" + re.escape(height.group(1)) + r"px", sign_css, re.I)
+            and re.search(r"text-align\s*:\s*center", sign_css, re.I)
+        )
+        if currency_method in (1, 2) and not re.search(r"vertical-align\s*:\s*super", sign_area, re.I):
+            _issue(report, "M%02d" % currency_method, "W", "Для выбранного способа знак должен быть приподнят")
+        if currency_method in (3, 17, 19) and not circular:
+            _issue(report, "M%02d" % currency_method, "W", "Для способа нужна круглая inline-плашка знака")
+        if currency_method in (4, 16, 18):
+            pill_ok = bool(width and height and width.group(1) == height.group(1)
+                           and re.search(r"display\s*:\s*inline-block", sign_css, re.I))
+            if currency_method == 4:
+                pill_ok = pill_ok and radius_px is not None and 6 <= float(radius_px.group(1)) <= 8
+            if not pill_ok:
+                _issue(report, "M%02d" % currency_method, "W", "Для способа нужны равные размеры inline-плашки")
+        if currency_method == 5 and (not re.search(r"border\s*:\s*2px", sign_css, re.I)
+                                     or re.search(r"background-color\s*:", sign_css, re.I)):
+            _issue(report, "M05", "W", "Для способа 5 нужна обводка 2px без фона")
+        if currency_method == 6 and (not sign_size or not amount_size or sign_size.group(1) != amount_size.group(1)):
+            _issue(report, "M06", "W", "Размер знака должен совпадать с размером суммы")
+        if currency_method == 7 and (
+            not re.search(r"vertical-align\s*:\s*middle", sign_area, re.I) or not sign_size or not amount_size
+            or float(sign_size.group(1)) >= float(amount_size.group(1))
+        ):
+            _issue(report, "M07", "W", "Знак должен быть меньше суммы и выровнен по центру")
+        if currency_method == 9 and not re.search(r"border-bottom\s*:\s*3px", sign_css, re.I):
+            _issue(report, "M09", "W", "Для способа 9 нужно подчёркивание толщиной 3px")
+        if currency_method == 10 and (
+            not re.search(r"font-style\s*:\s*italic", sign_css, re.I)
+            or not re.search(r"font-weight\s*:\s*(?:bold|[7-9]00)", price_css, re.I)
+        ):
+            _issue(report, "M10", "W", "Знак курсивный, сумма полужирная")
+        if currency_method == 11 and not (price_inline_style.get("background-color") or price_inline_style.get("background")):
+            _issue(report, "M11", "W", "Задайте фон ближайшему контейнеру суммы")
+        if currency_method == 12 and not (
+            sign_node and sign_node.tag in {"td", "div", "span"}
+            and (sign_inline_style.get("background-color") or sign_inline_style.get("background"))
+        ):
+            _issue(report, "M12", "W", "Поместите знак в отдельную цветную ячейку или плашку")
+        if currency_method == 13 and (
+            not sign_node or not price_node or node_fg(sign_node).lower() == node_fg(price_node).lower()
+            or not sign_size or not amount_size or sign_size.group(1) != amount_size.group(1)
+        ):
+            _issue(report, "M13", "W", "Знак отличается цветом и совпадает с суммой по размеру")
+        if currency_method == 14 and not re.search(r"border-(?:left|right)\s*:\s*[234]px", sign_css, re.I):
+            _issue(report, "M14", "W", "Для способа 14 нужна вертикальная линия толщиной 2–4px")
+        if currency_method in (16, 18) and not (radius_px or radius_pct):
+            _issue(report, "M%02d" % currency_method, "W", "Для выбранного способа задайте скругление плашки")
+        if currency_method == 20 and (
+            not sign_size or not 14 <= float(sign_size.group(1)) <= 20
+            or not re.search(r"border-right\s*:", sign_css, re.I)
+        ):
+            _issue(report, "M20", "W", "Для способа 20 нужен знак 14–20px и вертикальная черта справа")
+    mailto_node = next((node for node in nodes if node.tag == "a" and node.attrs.get("href", "").lower().startswith("mailto:")), None)
+    footer_container = mailto_node.parent if mailto_node else None
+    while footer_container is not None and footer_container.tag not in {"tr", "table"}:
+        footer_container = footer_container.parent
+    message_end = footer_container.start_pos if footer_container is not None else len(source)
+    for node in nodes:
+        if marker_pos >= 0 and marker_pos <= node.start_pos < message_end:
+            if node.tag in {"h1", "h2", "h3", "p", "ul", "li", "hr", "table", "td"} and "style" not in node.attrs:
+                _issue(report, "T16", "E", "Теги тела сообщения должны иметь inline style", node.tag)
+            elif node.tag in {"strong", "em", "i", "b"} and "style" not in node.attrs:
+                _issue(report, "T16", "W", "Добавьте inline style на выделение текста", node.tag)
+    if marker_pos >= 0:
+        message_area = source[marker_pos:source.lower().find("mailto:", marker_pos) if "mailto:" in source[marker_pos:].lower() else len(source)]
+        for tag, expression, message in (
+            ("h2", r"<h2\b", "В блоке сообщения обязателен h2"),
+            ("p", r"<p\b", "В блоке сообщения обязателен абзац"),
+            ("strong", r"<strong\b", "В блоке сообщения нужен strong"),
+            ("ul", r"<ul\b", "В блоке сообщения нужен маркированный список"),
+            ("hr", r"<hr\b", "В блоке сообщения нужен разделитель"),
+            ("italic", r"<(?:em|i)\b|font-style\s*:\s*italic", "В блоке сообщения нужна курсивная подпись"),
+        ):
+            if not re.search(expression, message_area, re.I): _issue(report, "T17", "E", message)
+        lis = re.findall(r"<li\b", message_area, re.I)
+        if len(lis) != 3: _issue(report, "T17", "E", "В списке сообщения должно быть ровно три пункта")
+        mailto_node = next((node for node in nodes if node.tag == "a" and node.attrs.get("href", "").lower().startswith("mailto:")), None)
+        footer_container = mailto_node.parent if mailto_node else None
+        while footer_container is not None and footer_container.tag not in {"tr", "table"}:
+            footer_container = footer_container.parent
+        message_end = footer_container.start_pos if footer_container is not None else len(source)
+        message_paragraphs = [
+            node for node in nodes
+            if node.tag == "p" and marker_pos <= node.start_pos < message_end
+            and not any(
+                descendant is not node and (
+                    descendant.tag in {"em", "i"}
+                    or _style(descendant).get("font-style", "").lower() == "italic"
+                )
+                for descendant in _walk(node)
+            )
+        ]
+        if len(message_paragraphs) > 2:
+            _issue(report, "T17", "W", "В блоке сообщения рекомендуется не более двух абзацев")
+    if marker_pos >= 0:
+        body_pos = next((node.start_pos for node in nodes if node.tag == "body"), 0)
+
+        def token_position(token, after=0):
+            for item in nodes:
+                if token not in item.text:
+                    continue
+                at = source.find(token, max(item.start_pos, after))
+                if at >= 0 and (marker_pos < 0 or at < marker_pos or token in {"{{supportEmail}}", "{{email}}"}):
+                    return at
+            return -1
+
+        def tag_position(tag, after):
+            return next((node.start_pos for node in nodes if node.tag == tag and node.start_pos >= after), -1)
+
+        support_position = next(
+            (node.start_pos for node in anchors if node.attrs.get("href") == "mailto:{{supportEmail}}"), -1
+        )
+        italic_position = next(
+            (node.start_pos for node in nodes if node.start_pos >= marker_pos and (
+                node.tag in {"em", "i"} or _style(node).get("font-style", "").lower() == "italic"
+            )), -1
+        )
+        brand_position = token_position("{{brandName}}")
+        name_position = token_position("{{name}}", max(body_pos, brand_position))
+        product_position = token_position("{{productName}}", body_pos)
+        transactional_position = token_position("{{transactionalId}}", product_position + 1)
+        price_position = token_position("{{price}}", transactional_position + 1)
+        h2_position = tag_position("h2", marker_pos)
+        ul_position = tag_position("ul", h2_position)
+        hr_position = tag_position("hr", ul_position)
+        positions = [
+            brand_position, name_position, product_position, transactional_position,
+            price_position, marker_pos, h2_position, ul_position, hr_position,
+            italic_position, support_position, token_position("{{email}}", support_position + 1),
+        ]
+        if any(pos < 0 for pos in positions) or positions != sorted(positions):
+            _issue(report, "L01", "E", "Блоки и обязательные переменные расположены не в заданном порядке")
+    for tag in ("table", "tr", "td", "ul", "li", "p", "h1", "h2", "h3", "a", "html", "head", "body"):
+        opened = len(re.findall(r"<" + tag + r"\b", source, re.I))
+        closed = len(re.findall(r"</" + tag + r"\s*>", source, re.I))
+        if opened != closed:
+            _issue(report, "T21", "E", "Незакрытый или лишний тег <" + tag + ">")
+
+    # Содержание. Текст перед отправкой нормализуется, но HTML-маркеры исключены.
+    for term in BANNED:
+        prefix = term.endswith("*")
+        phrase = term[:-1] if prefix else term
+        pattern = re.escape(phrase).replace(r"\ ", r"\s+")
+        if prefix:
+            pattern += r"\w*"
+        if re.search(r"(?<!\w)" + pattern + r"(?!\w)", content_text):
+            _issue(report, "S01", "E", "Найдено запрещённое слово или выражение")
+            break
+    exclamations = content_text.count("!")
+    report.stats["exclamations"] = exclamations
+    if exclamations > 2: _issue(report, "S02", "E", "В письме больше двух восклицательных знаков")
+    elif exclamations == 2: _issue(report, "S02", "W", "В письме два восклицательных знака")
+    if re.search(r"ваш заказ оформлен|спасибо за покупку|мы рады сообщить|уважаемый клиент", content_text):
+        _issue(report, "S06", "E", "Найдена шаблонная формулировка из списка запретов")
+    if re.search(r"\b(?:статус заказа|ваш заказ)\b", content_text):
+        _issue(report, "S08", "W", "Замените типовой заголовок статуса или заказа")
+    if re.search(r"\b(?:нажмите|кликните|жмите|click\s+here)\b", content_text):
+        _issue(report, "S11", "W", "Избегайте прямого призыва нажать или кликнуть")
+    if re.search(r"\b(?:акци\w*|скидк\w*|распродаж\w*|sale|discount|offer)\b", content_text):
+        _issue(report, "S12", "W", "Проверьте коммерческую лексику в транзакционном письме")
+    if re.search(r"\b(ты|тебе|тебя|твой|твоя|твое|твои|тобой)\b", content_text):
+        _issue(report, "S10", "E", "Обращение должно быть на «вы»")
+    message_text = ""
+    if marker_pos >= 0:
+        footer_at = source.lower().find("mailto:", marker_pos)
+        message_text = html.unescape(re.sub(r"<[^>]*>", " ", source[marker_pos:footer_at if footer_at >= 0 else len(source)]))
+    status_text = ""
+    if detail_start >= 0 and marker_pos > detail_start:
+        status_text = html.unescape(re.sub(r"<[^>]*>", " ", source[detail_start:marker_pos])).casefold()
+    if re.search(r"(?<![\w])(?:завтра|сегодня до|в ближайш\w*|за\s+\d+\s+(?:мин|час|дн|сут|недел)\w*|\d+\s+(?:рабоч\w+\s+)?(?:дн|час|сут)\w*|до\s+\d+\s+(?:дн|час)\w*)", content_text):
+        _issue(report, "S07", "E", "Обещания сроков в письме запрещены")
+    elif re.search(r"в течение|через\s+\d", content_text):
+        if re.search(r"в течение|через\s+\d", (message_text + " " + status_text).casefold()):
+            _issue(report, "S07", "E", "Обещания сроков в блоке сообщения запрещены")
+        else:
+            _issue(report, "S07", "W", "Проверьте формулировку, похожую на обещание срока")
+    for heading in (n for n in nodes if n.tag in {"h1", "h2", "h3"}):
+        if re.search(r"\b[A-ZА-ЯЁ]{3,}\b", _text(heading)) and not re.search(r"\b(?:USD|ID|PDF|SMS|OK|FAQ)\b", _text(heading)):
+            _issue(report, "S04", "E", "Не используйте слова целиком заглавными в заголовках")
+    if re.search(r"\b[A-ZА-ЯЁ]{4,}\b", content_case_text):
+        _issue(report, "S04", "W", "Проверьте слова целиком заглавными в тексте")
+    if any(_style(node).get("text-transform", "").lower() == "uppercase" for node in nodes):
+        _issue(report, "S04", "W", "Избегайте text-transform:uppercase")
+    greeting_node = next((node for node in nodes if "{{name}}" in node.text), None)
+    greeting_large = False
+    current = greeting_node
+    while current is not None:
+        size = re.search(r"(\d+(?:\.\d+)?)\s*px", _style(current).get("font-size", ""), re.I)
+        if size and float(size.group(1)) >= 22:
+            greeting_large = True
+            break
+        current = current.parent
+    if not any(node.tag == "h1" for node in nodes) and not greeting_large:
+        _issue(report, "S09", "W", "Рассмотрите h1 или заметный текст приветствия размером от 22 px")
+
+    indicator_end = marker_pos if marker_pos >= 0 else len(source)
+    indicator_html = source[detail_start:indicator_end] if detail_start >= 0 else ""
+    labels = re.findall(r">([^<>]+)<", indicator_html)
+    short_labels = set()
+    for item in labels:
+        label = html.unescape(re.sub(r"\{\{[^}]+\}\}", "", item)).strip()
+        if label and len(label) <= 30:
+            short_labels.add(label)
+    if len(short_labels) < 3:
+        _issue(report, "L02", "E", "Между деталями заказа и маркером нужны три подписи этапов")
+
+    # Проверяем контраст с наследованием цвета и фона по родителям.
+    checked_pairs = set()
+    for node in nodes:
+        text_value = html.unescape((node.text or "")).replace("\xa0", " ").strip()
+        if not text_value or node.tag in {"root", "head", "title"}:
+            continue
+        current = node
+        hidden = False
+        while current is not None:
+            style = _style(current)
+            if style.get("display", "").replace(" ", "").lower() == "none" or style.get("visibility", "").lower() == "hidden":
+                hidden = True
+                break
+            current = current.parent
+        if hidden:
+            continue
+        foreground, background = node_fg(node), node_bg(node)
+        pair = (foreground.lower(), background.lower())
+        if pair in checked_pairs:
+            continue
+        checked_pairs.add(pair)
+        contrast = ratio(foreground, background)
+        if contrast is None:
+            report.stats["contrast_unverified"] += 1
+        else:
+            report.stats["contrast_checked"] += 1
+            if contrast < 4.5:
+                _issue(
+                    report, "A01", "E",
+                    _contrast_message("Контраст текста", foreground, background, contrast),
+                    text_value[:40],
+                )
+    price_node = next((node for node in nodes if "{{price}}" in node.text), None)
+    sign_node = next((node for node in nodes if "$" in node.text), None)
+    if sign_node is not None and price_node is not None:
+        sign_contrast = ratio(node_fg(sign_node), node_bg(sign_node))
+        if sign_contrast is None:
+            report.stats["contrast_unverified"] += 1
+            _issue(report, "A02", "E", "Контраст знака валюты не удалось проверить", "$")
+        elif sign_contrast < 4.5:
+            _issue(
+                report, "A02", "E",
+                _contrast_message("Контраст знака валюты", node_fg(sign_node), node_bg(sign_node), sign_contrast),
+                "$",
+            )
+    if checked_pairs and report.stats["contrast_unverified"] / len(checked_pairs) > 0.3:
+        _issue(report, "A04", "W", "Слишком много непроверенных цветовых пар")
+    indicator_source = source[max(0, detail_start):marker_pos] if detail_start >= 0 and marker_pos >= 0 else ""
+    if not (
+        re.search(r"(?:&#10003;|&#x2713;|✓|&#x2714;)", indicator_source, re.I)
+        or re.search(r"\b(?:готово|завершен\w*|доставлен\w*|выполнен\w*|completed|done)\b", html.unescape(re.sub(r"<[^>]*>", " ", indicator_source)), re.I)
+    ):
+        _issue(report, "A03", "W", "Добавьте текстовую или графическую отметку завершённого этапа")
+    color_values = set(re.findall(r"#[0-9a-fA-F]{3,8}\b", source))
+    palette_values = []
+    for node in nodes:
+        styles = _style(node)
+        palette_values.extend(color_tokens(styles.get("color", "")))
+        palette_values.extend(color_tokens(styles.get("background-color", "")))
+        palette_values.extend(color_tokens(styles.get("background", "")))
+        palette_values.extend(color_tokens(node.attrs.get("bgcolor", "")))
+    if any(is_red_orange(color) for color in palette_values):
+        _issue(report, "P01", "W", "В палитре найден насыщенный красный или оранжевый цвет")
+    if not 4 <= len(color_values) <= 10:
+        _issue(report, "P02", "W", "Рекомендуется использовать от 4 до 10 различных hex-цветов")
+    emojis = [
+        char for char in re.findall(
+            r"[\U0001F000-\U0001FAFF\U00002600-\U000026FF\U00002700-\U000027BF\U00002B00-\U00002BFF\ufe0f]",
+            content_text,
+        ) if ord(char) != 0x2713
+    ]
+    report.stats["emoji"] = len(emojis)
+    important_text = " ".join(_text(node) for node in nodes if node.tag in {"title", "h1", "h2", "h3"}).replace("✓", "")
+    preheader_text = preheader.group(3) if preheader else ""
+    if any(char in content_text for char in "🚨⚡⚠️❗‼") or len(emojis) > 1 or re.search(r"[\U0001F000-\U0001FAFF\U00002600-\U000026FF\U00002700-\U000027BF\U00002B00-\U00002BFF\ufe0f]", important_text + preheader_text):
+        _issue(report, "S03", "E", "Эмодзи в письме запрещены правилами шаблона")
+    report.ok = not report.errors
+    return report
+
+
+_WARNING_RULES = {
+    "V09", "V10", "V11", "T13", "T14", "T25", "S02", "S08", "S09", "S11", "S12",
+    "A03", "A04", "P01", "P02",
+    *(f"M{number:02d}" for number in range(1, 21)),
+}
+_MIXED_SEVERITY_RULES = {"T04", "T16", "T17", "T23", "S02", "S04"}
+RULES: Dict[str, dict] = {
+    rule: {
+        "id": rule,
+        "severity": "E/W" if rule in _MIXED_SEVERITY_RULES else ("W" if rule in _WARNING_RULES else "E"),
+        "title": title,
+        "enabled": True,
+    }
+    for rule, title in {
+        "V01": "Обязательные переменные", "V02": "Допустимые плейсхолдеры", "V03": "Переменная в title",
+        "V04": "Переменная в деталях", "V05": "Название бренда", "V06": "Приветствие и заказ",
+        "V07": "Ссылка поддержки и получатель", "V08": "Валюта и сумма", "V09": "Чистый mailto",
+        "V11": "Размер цены", "T01": "Только inline CSS",
+        "T02": "Нет class", "T03": "Нет запрещённых тегов", "T04": "Безопасный CSS",
+        "T05": "Нет внешних ресурсов", "T06": "Документ и метаданные", "T07": "Ширина письма",
+        "T08": "Атрибуты email-таблиц", "T16": "Inline-стили сообщения", "T17": "Структура сообщения",
+        "T09": "Фон страницы и таблицы", "T10": "Скрытый прехедер", "T11": "Совместимость скруглений",
+        "T12": "Минимальный размер шрифта", "T13": "Размер основного текста", "T14": "Межстрочный интервал",
+        "T15": "Безопасные шрифты", "T18": "Маркер тела сообщения", "T19": "HTML-комментарии",
+        "T20": "Заголовок документа", "T21": "Сбалансированные теги", "T25": "Количество таблиц",
+        "T22": "Стили ссылок", "T23": "Размер HTML", "T24": "Маркированный список",
+        "S01": "Запрещённые формулировки", "S02": "Восклицательные знаки", "S04": "Капс в заголовках",
+        "S03": "Эмодзи", "S05": "Отсутствие кнопок", "S06": "Канцелярские фразы", "S07": "Обещания сроков",
+        "S08": "Нешаблонный заголовок", "S09": "Заметное приветствие", "S10": "Обращение на «ты»",
+        "S11": "Ненавязчивый призыв", "S12": "Транзакционный тон",
+        "L01": "Порядок блоков", "L02": "Индикатор этапов", "A01": "Контраст текста",
+        "A02": "Контраст знака валюты", "A03": "Индикатор без опоры на цвет", "A04": "Проверка контраста",
+        "P01": "Ограниченная палитра", "P02": "Количество цветов",
+        "V10": "Способ оформления валюты", "M01": "Выбранное оформление знака валюты",
+        "M07": "Выравнивание знака", "M08": "Знак после суммы", "M09": "Подчёркивание знака",
+        "M02": "Приподнятый знак валюты", "M03": "Круглая плашка знака", "M04": "Скруглённая плашка",
+        "M05": "Обводка знака", "M06": "Размер знака", "M11": "Подложка суммы", "M13": "Контрастный знак",
+        "M16": "Радиус плашки", "M17": "Индикатор-круг", "M18": "Радиус индикатора",
+        "M19": "Индикатор-круг", "M10": "Курсивный знак", "M12": "Фоновая плашка знака",
+        "M14": "Разделительная линия", "M15": "Подпись USD", "M20": "Вертикальная линия знака",
+    }.items()
+}
+
+
+def rules() -> list:
+    return [dict(item, enabled=item["id"] not in TEMPLATE_DISABLED_RULES) for item in RULES.values()]
