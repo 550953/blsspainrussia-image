@@ -17,6 +17,14 @@ JOB_STATS = Counter()
 TEMPLATE_RUNS: deque = deque(maxlen=2000)
 TEMPLATE_STATS = Counter()
 TEMPLATE_STATS["date_utc"] = time.strftime("%Y-%m-%d", time.gmtime())
+TEMPLATE_PROXY_ERROR_CATEGORIES = (
+    "proxy_preflight_failed", "generation_timeout", "proxy_unavailable",
+)
+
+
+def record_template_proxy_error(category: str) -> None:
+    if category in TEMPLATE_PROXY_ERROR_CATEGORIES:
+        TEMPLATE_STATS[category] += 1
 
 
 def ensure_template_day() -> None:

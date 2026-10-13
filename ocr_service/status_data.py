@@ -27,6 +27,7 @@ from .telemetry import (
     NO_ACCOUNT,
     QUALITY,
     TEMPLATE_RUNS,
+    TEMPLATE_PROXY_ERROR_CATEGORIES,
     TEMPLATE_STATS,
     _percentile,
     betterstack_queue_size,
@@ -296,6 +297,11 @@ def build_status() -> dict:
                 "latency_p95": _percentile(durations, 0.95),
                 "tokens_in": int(TEMPLATE_STATS.get("tokens_in", 0)),
                 "tokens_out": int(TEMPLATE_STATS.get("tokens_out", 0)),
+                "tokens_thoughts": int(TEMPLATE_STATS.get("tokens_thoughts", 0)),
+                "proxy_errors": {
+                    category: int(TEMPLATE_STATS.get(category, 0))
+                    for category in TEMPLATE_PROXY_ERROR_CATEGORIES
+                },
                 "top_rules": [{"rule": key, "count": value} for key, value in template_rules.most_common(10)],
                 "last_runs": [
                     {"id": item[1], "valid": item[2], "attempts": item[3], "total_ms": item[4],

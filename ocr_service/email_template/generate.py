@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 from ..config import (
     TEMPLATE_DAILY_TOKEN_CAP, TEMPLATE_MAX_ATTEMPTS, TEMPLATE_MAX_HTML_BYTES, TEMPLATE_MAX_OUTPUT_TOKENS,
     TEMPLATE_MIN_ATTEMPT_SECONDS, TEMPLATE_REPAIR_TEMPERATURE, TEMPLATE_RESULT_TTL_SECONDS,
-    TEMPLATE_TEMPERATURE, TEMPLATE_THINKING_BUDGET,
+    TEMPLATE_TEMPERATURE,
 )
 from ..telemetry import TEMPLATE_STATS, _job_log, ensure_template_day, record_template_run, record_template_usage
 from . import autofix
@@ -48,8 +48,6 @@ async def run_template_job(job_id: str, job: dict):
                 "temperature": TEMPLATE_TEMPERATURE if number == 1 else TEMPLATE_REPAIR_TEMPERATURE,
                 "maxOutputTokens": TEMPLATE_MAX_OUTPUT_TOKENS,
             }
-            if TEMPLATE_THINKING_BUDGET:
-                generation_config["thinkingConfig"] = {"thinkingBudget": TEMPLATE_THINKING_BUDGET}
             call_started = time.monotonic()
             try:
                 text, metadata, model = await call_model(
@@ -81,6 +79,8 @@ async def run_template_job(job_id: str, job: dict):
             _job_log(
                 "tpl_gemini_attempt", job_id, component="email_template", attempt=number,
                 model=model, latency_ms=latency_ms, tokens=usage,
+                thoughts=int(usage.get("thoughts", 0) or 0),
+                thinking_setting=metadata.get("thinking_setting", "model-default"),
             )
             parsed = parse(text, metadata.get("finish_reason", ""), metadata.get("prompt_block_reason", ""))
             if parsed.html and not re.search(
@@ -133,6 +133,7 @@ async def run_template_job(job_id: str, job: dict):
             current = {
                 "n": number, "model": model, "latency_ms": latency_ms,
                 "finish_reason": metadata.get("finish_reason", ""),
+                "thinking": metadata.get("thinking_setting", "model-default"),
                 "tokens": metadata.get("usage", {}),
                 "raw_errors": sorted(set(issue["rule"] for issue in raw_errors)),
                 "autofixes": fixes, "errors": sorted(set(issue["rule"] for issue in report_errors)),

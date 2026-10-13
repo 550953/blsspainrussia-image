@@ -74,15 +74,21 @@ class GeminiSmartProxyPool:
         self.geo_hits = {route: 0 for route in self.routes}       # сколько раз ловили гео-отказ с запуска
         self.cursor = 0
 
-    def next(self) -> Optional[str]:
+    def next(self, excluded=None) -> Optional[str]:
         now = time.monotonic()
+        excluded = set(excluded or ())
+        available_routes = [route for route in self.routes if route not in excluded]
         count = len(self.routes)
+        if not available_routes:
+            raise LookupError("no_proxy_routes")
         for offset in range(count):
             route = self.routes[(self.cursor + offset) % count]
+            if route in excluded:
+                continue
             if now >= self.cooldown_until[route]:
                 self.cursor = (self.cursor + offset + 1) % count
                 return route
-        route = min(self.routes, key=lambda item: self.cooldown_until[item])
+        route = min(available_routes, key=lambda item: self.cooldown_until[item])
         self.cursor = (self.routes.index(route) + 1) % count
         return route
 

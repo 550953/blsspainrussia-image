@@ -89,7 +89,7 @@ async def health():
     if TEMPLATE_ENABLED:
         from ..email_template.prompt import PROMPT_VERSION
         from ..routers.template import TEMPLATE_JOBS, _BREAKER_UNTIL, effective_concurrency
-        from ..telemetry import TEMPLATE_STATS
+        from ..telemetry import TEMPLATE_PROXY_ERROR_CATEGORIES, TEMPLATE_STATS
         result["template"] = {
             "enabled": True,
             "models": TEMPLATE_MODELS,
@@ -100,6 +100,10 @@ async def health():
             "daily_jobs": int(TEMPLATE_STATS.get("daily_jobs", 0)),
             "daily_cap": TEMPLATE_DAILY_CAP,
             "daily_tokens": sum(int(TEMPLATE_STATS.get(key, 0)) for key in ("tokens_in", "tokens_out", "tokens_thoughts")),
+            "proxy_errors": {
+                category: int(TEMPLATE_STATS.get(category, 0))
+                for category in TEMPLATE_PROXY_ERROR_CATEGORIES
+            },
             "breaker_open": time.monotonic() < _BREAKER_UNTIL,
             "prompt_version": PROMPT_VERSION,
         }

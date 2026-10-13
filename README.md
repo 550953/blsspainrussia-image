@@ -35,6 +35,8 @@ curl -X POST http://localhost:8000/template/submit \
 
 Опрос `GET /template/result/{job_id}`: обычно раз в 3–5 секунд, используя `poll_after_ms`, если он возвращён сервером; `?html=0` уменьшает ответ до статуса. На `done` проверяйте `template.valid`, `template.report` и `template.attempts`; статус `done` означает, что лучшая версия сохранена, но она может содержать ошибки валидации. Если после рестарта вы получили `404`, повторите `POST` с теми же `account_id` и `client_request_id`, затем продолжите опрос по возвращённому `job_id`. Для отмены используйте `POST /template/cancel/{job_id}` с тем же `X-API-Key`.
 
+Для внешнего клиента держите polling не дольше **12 минут от принятия задания**: очередь может ждать до 5 минут, после неё генерации даётся до 7 минут. Результат хранится до 60 минут, но рестарт процесса очищает его раньше.
+
 Дополнительные endpoints:
 
 - `POST /template/validate` — локальная проверка переданного HTML без вызова Gemini.
@@ -53,8 +55,8 @@ curl -X POST http://localhost:8000/template/submit \
 | `TEMPLATE_ENABLED` | `0` | Включить API генерации |
 | `TEMPLATE_API_KEYS` | пусто | Список клиентских ключей через запятую |
 | `TEMPLATE_MODELS` | пусто | Разрешённые модели Gemini для писем |
-| `TEMPLATE_MAX_CONCURRENCY` | `1` | Параллельные генерации, ограничиваются доступными ключами |
-| `TEMPLATE_RESERVE_KEYS_FOR_OCR` | `1` | Резерв ключей Gemini для OCR |
+| `TEMPLATE_MAX_CONCURRENCY` | `3` | Параллельные генерации, ограничиваются доступными ключами |
+| `TEMPLATE_RESERVE_KEYS_FOR_OCR` | `5` | Резерв ключей Gemini для OCR |
 | `TEMPLATE_YIELD_TO_OCR` | `1` | Приоритет ожидающим/активным OCR-заданиям |
 | `TEMPLATE_MAX_ATTEMPTS` | `3` | Генерация + попытки исправления (максимум 5) |
 | `TEMPLATE_INFRA_RETRIES` | `4` | Повторы инфраструктурного вызова внутри попытки |
@@ -66,14 +68,15 @@ curl -X POST http://localhost:8000/template/submit \
 | `TEMPLATE_HARD_TIMEOUT` | `150` | Жёсткий таймаут одного вызова Gemini |
 | `TEMPLATE_HTTP_READ_TIMEOUT` | `130` | Таймаут чтения ответа Gemini |
 | `TEMPLATE_CONNECT_TIMEOUT` | `8` | Таймаут соединения с Gemini |
+| `TEMPLATE_PROXY_PREFLIGHT_TIMEOUT` | `7` | Короткая проверка прокси до аренды ключа; DIRECT пропускает её |
 | `TEMPLATE_LEASE_TTL` | `180` | Аренда ключа для вызова (не меньше hard timeout + 30) |
 | `TEMPLATE_MODEL_COOLDOWN` | `60` | Пауза пары ключ/модель после краткой квоты |
 | `TEMPLATE_QUOTA_BLOCK_SECONDS` | `900` | Временная блокировка пары ключ/модель при дневной квоте |
 | `TEMPLATE_CONTRAST_SUGGEST` | `1` | Добавлять конкретный цвет-коррекцию в предупреждение о контрасте |
 | `TEMPLATE_RESULT_TTL_SECONDS` | `3600` | Хранение готового результата |
-| `TEMPLATE_MAX_PENDING` | `3` | Максимум активных заданий |
+| `TEMPLATE_MAX_PENDING` | `6` | Максимум активных/ожидающих заданий |
 | `TEMPLATE_DAILY_CAP` | `100` | Максимум принятых заданий в UTC-день |
-| `TEMPLATE_DAILY_TOKEN_CAP` | `1500000` | Суточный предел токенов |
+| `TEMPLATE_DAILY_TOKEN_CAP` | `20000000` | Суточный предел токенов |
 | `TEMPLATE_BREAKER_FAILS` | `5` | Число последовательных ошибок до паузы |
 | `TEMPLATE_BREAKER_PAUSE_SECONDS` | `120` | Длительность паузы breaker |
 | `TEMPLATE_MAX_HTML_BYTES` | `300000` | Максимальный размер HTML |
@@ -81,7 +84,8 @@ curl -X POST http://localhost:8000/template/submit \
 | `TEMPLATE_MAX_OUTPUT_TOKENS` | `16384` | Максимальный ответ модели |
 | `TEMPLATE_TEMPERATURE` | `1.0` | Температура первой генерации |
 | `TEMPLATE_REPAIR_TEMPERATURE` | `0.4` | Температура исправления |
-| `TEMPLATE_THINKING_BUDGET` | `0` | Бюджет thinking tokens; `0` отключает |
+| `TEMPLATE_THINKING_BUDGET` | `0` | Для Gemini 2.5: thinking tokens; `0` передаётся явно, `-1` включает динамический бюджет |
+| `TEMPLATE_THINKING_LEVEL` | `low` | Уровень Gemini 3/4: `minimal`, `low`, `medium`, `high` (поддержка зависит от модели) |
 | `TEMPLATE_HISTORY` | `12` | История для разнообразия брифов |
 | `TEMPLATE_STORE_MAX` | `100` | Максимум сохранённых заданий |
 | `TEMPLATE_VALIDATE_RATE_PER_MIN` | `30` | Лимит валидации на ключ в минуту |
@@ -95,17 +99,50 @@ TEMPLATE_ENABLED=0
 TEMPLATE_API_KEYS=replace-with-private-client-key
 TEMPLATE_MODELS=gemini-2.5-flash
 GEMINI_API_KEY_1=replace-with-secret
-TEMPLATE_MAX_CONCURRENCY=1
-TEMPLATE_RESERVE_KEYS_FOR_OCR=1
+TEMPLATE_MAX_CONCURRENCY=3
+TEMPLATE_RESERVE_KEYS_FOR_OCR=5
 TEMPLATE_YIELD_TO_OCR=1
 TEMPLATE_MAX_ATTEMPTS=3
 TEMPLATE_JOB_DEADLINE_SECONDS=420
 TEMPLATE_QUEUE_MAX_WAIT_SECONDS=300
 TEMPLATE_DAILY_CAP=100
-TEMPLATE_DAILY_TOKEN_CAP=1500000
+TEMPLATE_DAILY_TOKEN_CAP=20000000
+TEMPLATE_PROXY_PREFLIGHT_TIMEOUT=7
+TEMPLATE_THINKING_BUDGET=0
+TEMPLATE_THINKING_LEVEL=low
 ```
 
-Ключи API и модельные ключи берутся из Replit Secrets/Render/Infisical. Не помещайте их в `.env.example`, логи или клиентский код. Свободный текстовый `prompt` не принимается: сервер выбирает бриф и параметры только из белых списков.
+Ключи API и модельные ключи берутся из Replit Secrets/Render/Infisical. Не помещайте их в `.env.example`, логи или клиентский код. Клиент не присылает произвольный промпт генерации: сервер строит его из брифа и белых списков. Поле `TEMPLATE_THINKING_BUDGET=0` не превращается в `None`: для Gemini 2.5 Flash передаётся именно нулевой бюджет; `-1` означает динамический бюджет. Для Gemini 2.5 Pro ноль не поддерживается и настройка пропускается — модель сохраняет своё thinking по умолчанию.
+
+Thinking-параметр выбирается по модели в `thinkingConfig`, а не отправляется неподходящему семейству:
+
+| Семейство/модель | Поле API | Поддержка и поведение |
+|---|---|---|
+| Gemini 2.5 Flash / Flash Lite | `thinkingBudget` | `0..24576`, `0` явно выключает thinking, `-1` — динамический бюджет |
+| Gemini 2.5 Pro | `thinkingBudget` | `128..32768` или `-1`; отключить thinking нельзя, при `0` используется default модели |
+| Gemini 3.8 / 3.7 Flash | `thinkingLevel` | `low`, `medium`, `high`; `minimal` не поддерживается |
+| Gemini 3.6 Flash, 3.5/3.1 Flash-Lite, Gemini 3 Flash | `thinkingLevel` | `minimal`, `low`, `medium`, `high` |
+| Gemini 4 Argon | `thinkingLevel` | `low`, `medium`, `high`; отключить thinking нельзя |
+| Остальные модели | — | параметр не посылается, действует настройка модели по умолчанию |
+
+Точная совместимость может меняться вместе с каталогом Gemini; при переходе на другую модель сверьте [официальную таблицу thinking](https://ai.google.dev/gemini-api/docs/generate-content/thinking). `tpl_gemini_attempt` пишет только число `thoughts` из usage и применённую настройку, не текст внутреннего рассуждения.
+
+`TEMPLATE_DAILY_TOKEN_CAP=20000000` выбран по оценке, а не по live Gemini-замерам: текущие system prompt и стартовый бриф занимают около 12,662 символов (примерно 3,166 токенов при грубой оценке 4 символа/токен); при стандартных 3 попытках и `maxOutputTokens=16384` предыдущие ответы также повторяются в repair-контексте. Грубая верхняя оценка — около 108 тыс. токенов на задание и 10.8 млн на 100 заданий; 20 млн оставляет примерно 1.8× запас на repair-текст и вариативность токенизации. Запросы могут разрешить до 5 попыток, поэтому дневной лимит остаётся жёстким предохранителем и при такой нагрузке может остановить последующие repair-попытки раньше.
+
+Прокси генерации перед арендой Gemini-ключа проверяется отдельным коротким GET к Google API (лимит 7 секунд). Любой HTTP-ответ подтверждает транспортную доступность; сетевой сбой помещает только этот канал в cooldown, не использует ключ и не считается API-попыткой. `DIRECT` пропускает preflight. После таймаута генерации канал проверяется ещё раз: живой канал не штрафуется только за долгий ответ модели. В `tpl_gemini_error` и `/status.json` счётчики разделены на `proxy_preflight_failed`, `generation_timeout` и `proxy_unavailable`; URL прокси и секреты туда не добавляются.
+
+### Окна и аренда: OCR против email
+
+| Параметр | OCR | Email generation |
+|---|---|---|
+| Профиль сетевого вызова | Short: connect 8с, HTTP 15с, hard timeout 45с | Long: connect 8с, чтение до 130с, hard timeout 150с; preflight прокси до 7с до аренды ключа |
+| Аренда Gemini-ключа | 60с по умолчанию | `max(TEMPLATE_LEASE_TTL, hard timeout + 30с)`, по умолчанию 180с |
+| Дедлайн задания | 60с (`OCR_JOB_MAX_SECONDS`) | 420с после запуска генерации |
+| Очередь / параллельность | До 8 OCR workers | Ожидание семафора до 300с; до 3 параллельных задач с учётом резерва 5 ключей OCR |
+| Очередь и дневные ограничения | Общий OCR job pool, результат хранится 300с | До 6 pending/running, 100 принятых заданий и 20 млн учтённых токенов за UTC-день |
+| Результат | Сохраняется в in-memory OCR job | In-memory до 3600с; restart теряет задания |
+
+Локальная проверка интеграции (fake Gemini API и локальные HTTP-прокси, внешний Gemini не вызывается): `PYTHONPATH=. python scripts/smoke_template.py`. Она печатает временную шкалу всех восьми сценариев и завершает работу с ненулевым кодом, если нарушен хотя бы один итоговый инвариант.
 
 ### Ограничения и эксплуатация
 

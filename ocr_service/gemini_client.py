@@ -22,6 +22,24 @@ GEMINI_HARD_TIMEOUT = float(os.getenv("GEMINI_HARD_TIMEOUT", "45"))
 # а зависший канал обнаруживается быстрее, и задание успевает сделать больше попыток до дедлайна.
 GEMINI_HTTP_TIMEOUT = float(os.getenv("GEMINI_HTTP_TIMEOUT", "15"))
 GEMINI_CONNECT_TIMEOUT = float(os.getenv("GEMINI_CONNECT_TIMEOUT", "8"))
+TEMPLATE_PROXY_PREFLIGHT_URL = "https://generativelanguage.googleapis.com/"
+
+
+async def preflight_template_proxy(proxy_url: Optional[str], timeout: Optional[float] = None) -> None:
+    """Проверяет только транспорт прокси, не используя ключ Gemini и профиль короткого OCR."""
+    if proxy_url is None:
+        return
+    from .config import TEMPLATE_PROXY_PREFLIGHT_TIMEOUT
+
+    limit = max(0.1, float(timeout if timeout is not None else TEMPLATE_PROXY_PREFLIGHT_TIMEOUT))
+    request_timeout = httpx.Timeout(limit, connect=min(limit, 3.0))
+    try:
+        async with httpx.AsyncClient(proxy=proxy_url, timeout=request_timeout, trust_env=False) as client:
+            # Любой HTTP-ответ доказывает доступность канала; проверка не вызывает Gemini API.
+            await asyncio.wait_for(client.get(TEMPLATE_PROXY_PREFLIGHT_URL), timeout=limit)
+    except Exception as exc:
+        # Не включаем URL прокси, credentials или upstream response в текст ошибки.
+        raise ProxyUnavailable(f"proxy preflight failed ({type(exc).__name__})") from exc
 
 
 def _get_http_client(proxy_url: Optional[str], profile: str = "short") -> httpx.AsyncClient:

@@ -241,6 +241,10 @@ def test_health_and_status_include_template_runs_without_changing_ocr_stats(api,
         status = build_status()
         assert status_http.status_code == 200
         assert status_http.json()["templates"]["runs_24h"] >= 1
+        assert set(status_http.json()["templates"]["proxy_errors"]) == {
+            "proxy_preflight_failed", "generation_timeout", "proxy_unavailable",
+        }
+        assert "tokens_thoughts" in status_http.json()["templates"]
         assert health["template"]["enabled"] is True
         assert status["templates"]["runs_24h"] >= 1
         assert health["ocr_job_stats"] == before_stats

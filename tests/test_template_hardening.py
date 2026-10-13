@@ -324,7 +324,7 @@ def test_cancel_after_first_attempt_keeps_best_and_returns_key(monkeypatch):
             return True
 
     class FakeProxyPool:
-        def next(self):
+        def next(self, excluded=None):
             return "http://proxy.test"
 
         def mark_ok(self, _proxy):
@@ -340,6 +340,9 @@ def test_cancel_after_first_attempt_keeps_best_and_returns_key(monkeypatch):
     monkeypatch.setattr(runner, "TEMPLATE_INFRA_RETRIES", 1)
     monkeypatch.setattr(runner, "TEMPLATE_MIN_CALL_SECONDS", 1)
     monkeypatch.setattr(runner, "TEMPLATE_DEADLINE_MARGIN", 0)
+    async def healthy_preflight(*args, **kwargs):
+        return None
+    monkeypatch.setattr(runner, "preflight_template_proxy", healthy_preflight)
 
     async def hanging_gemini(**kwargs):
         entered.set()

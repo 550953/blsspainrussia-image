@@ -228,6 +228,35 @@ def test_generation_warns_when_model_adds_text_after_html(monkeypatch):
     assert "V10" in warnings
 
 
+def test_gemini_attempt_log_has_thought_token_count_only(monkeypatch):
+    from ocr_service.email_template import generate
+
+    events = []
+
+    async def fake_model(contents, system, models, job_id, generation_config, deadline_ts=None):
+        return "No document", {
+            "finish_reason": "STOP",
+            "prompt_block_reason": "",
+            "usage": {"in": 11, "out": 7, "thoughts": 23, "cached": 0},
+            "thinking_setting": "level:low",
+        }, models[0]
+
+    monkeypatch.setattr(generate, "call_model", fake_model)
+    monkeypatch.setattr(generate, "_job_log", lambda event, _job_id, **fields: events.append((event, fields)))
+    job = {
+        "job_id": "thought-log", "max_attempts": 1, "models": ["gemini-3.8-flash"],
+        "deadline_s": 420, "brief": {
+            "currency_method": 1, "palette_family": "green", "fonts": "Georgia + Verdana",
+            "header": "header", "indicator": "indicator", "avoid_palettes": [], "seed": 42,
+        },
+    }
+    asyncio.run(generate.run_template_job("thought-log", job))
+    _, fields = next(item for item in events if item[0] == "tpl_gemini_attempt")
+    assert fields["thoughts"] == 23
+    assert fields["thinking_setting"] == "level:low"
+    assert "private reasoning" not in str(fields)
+
+
 def test_template_routes_are_not_registered_when_flag_is_off(monkeypatch):
     import importlib
     import sys
