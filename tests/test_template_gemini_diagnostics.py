@@ -56,6 +56,7 @@ def test_template_http_errors_keep_expected_global_key_state(
     monkeypatch.setattr(runner, "smart_proxy_pool", proxy_pool)
     monkeypatch.setattr(runner, "TEMPLATE_RESERVE_KEYS_FOR_OCR", 0)
     monkeypatch.setattr(runner, "TEMPLATE_INFRA_RETRIES", 1)
+    monkeypatch.setattr(runner, "TEMPLATE_OVERLOAD_RETRIES", 0)
     monkeypatch.setattr(runner, "TEMPLATE_YIELD_TO_OCR", False)
     monkeypatch.setattr(runner, "TEMPLATE_MIN_CALL_SECONDS", 0.01)
     monkeypatch.setattr(runner, "TEMPLATE_DEADLINE_MARGIN", 0.0)

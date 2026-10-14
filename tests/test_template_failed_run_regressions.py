@@ -276,3 +276,61 @@ def test_httpx_read_timeout_is_not_shorter_than_first_byte_timeout():
     except RuntimeError:
         pass
     assert captured and captured[0].read >= 75.0
+
+
+# ---- 503 «высокий спрос»: повторы с паузой вместо мгновенного отказа (job 1be66c17…, 34793beb…) ----
+
+def _overload_error():
+    from ocr_service.gemini_errors import GeminiAPIError, _classify_gemini_http_error
+    message = "This model is currently experiencing high demand."
+    return GeminiAPIError(503, "UNAVAILABLE", message, _classify_gemini_http_error(503, "UNAVAILABLE", message))
+
+
+def test_overload_503_does_not_spend_the_infra_retry_budget_and_backs_off(monkeypatch):
+    from ocr_service.email_template import runner
+
+    key_pool, proxy_pool = _fakes(runner, 5, [None])
+    _patch_runner(monkeypatch, runner, key_pool, proxy_pool, retries=1)
+    monkeypatch.setattr(runner, "TEMPLATE_OVERLOAD_RETRIES", 4)
+    monkeypatch.setattr(runner, "TEMPLATE_OVERLOAD_BACKOFF", 0.01)
+    monkeypatch.setattr(runner, "TEMPLATE_OVERLOAD_BACKOFF_MAX", 0.02)
+    monkeypatch.setattr(key_pool, "mark_model_overloaded", lambda *a, **k: None, raising=False)
+    calls = []
+
+    async def call(**kwargs):
+        calls.append(kwargs["key"])
+        if len(calls) <= 3:
+            raise _overload_error()
+        return "ok", {"usage": {}}
+
+    monkeypatch.setattr(runner, "call_gemini_generate", call)
+    text, metadata, _model = asyncio.run(runner.generate(
+        [], "", ["unit-model"], "overload", {}, deadline_ts=time.monotonic() + 60,
+    ))
+    assert text == "ok"
+    assert len(calls) == 4
+    assert [item["outcome"] for item in metadata["api_trace"]] == ["api_error"] * 3 + ["success"]
+
+
+def test_overload_retries_are_bounded_and_end_with_upstream_unavailable(monkeypatch):
+    from ocr_service.email_template import runner
+
+    key_pool, proxy_pool = _fakes(runner, 8, [None])
+    _patch_runner(monkeypatch, runner, key_pool, proxy_pool, retries=1)
+    monkeypatch.setattr(runner, "TEMPLATE_OVERLOAD_RETRIES", 2)
+    monkeypatch.setattr(runner, "TEMPLATE_OVERLOAD_BACKOFF", 0.01)
+    monkeypatch.setattr(runner, "TEMPLATE_OVERLOAD_BACKOFF_MAX", 0.01)
+    calls = []
+
+    async def call(**kwargs):
+        calls.append(kwargs["key"])
+        raise _overload_error()
+
+    monkeypatch.setattr(runner, "call_gemini_generate", call)
+    try:
+        asyncio.run(runner.generate([], "", ["unit-model"], "overload-limit", {}, deadline_ts=time.monotonic() + 60))
+        raised = None
+    except runner.TemplateGenerationError as exc:
+        raised = exc
+    assert raised is not None and raised.code == "upstream_unavailable"
+    assert len(calls) == 3  # 1 по обычному бюджету + 2 «возвращённых» при перегрузке

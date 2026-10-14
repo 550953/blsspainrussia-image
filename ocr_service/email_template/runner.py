@@ -10,7 +10,8 @@ from ..config import (
     TEMPLATE_HTTP_READ_TIMEOUT, TEMPLATE_LEASE_TTL, TEMPLATE_MODELS, TEMPLATE_PROXY_PREFLIGHT_TIMEOUT,
     TEMPLATE_MODEL_COOLDOWN, TEMPLATE_RESERVE_KEYS_FOR_OCR, TEMPLATE_THINKING_BUDGET,
     TEMPLATE_THINKING_LEVEL, TEMPLATE_QUOTA_BLOCK_SECONDS, TEMPLATE_YIELD_TO_OCR,
-    TEMPLATE_SLOW_ROUTE_COOLDOWN,
+    TEMPLATE_SLOW_ROUTE_COOLDOWN, TEMPLATE_OVERLOAD_BACKOFF, TEMPLATE_OVERLOAD_BACKOFF_MAX,
+    TEMPLATE_OVERLOAD_RETRIES,
 )
 from ..gemini_client import GenerationTimeout, call_gemini_generate, preflight_template_proxy
 from ..gemini_errors import GeminiAPIError, _safe_gemini_message
@@ -356,6 +357,8 @@ async def generate(contents, system_instruction, model_chain, job_id, generation
     previous_model_rejection = None
     dead_key_refunds = 0   # ключи с PROJECT_ACCESS_DENIED не тратят бюджет повторов (до 3 раз за вызов)
     timeout_hits = 0       # таймауты в рамках одного вызова generate()
+    overload_refunds = 0   # 503/5xx «высокий спрос» не тратят бюджет повторов (до TEMPLATE_OVERLOAD_RETRIES)
+    pending_overload_sleep = 0.0
 
     def detail_for(code, category=None, error=None, model=None, key_name=None):
         return _error_detail(
@@ -367,7 +370,7 @@ async def generate(contents, system_instruction, model_chain, job_id, generation
             error_code=code, api_trace=api_trace,
         )
 
-    while api_attempts - dead_key_refunds < TEMPLATE_INFRA_RETRIES:
+    while api_attempts - dead_key_refunds - overload_refunds < TEMPLATE_INFRA_RETRIES:
         remaining = deadline - time.monotonic() - TEMPLATE_DEADLINE_MARGIN
         if remaining < TEMPLATE_MIN_CALL_SECONDS:
             code = "ocr_priority_timeout" if yielded_to_ocr else "deadline"
@@ -620,6 +623,14 @@ async def generate(contents, system_instruction, model_chain, job_id, generation
                 gemini_pool.release(idx, error=exc)
             if exc.http_status in (500, 502, 503, 504):
                 gemini_pool.mark_model_overloaded(model, TEMPLATE_MODEL_COOLDOWN)
+            if (
+                (exc.http_status in (500, 502, 503, 504) or exc.category == "UPSTREAM_UNAVAILABLE")
+                and overload_refunds < TEMPLATE_OVERLOAD_RETRIES
+            ):
+                overload_refunds += 1
+                pending_overload_sleep = min(
+                    float(TEMPLATE_OVERLOAD_BACKOFF_MAX), float(TEMPLATE_OVERLOAD_BACKOFF) * overload_refunds,
+                )
         except asyncio.CancelledError as exc:
             request_error = exc
             cancelled = True
@@ -703,6 +714,11 @@ async def generate(contents, system_instruction, model_chain, job_id, generation
         )
         if model_rejected_twice:
             raise TemplateGenerationError("model_rejected", last_error_detail) from request_error
+        if pending_overload_sleep > 0:
+            # Пауза между повторами при перегрузке модели; не дольше остатка дедлайна.
+            left = deadline - time.monotonic() - TEMPLATE_DEADLINE_MARGIN - TEMPLATE_MIN_CALL_SECONDS
+            await asyncio.sleep(max(0.0, min(pending_overload_sleep, left)))
+            pending_overload_sleep = 0.0
     if isinstance(last_error, ProxyUnavailable):
         detail = dict(last_error_detail or detail_for("no_proxy", "PROXY_UNAVAILABLE", last_error))
         detail.update(error_code="no_proxy", api_attempts=api_attempts,
