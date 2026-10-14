@@ -482,12 +482,22 @@ def apply(source: str):
         def add_fallback(match):
             nonlocal font_fallback_changed
             value = match.group(2).strip()
-            parts = [part.strip().strip("\"'").lower() for part in value.split(",")]
+            raw_parts = [part.strip() for part in value.split(",")]
+            parts = [part.strip("\"'").lower() for part in raw_parts]
             first = parts[0] if parts else ""
             allowed = {"arial", "georgia", "trebuchet ms", "verdana", "tahoma", "helvetica"}
-            if first in allowed and parts[-1] not in {"serif", "sans-serif"}:
-                font_fallback_changed = True
-                value += ", serif" if first == "georgia" else ", sans-serif"
+            generic = {"serif", "sans-serif"}
+            if first in allowed:
+                # Посторонние имена в списке (Geneva, Segoe UI, italic и т.п.) безвредны для вида письма,
+                # но валидатор их не принимает: оставляем только разрешённые шрифты и generic-семейства.
+                kept = [raw for raw, low in zip(raw_parts, parts) if low in allowed or low in generic]
+                if kept != raw_parts:
+                    font_fallback_changed = True
+                    value = ", ".join(kept)
+                    parts = [part.strip("\"'").lower() for part in kept]
+                if parts[-1] not in generic:
+                    font_fallback_changed = True
+                    value += ", serif" if first == "georgia" else ", sans-serif"
             return match.group(1) + value
 
         return re.sub(r"(font-family\s*:\s*)([^;]+)", add_fallback, updated_style, flags=re.I)
