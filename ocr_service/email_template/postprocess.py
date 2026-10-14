@@ -109,6 +109,9 @@ class _PlainText(HTMLParser):
 
     def handle_starttag(self, tag, attrs):
         tag = tag.lower()
+        if tag == "body":
+            # Незакрытый или битый <head> (например, «</>») не должен скрывать всё письмо.
+            self.stack.clear()
         style = dict((k.lower(), v or "") for k, v in attrs).get("style", "")
         hidden = tag in _SKIP or re.search(r"display\s*:\s*none", style, re.I) is not None
         if tag in _VOID:
@@ -166,6 +169,79 @@ class _PlainText(HTMLParser):
             self.out.append(data)
 
 
+_VALUE_TOKEN = re.compile(r"^(?:[$€£₽]|USD|EUR|RUB|\{\{price\}\})$", re.I)
+
+
+def _tidy_plain_lines(text: str) -> str:
+    """Лечит раскладку таблиц в text/plain: одиночные символы, разорванные «Сумма: $ {{price}}», индикатор этапов."""
+    out, pending, marked = [], "", set()
+    for line in text.split("\n"):
+        bare = line.strip()
+        if bare and len(bare) <= 2 and not re.search(r"[^\W_]{2}", bare) and not re.search(r"\{|\}", bare) and not re.fullmatch(r"[$€£₽]", bare):
+            if bare == "✓":
+                pending = "✓ "
+            continue  # маркеры ■ • ▪ и прочие одиночные символы не печатаем
+        if bare and pending:
+            line = pending + bare
+            marked.add(len(out))
+            pending = ""
+        out.append(line)
+    # 1) «Сумма:» + знак валюты + значение -> одна строка
+    merged, i = [], 0
+    while i < len(out):
+        line = out[i]
+        if line.strip().endswith(":") and "{{" not in line.strip()[:-1]:
+            j, tokens = i + 1, []
+            while j < len(out) and len(tokens) < 3:
+                if not out[j].strip():
+                    j += 1
+                    continue
+                if len(out[j].strip()) <= 12 and _VALUE_TOKEN.match(out[j].strip()):
+                    tokens.append(out[j].strip())
+                    j += 1
+                    continue
+                break
+            if tokens:
+                merged.append(line.strip() + " " + " ".join(tokens))
+                i = j
+                continue
+        merged.append(line)
+        i += 1
+    # 2) индикатор этапов после строки «Сумма: …» -> «Статус: ✓ А → Б (сейчас) → В»
+    def _stage(line):
+        cand = line.strip()
+        return bool(cand) and len(cand) <= 40 and ":" not in cand and not cand.startswith("- ") \
+            and not re.search(r"[.!?,]$", cand) and "{{" not in cand
+
+    result, i = [], 0
+    while i < len(merged):
+        line = merged[i]
+        result.append(line)
+        i += 1
+        if not (line.startswith("Сумма:") and "{{price}}" in line):
+            continue
+        j, run = i, []
+        while j < len(merged) and len(run) < 4:
+            if not merged[j].strip():
+                j += 1
+                continue
+            if not _stage(merged[j]):
+                break
+            run.append((j, merged[j].strip()))
+            j += 1
+        start = next((k for k, (_, text) in enumerate(run) if text.startswith("✓")), 0)
+        if len(run) - start < 3:
+            continue
+        run = run[:start + 3]
+        names = [text for _, text in run[start:]]
+        first = names[0] if names[0].startswith("✓") else "✓ " + names[0]
+        result.append("")
+        result.append("Статус: %s → %s (сейчас) → %s" % (first, names[1], names[2]))
+        result.append("")
+        i = run[-1][0] + 1
+    return "\n".join(result)
+
+
 def plain_text(source: str) -> str:
     """text/plain версия письма. Плейсхолдеры {{...}} остаются как есть."""
     parser = _PlainText()
@@ -179,7 +255,7 @@ def plain_text(source: str) -> str:
     for ch in ("\u200b", "\u200c", "\u200d", "\u2060", "\ufeff"):
         text = text.replace(ch, "")
     lines = [re.sub(r"[ \t]+", " ", line).strip() for line in text.split("\n")]
-    text = "\n".join(lines)
+    text = _tidy_plain_lines("\n".join(lines))
     text = re.sub(r"\n{3,}", "\n\n", text)
     text = re.sub(r"(- [^\n]*)\n\n(?=- )", r"\1\n", text).strip()
     return text + "\n" if text else ""

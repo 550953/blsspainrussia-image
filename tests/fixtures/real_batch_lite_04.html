@@ -1,0 +1,116 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta http-equiv="X-UA-Compatible" content="IE=edge">
+<title>{{productName}} — подтверждение заказа</title>
+<meta name="x-apple-disable-message-reformatting"><meta name="color-scheme" content="light"><meta name="supported-color-schemes" content="light"></head>
+<body bgcolor="#fafbf2" style="margin:0;padding:0;background-color:#fafbf2;font-family:Tahoma,sans-serif;-webkit-text-size-adjust:100%;-ms-text-size-adjust:100%">
+<div style="display:none;font-size:1px;line-height:1px;max-height:0;max-width:0;opacity:0;overflow:hidden;mso-hide:all;">
+Заказ {{transactionalId}} успешно принят в работу, скоро всё подготовим&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;
+</div>
+<table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" bgcolor="#fafbf2" style="background-color:#fafbf2;table-layout:fixed;mso-table-lspace:0pt;mso-table-rspace:0pt">
+<tr>
+<td align="center" style="padding:40px 0;">
+<table role="presentation" cellpadding="0" cellspacing="0" border="0" width="560" style="width:100%;max-width:560px;background-color:#ffffff;border-collapse:separate;border-spacing:0;mso-table-lspace:0pt;mso-table-rspace:0pt" bgcolor="#ffffff">
+<tr>
+<td align="center" style="padding:30px 40px 20px;">
+<table role="presentation" cellpadding="0" cellspacing="0" border="0" style="margin:0 auto;border:1px solid #d6458f;border-radius:4px;;border-collapse:separate;mso-table-lspace:0pt;mso-table-rspace:0pt">
+<tr>
+<td align="center" style="padding:10px 24px;font-family:Helvetica,Arial,sans-serif;font-size:18px;line-height:1.4;color:#4a5a1a;font-weight:bold;">
+{{brandName}}
+</td>
+</tr>
+</table>
+</td>
+</tr>
+<tr>
+<td align="left" style="padding:10px 40px 20px;">
+<p style="margin:0 0 12px;font-family:Helvetica,Arial,sans-serif;font-size:22px;line-height:1.4;color:#4a5a1a;font-weight:bold;">
+Рады вашему заказу, {{name}}!
+</p>
+<p style="margin:0;font-family:Tahoma,sans-serif;font-size:15px;line-height:1.6;color:#4a5a1a;">
+Мы уже получили вашу заявку и начали подготовку. Скоро всё будет готово к отправке.
+</p>
+</td>
+</tr>
+<tr>
+<td align="left" style="padding:10px 40px 20px;">
+<table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" style="background-color:#f1f5df;border-radius:6px;border-collapse:separate;mso-table-lspace:0pt;mso-table-rspace:0pt">
+<tr>
+<td style="padding:20px;">
+<table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" style="mso-table-lspace:0pt;mso-table-rspace:0pt">
+<tr>
+<td style="padding:0 0 10px;font-family:Tahoma,sans-serif;font-size:15px;line-height:1.5;color:#4a5a1a;">
+<strong>Товар:</strong> {{productName}}
+</td>
+</tr>
+<tr>
+<td style="padding:0 0 10px;font-family:Tahoma,sans-serif;font-size:15px;line-height:1.5;color:#4a5a1a;">
+<strong>Номер заказа:</strong> {{transactionalId}}
+</td>
+</tr>
+<tr>
+<td style="padding:0;font-family:Tahoma,sans-serif;font-size:15px;line-height:1.5;color:#4a5a1a;">
+<strong>Сумма:</strong> <span style="display:inline-block;width:20px;height:20px;background-color:#d6458f;color:#121212;text-align:center;font-size:13px;line-height:20px;border-radius:6px;margin-right:4px;vertical-align:baseline;">$</span><span style="font-size:24px;line-height:1;font-weight:bold;color:#4a5a1a;">{{price}}</span>
+</td>
+</tr>
+</table>
+</td>
+</tr>
+</table>
+</td>
+</tr>
+<tr>
+<td align="center" style="padding:10px 40px 20px;">
+<table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" style="border-collapse:separate;border-spacing:4px;mso-table-lspace:0pt;mso-table-rspace:0pt">
+<tr>
+<td width="33%" align="center" bgcolor="#46802a" style="background-color:#46802a;border-radius:3px;padding:10px 8px;font-family:Tahoma,sans-serif;font-size:13px;line-height:1.4;color:#ffffff;">
+&#10003; Подтверждён
+</td>
+<td width="33%" align="center" bgcolor="#f1f5df" style="background-color:#f1f5df;border-radius:3px;padding:10px 8px;font-family:Tahoma,sans-serif;font-size:13px;line-height:1.4;color:#4a5a1a;font-weight:bold;border-bottom:3px solid #d6458f;">
+В обработке
+</td>
+<td width="33%" align="center" bgcolor="#f1f5df" style="background-color:#f1f5df;border-radius:3px;padding:10px 8px;font-family:Tahoma,sans-serif;font-size:13px;line-height:1.4;color:#4a5a1a;opacity:0.7;">
+Скоро отправка
+</td>
+</tr>
+</table>
+</td>
+</tr>
+<tr>
+<td align="left" style="padding:10px 40px 30px;"><!-- Здесь вставляется тело письма --><h2 style="margin:20px 0 12px;color:#4a5a1a;font-size:20px;line-height:1.5;font-family:Helvetica,Arial,sans-serif;">Как всё пройдёт дальше</h2>
+<p style="margin:0 0 12px;font-family:Tahoma,sans-serif;font-size:15px;line-height:1.6;color:#4a5a1a;">
+Мы усердно трудимся над тем, чтобы ваш комплект был собран безупречно. <strong style="font-weight:700">Каждый этап</strong> проходит строгий контроль качества перед передачей в службу доставки.
+</p>
+<p style="margin:0 0 16px;font-family:Tahoma,sans-serif;font-size:15px;line-height:1.6;color:#4a5a1a;">
+Вот простые шаги, которые происходят сейчас:
+</p>
+<ul style="margin:0 0 16px;padding-left:20px;font-family:Tahoma,sans-serif;font-size:15px;line-height:1.6;color:#4a5a1a;">
+<li style="margin-bottom:6px;">Сотрудники склада комплектуют ваш заказ.</li>
+<li style="margin-bottom:6px;">Проверяется целостность упаковки и комплектация.</li>
+<li style="margin-bottom:0;">Курьерская служба получает данные для отправления.</li>
+</ul>
+<hr style="border:none;border-top:1px solid #f1f5df;margin:20px 0;">
+<p style="margin:0;font-family:Tahoma,sans-serif;font-size:14px;line-height:1.5;color:#4a5a1a;font-style:italic;">
+С уважением, отдел логистики {{brandName}}
+</p>
+</td>
+</tr>
+<tr>
+<td align="left" style="padding:20px 40px 40px;border-top:1px solid #f1f5df;">
+<p style="margin:0 0 8px;font-family:Tahoma,sans-serif;font-size:13px;line-height:1.5;color:#4a5a1a;">
+Вопросы по заказу? <a href="mailto:{{supportEmail}}" style="color:#4a5a1a;text-decoration:underline;">Напишите нам</a>
+</p>
+<p style="margin:0;font-family:Tahoma,sans-serif;font-size:13px;line-height:1.5;color:#4a5a1a;">
+Письмо отправлено на {{email}}
+</p>
+</td>
+</tr>
+</table>
+</td>
+</tr>
+</table>
+</body>
+</html>
