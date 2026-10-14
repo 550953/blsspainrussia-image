@@ -1,0 +1,98 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta http-equiv="X-UA-Compatible" content="IE=edge">
+<title>Ваш заказ {{productName}} оформлен</title>
+<meta name="x-apple-disable-message-reformatting"><meta name="color-scheme" content="light"><meta name="supported-color-schemes" content="light"></head>
+<body bgcolor="#f0fdf4" style="margin:0;padding:0;background-color:#f0fdf4;font-family:'Trebuchet MS',Verdana,sans-serif;-webkit-text-size-adjust:100%;-ms-text-size-adjust:100%">
+<div style="display:none;font-size:1px;line-height:1px;max-height:0;max-width:0;opacity:0;overflow:hidden;mso-hide:all;">
+Заказ {{transactionalId}} успешно принят в работу, скоро всё подготовим.&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;
+</div>
+<table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" bgcolor="#f0fdf4" style="background-color:#f0fdf4;table-layout:fixed;mso-table-lspace:0pt;mso-table-rspace:0pt">
+<tr>
+<td align="center" style="padding:24px 12px;">
+<table role="presentation" cellpadding="0" cellspacing="0" border="0" width="560" style="width:100%;max-width:560px;background-color:#ffffff;border-radius:12px;border-collapse:separate;mso-table-lspace:0pt;mso-table-rspace:0pt" bgcolor="#ffffff">
+<tr>
+<td style="padding:28px 32px 20px 32px;">
+<table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" style="mso-table-lspace:0pt;mso-table-rspace:0pt">
+<tr>
+<td style="padding-bottom:24px;">
+<span style="display:inline-block;padding:4px 8px;background-color:#82c91e;color:#0d233a;font-size:18px;font-weight:bold;line-height:1.2;border-radius:4px;">{{brandName}}</span>
+</td>
+</tr>
+<tr>
+<td style="padding-bottom:20px;">
+<h1 style="margin:0 0 12px 0;color:#0d233a;font-size:22px;line-height:1.4;font-weight:normal;">Здравствуйте, {{name}}!</h1>
+<p style="margin:0;color:#0d233a;font-size:16px;line-height:1.5;">Мы получили ваш заказ и уже начали им заниматься. Спасибо за доверие к нам.</p>
+</td>
+</tr>
+<tr>
+<td style="padding-bottom:24px;">
+<table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" bgcolor="#e6fcf5" style="background-color:#e6fcf5;border-radius:8px;border-collapse:separate;mso-table-lspace:0pt;mso-table-rspace:0pt">
+<tr>
+<td style="padding:20px;">
+<table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" style="mso-table-lspace:0pt;mso-table-rspace:0pt">
+<tr>
+<td style="padding-bottom:8px;color:#0d233a;font-size:15px;line-height:1.5;"><strong>Товар:</strong> {{productName}}</td>
+</tr>
+<tr>
+<td style="padding-bottom:8px;color:#0d233a;font-size:15px;line-height:1.5;"><strong>Номер заказа:</strong> {{transactionalId}}</td>
+</tr>
+<tr>
+<td style="color:#0d233a;font-size:15px;line-height:1.5;"><strong>Сумма:</strong> <span style="display:inline-block;background-color:#0d233a;color:#ffffff;width:20px;height:20px;text-align:center;font-size:13px;line-height:20px;border-radius:6px;vertical-align:middle;margin-right:2px;">$</span>{{price}}</td>
+</tr>
+</table>
+</td>
+</tr>
+</table>
+</td>
+</tr>
+<tr>
+<td style="padding-bottom:28px;">
+<table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" style="border-collapse:separate;mso-table-lspace:0pt;mso-table-rspace:0pt">
+<tr>
+<td width="32%" align="center" bgcolor="#82c91e" style="background-color:#82c91e;padding:10px 4px;border-radius:6px;color:#0d233a;font-size:13px;line-height:1.3;font-weight:bold;">Заказ подтверждён</td>
+<td width="2%">&nbsp;</td>
+<td width="32%" align="center" bgcolor="#0d233a" style="background-color:#0d233a;padding:10px 4px;border-radius:6px;color:#ffffff;font-size:13px;line-height:1.3;font-weight:bold;">Товар в обработке</td>
+<td width="2%">&nbsp;</td>
+<td width="32%" align="center" bgcolor="#e6fcf5" style="background-color:#e6fcf5;padding:10px 4px;border-radius:6px;color:#0d233a;font-size:13px;line-height:1.3;">Скоро отправка</td>
+</tr>
+</table>
+</td>
+</tr>
+<tr>
+<td style="padding-top:4px;border-top:1px solid #e2e8f0;padding-top:24px;"><!-- Здесь вставляется тело письма --><h2 style="margin:0 0 12px 0;color:#0d233a;font-size:18px;line-height:1.4;">Что происходит сейчас</h2>
+<p style="margin:0 0 12px 0;color:#0d233a;font-size:15px;line-height:1.5;">Мы проверяем комплектность и аккуратно упаковываем ваш <strong>заказ</strong>, чтобы он доехал в идеальном состоянии.</p>
+<p style="margin:0 0 12px 0;color:#0d233a;font-size:15px;line-height:1.5;">Вот основные этапы, через которые он проходит:</p>
+<ul style="margin:0 0 16px 0;padding-left:20px;color:#0d233a;font-size:15px;line-height:1.5;">
+<li style="margin-bottom:6px;color:#0d233a;font-size:15px;line-height:1.5;">Сверка артикулов и проверка качества</li>
+<li style="margin-bottom:6px;color:#0d233a;font-size:15px;line-height:1.5;">Бережная защитная упаковка</li>
+<li style="margin-bottom:6px;color:#0d233a;font-size:15px;line-height:1.5;">Передача в службу доставки</li>
+</ul>
+<hr style="border:none;border-top:1px solid #e2e8f0;margin:16px 0;">
+<p style="margin:0;color:#4a5568;font-size:14px;line-height:1.5;font-style:italic;">С теплом и заботой, команда вашего магазина</p>
+</td>
+</tr>
+<tr>
+<td style="padding-top:32px;border-top:1px solid #e2e8f0;margin-top:28px;">
+<table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" style="mso-table-lspace:0pt;mso-table-rspace:0pt">
+<tr>
+<td style="color:#0d233a;font-size:13px;line-height:1.5;">Вопросы? <a href="mailto:{{supportEmail}}" style="color:#0d233a;text-decoration:underline;">Напишите нам</a></td>
+</tr>
+<tr>
+<td style="padding-top:6px;color:#4a5568;font-size:13px;line-height:1.5;">Письмо отправлено на {{email}}</td>
+</tr>
+</table>
+</td>
+</tr>
+</table>
+</td>
+</tr>
+</table>
+</td>
+</tr>
+</table>
+</body>
+</html>
