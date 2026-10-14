@@ -20,8 +20,22 @@ BANNED = (
     "urgent", "action required", "act now", "act fast", "limited time", "don't delay", "dont delay",
     "verify now", "verify immediately", "get paid now", "unlock funds", "funds on hold", "payment hold",
     "delays may apply", "within 24 hours", "last chance", "sold", "hot", "срочн*", "немедленн*", "прямо сейчас",
-    "не откладыва*", "успейте", "успей", "быстрее", "последний шанс", "иначе потеря*",
+    "не откладыва*", "успейте", "успей", "последний шанс", "иначе потеря*",
     "в течение 24 час*", "средства под блокировк*", "заблокир*", "не упустите", "торопитесь", "поторопитесь",
+)
+
+
+# Мягкие стоп-слова: безобидны в обычной фразе («пока чайник закипает быстрее…»), поэтому только предупреждение без ремонтного вызова.
+SOFT_BANNED = ("быстрее",)
+_STOCK_PHRASES = (
+    r"статус заказа|ваш заказ|что происходит|путь вашего заказа|с уважением|с теплом|"
+    r"рады вас приветствовать|максимум внимания|под контролем специалистов"
+)
+# Выдуманные подробности: склад, накладная, служба доставки, специалисты, отдел, персональный менеджер, «бережно».
+_INVENTED_PATTERN = (
+    r"\bмастер\w*|\bсклад(?:а|е|у|ом|ы|ов|ах)?\b|\bкурьер\w*|\bтрек(?:[-\s]?номер\w*)?\b|\bнакладн\w*|"
+    r"\bспециалист\w*|\bперсональн\w*\s+менеджер\w*|\bслужб\w*\s+доставк\w*|"
+    r"\bотдел(?:а|у|ом|е|ы|ов)?\b|\bбережн\w*"
 )
 
 
@@ -31,6 +45,7 @@ class Issue:
     severity: str
     message: str
     where: str = ""
+    count: int = 1
 
 
 @dataclass
@@ -240,7 +255,8 @@ def _fragment(source: str, start: int, end: Optional[int] = None, limit: int = 2
 _WHERE_LIMIT = 120
 _CONTENT_PATTERNS = {
     "S06": r"ваш заказ оформлен|спасибо за покупку|мы рады сообщить|уважаемый клиент",
-    "S08": r"\b(?:статус заказа|ваш заказ)\b",
+    "S08": r"(?<!\w)(?:" + _STOCK_PHRASES + r")(?!\w)",
+    "S14": _INVENTED_PATTERN,
     "S10": r"\b(ты|тебе|тебя|твой|твоя|твое|твои|тобой)\b",
     "S11": r"\b(?:нажмите|кликните|жмите|click\s+here)\b",
     "S12": r"\b(?:акци\w*|скидк\w*|распродаж\w*|sale|discount|offer)\b",
@@ -268,7 +284,7 @@ def _fill_where(report, source, content_text, nodes, preheader):
                 if token.group(0) not in allowed:
                     return around(source, token)
         elif rule == "S01":
-            for term in BANNED:
+            for term in BANNED + SOFT_BANNED:
                 phrase = term[:-1] if term.endswith("*") else term
                 pattern = re.escape(phrase).replace(r"\ ", r"\s+") + (r"\w*" if term.endswith("*") else "")
                 hit = re.search(r"(?<!\w)" + pattern + r"(?!\w)", content_text)
@@ -305,6 +321,37 @@ def _fill_where(report, source, content_text, nodes, preheader):
             else:
                 issue.where = issue.where[:_WHERE_LIMIT]
 
+
+
+_GROUPED_WARNINGS = {"T13", "T14", "T25", "T27"}
+_MAX_WARNING_LINES_PER_RULE = 5
+
+
+def _group_warnings(report):
+    """Одна строка на правило и тип элемента (поле count), не больше 5 строк на правило, остальное в stats["suppressed_warnings"]."""
+    merged, order = {}, []
+    for issue in report.warnings:
+        tag = ""
+        if issue.rule in _GROUPED_WARNINGS:
+            match = re.match(r"([a-z0-9]+):", issue.where)
+            tag = match.group(1) if match else ""
+        key = (issue.rule, tag) if tag else (issue.rule, id(issue))
+        if key in merged:
+            merged[key].count += issue.count
+        else:
+            merged[key] = issue
+            order.append(key)
+    kept, per_rule, suppressed = [], {}, {}
+    for key in order:
+        issue = merged[key]
+        per_rule[issue.rule] = per_rule.get(issue.rule, 0) + 1
+        if per_rule[issue.rule] > _MAX_WARNING_LINES_PER_RULE:
+            suppressed[issue.rule] = suppressed.get(issue.rule, 0) + issue.count
+        else:
+            kept.append(issue)
+    report.warnings = kept
+    if suppressed:
+        report.stats["suppressed_warnings"] = suppressed
 
 
 def _contrast_message(label, foreground, background, observed):
@@ -733,7 +780,7 @@ def validate(source: str, currency_method: Optional[int] = None) -> Report:
             detail_start >= 0 and detail_start <= node.start_pos < marker_pos
             and len((node.text or "").strip()) <= 30
         ):
-            _issue(report, "T13", "W", "Для основного текста рекомендуется не менее 15 px", node.tag)
+            _issue(report, "T13", "W", "Для основного текста рекомендуется не менее 15 px", node.tag + ": " + _fragment(source, node.start_pos, None, 90))
         family = st.get("font-family")
         if family:
             allowed_fonts = {"arial", "georgia", "trebuchet ms", "verdana", "tahoma", "helvetica", "serif", "sans-serif"}
@@ -749,7 +796,7 @@ def validate(source: str, currency_method: Optional[int] = None) -> Report:
             if line_px and font_size and float(font_size.group(1)) > 0 else None
         )
         if line_ratio is not None and has_text and not is_round and id(node) != id(preheader_node) and not 1.4 <= line_ratio <= 1.6:
-            _issue(report, "T14", "W", "Рекомендуемый межстрочный интервал: 1.4–1.6", node.tag)
+            _issue(report, "T14", "W", "Рекомендуемый межстрочный интервал: 1.4–1.6", node.tag + ": " + _fragment(source, node.start_pos, None, 90))
         if node.tag == "a" and ("padding" in st or "background" in st):
             _issue(report, "S05", "E", "Ссылка не должна выглядеть как кнопка")
     if re.search(r"\brole\s*=\s*['\"]?button", source, re.I):
@@ -965,14 +1012,21 @@ def validate(source: str, currency_method: Optional[int] = None) -> Report:
         if re.search(r"(?<!\w)" + pattern + r"(?!\w)", content_text):
             _issue(report, "S01", "E", "Найдено запрещённое слово или выражение")
             break
+    for term in SOFT_BANNED:
+        if re.search(r"(?<!\w)" + re.escape(term) + r"(?!\w)", content_text):
+            _issue(report, "S01", "W", "Мягкое стоп-слово «%s»: уберите, если это не нужно по смыслу" % term)
+            break
     exclamations = content_text.count("!")
     report.stats["exclamations"] = exclamations
     if exclamations > 2: _issue(report, "S02", "E", "В письме больше двух восклицательных знаков")
     elif exclamations == 2: _issue(report, "S02", "W", "В письме два восклицательных знака")
     if re.search(r"ваш заказ оформлен|спасибо за покупку|мы рады сообщить|уважаемый клиент", content_text):
         _issue(report, "S06", "E", "Найдена шаблонная формулировка из списка запретов")
-    if re.search(r"\b(?:статус заказа|ваш заказ)\b", content_text):
-        _issue(report, "S08", "W", "Замените типовой заголовок статуса или заказа")
+    heading_text = " ".join(
+        html.unescape(_text(node)).replace("ё", "е").casefold() for node in nodes if node.tag in {"h1", "h2", "h3"}
+    )
+    if re.search(_CONTENT_PATTERNS["S08"], content_text) or re.search(r"(?<!\w)как продвигается", heading_text):
+        _issue(report, "S08", "W", "Замените типовой заголовок, подпись или оборот из списка шаблонных (что происходит, путь заказа, с уважением и т. п.)")
     if re.search(r"\b(?:нажмите|кликните|жмите|click\s+here)\b", content_text):
         _issue(report, "S11", "W", "Избегайте прямого призыва нажать или кликнуть")
     if re.search(r"\b(?:акци\w*|скидк\w*|распродаж\w*|sale|discount|offer)\b", content_text):
@@ -1192,16 +1246,16 @@ def validate(source: str, currency_method: Optional[int] = None) -> Report:
         if node.tag == "span" and any(prop.startswith(("padding", "margin")) for prop in _style(node)):
             _issue(report, "T27", "W", "Outlook игнорирует padding и margin на span: отступы задавай ячейкой таблицы или пробелом", node.tag)
             break
-    # --- S14: выдуманные подробности (склад, мастера, курьер, трек) до блока сообщения
-    if marker_pos >= 0:
-        head_text = html.unescape(re.sub(r"<[^>]*>", " ", source[:marker_pos]))
-        invented = re.search(
-            r"\bмастер\w*|\bсклад(?:а|е|у|ом|ы|ов|ах)?\b|\bкурьер\w*|\bтрек(?:[-\s]?номер\w*)?\b",
-            head_text, re.I,
+    # --- S14: выдуманные подробности (склад, накладная, служба доставки, специалисты, отдел, трек, «бережно») во всём видимом тексте
+    invented = re.search(_INVENTED_PATTERN, content_text)
+    if invented:
+        _issue(
+            report, "S14", "W",
+            "Не выдумывай подробности, которых ты не знаешь (склад, накладная, служба доставки, специалисты, отдел, трек-номер, сроки): «%s»" % invented.group(0),
+            _fragment(content_text, invented.start(), invented.end(), _WHERE_LIMIT),
         )
-        if invented:
-            _issue(report, "S14", "W", "Не выдумывай подробности, которых ты не знаешь (склад, мастера, курьер, трек-номер, сроки): «%s»" % invented.group(0), invented.group(0))
     _fill_where(report, source, content_text, nodes, preheader)
+    _group_warnings(report)
     report.ok = not report.errors
     return report
 
@@ -1211,7 +1265,7 @@ _WARNING_RULES = {
     "A04", "P02", "T27", "S14",
     *(f"M{number:02d}" for number in range(1, 21)),
 }
-_MIXED_SEVERITY_RULES = {"T04", "T16", "T17", "T23", "S02", "S04", "T26", "P03"}
+_MIXED_SEVERITY_RULES = {"T04", "T16", "T17", "T23", "S01", "S02", "S04", "T26", "P03"}
 RULES: Dict[str, dict] = {
     rule: {
         "id": rule,

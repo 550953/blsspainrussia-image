@@ -78,6 +78,30 @@ GREETINGS = [
     "Здравствуйте, {{name}}",
     "{{name}}, мы начали работу",
     "Приятно познакомиться, {{name}}",
+    "{{name}}, заказ у нас",
+    "Добрый вечер, {{name}}",
+    "Доброе утро, {{name}}",
+    "{{name}}, всё на месте",
+    "Мы на связи, {{name}}",
+    "{{name}}, спасибо, что выбрали нас",
+    "{{name}}, вот краткая сводка",
+    "Хорошие новости, {{name}}",
+    "{{name}}, всё идёт как надо",
+    "Рады вас видеть, {{name}}",
+    "{{name}}, мы всё получили",
+    "Отлично, {{name}}, заказ принят",
+    "{{name}}, коротко о главном",
+    "Заказ принят, {{name}}",
+    "{{name}}, держим вас в курсе",
+    "Приветствуем, {{name}}",
+    "{{name}}, у нас всё в порядке",
+    "Привет-привет, {{name}}",
+    "{{name}}, мы уже на старте",
+    "Спасибо, что заглянули, {{name}}",
+    "{{name}}, дело сдвинулось",
+    "Всё готово к работе, {{name}}",
+    "{{name}}, взялись за заказ",
+    "Добро пожаловать, {{name}}",
 ]
 HEADINGS = [
     "Следующие шаги",
@@ -90,6 +114,29 @@ HEADINGS = [
     "Как всё устроено",
     "От заявки до отправки",
     "Что мы делаем дальше",
+    "Что дальше",
+    "Ближайшие шаги",
+    "Дальше по плану",
+    "Наш план на заказ",
+    "Три коротких шага",
+    "Что мы сделаем",
+    "Как мы действуем",
+    "Этапы заказа",
+    "Что нас ждёт дальше",
+    "По шагам",
+    "Коротко о ближайшем",
+    "Ход работы",
+    "Дорожная карта заказа",
+    "Шаг за шагом",
+    "Что готовим дальше",
+    "Что мы делаем с заказом",
+    "Заказ по этапам",
+    "Три действия впереди",
+    "Куда движется заказ",
+    "Наши ближайшие действия",
+    "Порядок работы",
+    "Дальше без сюрпризов",
+    "Что в планах",
 ]
 SIGNOFFS = [
     "Спокойного дня от {{brandName}}",
@@ -102,6 +149,29 @@ SIGNOFFS = [
     "Мы рядом, {{brandName}}",
     "Берегите себя, {{brandName}}",
     "На связи, {{brandName}}",
+    "Хорошего вечера, {{brandName}}",
+    "Всегда на связи, {{brandName}}",
+    "Спасибо, что с нами, {{brandName}}",
+    "Дальше напишем сами, {{brandName}}",
+    "До новых писем, {{brandName}}",
+    "Рядом, если понадобимся, — {{brandName}}",
+    "Ваш {{brandName}}",
+    "Хорошей недели, {{brandName}}",
+    "Мы всегда за вас, {{brandName}}",
+    "Не прощаемся, {{brandName}}",
+    "Спасибо за доверие, {{brandName}}",
+    "Пишите в любой момент, {{brandName}}",
+    "До скорого, {{brandName}}",
+    "Приятного дня, {{brandName}}",
+    "Команда {{brandName}} на связи",
+    "Вернёмся с новостями, {{brandName}}",
+    "Обязательно напишем, {{brandName}}",
+    "Заглядывайте к нам, {{brandName}}",
+    "Коротко и по делу, {{brandName}}",
+    "Всё под рукой, {{brandName}}",
+    "Мы тут, {{brandName}}",
+    "Спокойного вечера, {{brandName}}",
+    "Напишем, как только будут новости, — {{brandName}}",
 ]
 VOICES = [
     "через конкретику: что именно будет сделано на каждом этапе, без общих слов",
@@ -109,7 +179,7 @@ VOICES = [
     "спокойно и уверенно: заказ принят, всё идёт по плану, без оправданий и восторгов",
     "от первого лица множественного числа: «мы проверяем», «мы сообщим», живыми короткими фразами",
     "коротко и по делу: два предложения без образов",
-    "с одной лёгкой шуткой про ожидание, остальное строго по делу",
+    "с одной короткой шуткой про бытовую мелочь (не про чай, чайник, кофе, кота и не про скорость), остальное строго по делу",
     "как сообщение коллеги: просто, тепло, без канцелярита и без пафоса",
     "через сравнение с обычной жизнью, но одно и только понятное",
 ]
@@ -117,7 +187,9 @@ CURRENCY_METHODS = list(range(1, 21))
 HISTORY_DEFAULT = 12
 _lock = threading.Lock()
 _history: Deque[Tuple[str, str, str, int]] = deque(maxlen=HISTORY_DEFAULT)
-_text_history: Deque[Tuple[str, str, str, str]] = deque(maxlen=HISTORY_DEFAULT)
+# Тексты повторяются заметнее дизайна: история текстов длиннее и не меньше размера самого большого пула.
+TEXT_HISTORY_MIN = 40
+_text_history: Deque[Tuple[str, str, str, str]] = deque(maxlen=max(HISTORY_DEFAULT, TEXT_HISTORY_MIN))
 # Совместимое имя для кода, который раньше читал историю напрямую.
 HISTORY = _history
 
@@ -146,7 +218,7 @@ def set_history_size(n: int) -> None:
     global _history, HISTORY, _text_history
     with _lock:
         _history = deque(list(_history), maxlen=max(int(n), 1))
-        _text_history = deque(list(_text_history), maxlen=max(int(n), 1))
+        _text_history = deque(list(_text_history), maxlen=max(int(n), TEXT_HISTORY_MIN, 1))
         HISTORY = _history
 
 
@@ -170,9 +242,23 @@ def _resolve(pool, value, name):
 
 
 def _pick(rng, pool, recent, depth):
+    """Случайный вариант из тех, что не были среди последних `depth` выданных.
+
+    Если пул не больше истории (или depth не меньше размера пула), исключаются не все варианты, а `len(pool)-1`
+    самых недавних: остаётся как минимум один, наименее недавний. Выбор не падает и не зацикливается на одном значении.
+    """
+    pool = list(pool)
+    depth = max(0, min(int(depth), len(pool) - 1))
     recent_values = set(recent[-depth:]) if depth > 0 else set()
-    candidates = [value for value in pool if value not in recent_values] or list(pool)
+    candidates = [value for value in pool if value not in recent_values]
+    if not candidates:  # защита: пул из одного значения или пустая арифметика
+        candidates = pool
     return rng.choice(candidates)
+
+
+def _text_depth(pool):
+    """Сколько последних текстов исключать: три четверти пула. В пуле из 32 вариантов любые 25 писем подряд не повторяются."""
+    return max(1, (len(pool) * 3) // 4)
 
 
 def pick_brief(seed: Optional[int] = None, currency_method: Optional[int] = None,
@@ -207,9 +293,9 @@ def pick_brief(seed: Optional[int] = None, currency_method: Optional[int] = None
         )
         # Тексты выбираются после дизайна, чтобы выбор палитры, шапки и индикатора по одному seed не менялся.
         texts = list(_text_history)
-        selected_greeting = _resolve(GREETINGS, overrides.get("greeting"), "greeting") or _pick(rng, GREETINGS, [row[0] for row in texts], min(5, len(GREETINGS) - 1))
-        selected_heading = _resolve(HEADINGS, overrides.get("heading"), "heading") or _pick(rng, HEADINGS, [row[1] for row in texts], min(5, len(HEADINGS) - 1))
-        selected_signoff = _resolve(SIGNOFFS, overrides.get("signoff"), "signoff") or _pick(rng, SIGNOFFS, [row[2] for row in texts], min(5, len(SIGNOFFS) - 1))
+        selected_greeting = _resolve(GREETINGS, overrides.get("greeting"), "greeting") or _pick(rng, GREETINGS, [row[0] for row in texts], _text_depth(GREETINGS))
+        selected_heading = _resolve(HEADINGS, overrides.get("heading"), "heading") or _pick(rng, HEADINGS, [row[1] for row in texts], _text_depth(HEADINGS))
+        selected_signoff = _resolve(SIGNOFFS, overrides.get("signoff"), "signoff") or _pick(rng, SIGNOFFS, [row[2] for row in texts], _text_depth(SIGNOFFS))
         selected_voice = _resolve(VOICES, overrides.get("voice"), "voice") or _pick(rng, VOICES, [row[3] for row in texts], min(4, len(VOICES) - 1))
         brief = DesignBrief(
             seed=seed, palette_family=selected_palette, fonts=selected_fonts, header=selected_header,

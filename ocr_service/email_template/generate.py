@@ -234,7 +234,7 @@ async def run_template_job(job_id: str, job: dict):
                 report_errors.extend({"rule": issue.rule, "message": issue.message, "where": issue.where} for issue in report.errors)
             report_warnings = list(parsed.warnings)
             if report is not None:
-                report_warnings.extend({"rule": issue.rule, "message": issue.message, "where": issue.where} for issue in report.warnings)
+                report_warnings.extend({"rule": issue.rule, "message": issue.message, "where": issue.where, "count": issue.count} for issue in report.warnings)
             last_report_errors = list(report_errors)
             current = {
                 "n": number, "model": model, "latency_ms": latency_ms,

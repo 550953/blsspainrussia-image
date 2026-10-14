@@ -157,9 +157,11 @@ def test_s14_flags_invented_facts_but_not_look_alike_words():
         assert found == phrase.startswith("Мастерство"), phrase  # «мастер*» ловит только корень, «складывается» нет
 
 
-def test_s14_ignores_message_block_after_marker():
+def test_s14_also_checks_message_block_after_marker():
+    # Раунд 4: выдуманные подробности модель пишет именно в блоке сообщения, поэтому S14 смотрит весь видимый текст (предупреждение).
     text = GOOD.replace("Мы сверяем состав", "Передаём на склад", 1)
-    assert "S14" not in _rules(validate(text, 1))
+    report = validate(text, 1)
+    assert "S14" in {i.rule for i in report.warnings} and "S14" not in {i.rule for i in report.errors}
 
 
 # ------------------------------------------------------ интеграция с generate

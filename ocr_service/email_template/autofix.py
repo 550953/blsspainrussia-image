@@ -3,6 +3,7 @@ import re
 from ..config import TEMPLATE_AUTOFIX_CONTRAST
 import colorsys
 from .contrast import color_tokens, is_red_orange, parse_color, ratio, suggest_fix
+from .validator import validate as _validate
 from .validator import ALLOWED_VARS, MARKER, _Tree, _outer_footer_row, _style, _text, _walk, find_stretched_circles, round_cell_side
 
 
@@ -777,6 +778,94 @@ def _fix_stretched_circles(source):
     return source, True
 
 
+_SPACING_PROP = re.compile(r"^(?:padding|margin)(?:-(?:top|right|bottom|left))?$")
+_SPAN_TOKEN = re.compile(r"<(/?)span\b[^>]*>", re.I)
+MAX_SPAN_SPACING_PX = 8
+
+
+def _spacing_px(value):
+    """Список чисел px из значения spacing или None, если есть auto, em, % и т. п."""
+    numbers = []
+    for part in value.replace("!important", "").split():
+        match = re.fullmatch(r"(-?\d+(?:\.\d+)?)(?:px)?", part.strip().lower())
+        if not match:
+            return None
+        numbers.append(float(match.group(1)))
+    return numbers or None
+
+
+def _span_sides(prop, numbers):
+    """(left, right) для одного свойства spacing."""
+    if prop.endswith("-left"):
+        return numbers[0], 0.0
+    if prop.endswith("-right"):
+        return 0.0, numbers[0]
+    if prop.endswith(("-top", "-bottom")):
+        return 0.0, 0.0
+    right = numbers[1] if len(numbers) > 1 else numbers[0]
+    left = numbers[3] if len(numbers) > 3 else (numbers[1] if len(numbers) > 1 else numbers[0])
+    return left, right
+
+
+def _fix_span_spacing(source):
+    """AF32: T27. margin/padding до 8px на <span> Outlook игнорирует: убираем их и ставим &nbsp; с нужной стороны.
+
+    Больше 8px, значения не в px и span без style не трогаем. Идемпотентно; если число ошибок выросло, возвращаем исходный текст.
+    """
+    stack, edits = [], []
+    for token in _SPAN_TOKEN.finditer(source):
+        if token.group(1):
+            if stack:
+                opened = stack.pop()
+                if opened is not None:
+                    edits.append((opened, token.start()))
+            continue
+        tag = token.group(0)
+        style = re.search(r"\bstyle\s*=\s*([\"'])(.*?)\1", tag, re.I | re.S)
+        plan = None
+        if style:
+            kept, left, right, drop, valid = [], 0.0, 0.0, False, True
+            for declaration in style.group(2).split(";"):
+                if ":" not in declaration:
+                    if declaration.strip():
+                        kept.append(declaration.strip())
+                    continue
+                name, value = declaration.split(":", 1)
+                name_key = name.strip().lower()
+                if not _SPACING_PROP.match(name_key):
+                    kept.append(declaration.strip())
+                    continue
+                numbers = _spacing_px(value)
+                if numbers is None or len(numbers) > 4 or max(abs(n) for n in numbers) > MAX_SPAN_SPACING_PX or min(numbers) < 0:
+                    valid = False
+                    break
+                drop = True
+                side_left, side_right = _span_sides(name_key, numbers)
+                left, right = max(left, side_left), max(right, side_right)
+            if valid and drop:
+                new_style = ";".join(kept) + (";" if kept else "")
+                new_tag = tag[:style.start(2)] + new_style + tag[style.end(2):]
+                plan = (token.start(), token.end(), new_tag, left, right)
+        stack.append(plan)
+    if not edits:
+        return source, False
+    result = source
+    pieces = []
+    for plan, close_at in edits:
+        start, end, new_tag, left, right = plan
+        pieces.append((start, end, new_tag + ("&nbsp;" * min(2, max(1, round(left / 4))) if left > 0 else "")))
+        if right > 0:
+            pieces.append((close_at, close_at, "&nbsp;" * min(2, max(1, round(right / 4)))))
+    for start, end, text in sorted(pieces, key=lambda item: (item[0], item[1]), reverse=True):
+        result = result[:start] + text + result[end:]
+    try:
+        if len(_validate(result).errors) > len(_validate(source).errors):
+            return source, False
+    except Exception:
+        return source, False
+    return result, result != source
+
+
 def _fix_text_metrics(source):
     """AF31: T13/T14. Межстрочный интервал 1.4–1.6 у абзацев, пунктов и ячеек с текстом; 12–14px в блоке сообщения -> 15px.
 
@@ -1127,7 +1216,7 @@ def apply(source: str):
         fixes.append("AF12")
     for fix_id, function in (
         ("AF20", _fix_message_styles), ("AF21", _fix_message_structure), ("AF23", _fix_page_backgrounds),
-        ("AF24", _fix_preheader), ("AF25", _fix_round_shapes), ("AF30", _fix_stretched_circles), ("AF31", _fix_text_metrics), ("AF26", _fix_done_mark),
+        ("AF24", _fix_preheader), ("AF25", _fix_round_shapes), ("AF30", _fix_stretched_circles), ("AF31", _fix_text_metrics), ("AF32", _fix_span_spacing), ("AF26", _fix_done_mark),
         ("AF27", _fix_banned_phrases), ("AF29", _fix_red_orange),
     ):
         try:

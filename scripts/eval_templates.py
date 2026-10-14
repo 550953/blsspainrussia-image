@@ -40,6 +40,34 @@ def was_autofix_rescued(attempts):
     )
 
 
+# Копия prompt.FORBIDDEN_STEMS: скрипт самостоятельный и не импортирует код сервиса (тест следит за совпадением).
+FORBIDDEN_STEMS = (
+    "с уважением", "с теплом", "рады вас приветствовать", "что происходит", "путь вашего заказа", "как продвигается",
+    "прямо сейчас", "персональн", "под контролем", "бережн", "максимум внимания", "накладн", "служб", "специалист",
+    "отдел", "мастер", "склад", "курьер", "трек",
+)
+
+
+def visible_text(document):
+    return html.unescape(re.sub(r"<[^>]*>", " ", re.sub(r"<(?:style|script)\b[\s\S]*?</(?:style|script)>", " ", document or "", flags=re.I)))
+
+
+def extract_texts(document):
+    """Приветствие (h1), заголовок блока (первый h2) и подпись (последний курсивный абзац)."""
+    def clean(fragment):
+        return re.sub(r"\s+", " ", html.unescape(re.sub(r"<[^>]*>", " ", fragment))).strip()
+    h1 = re.search(r"<h1\b[^>]*>([\s\S]*?)</h1>", document or "", re.I)
+    h2 = re.search(r"<h2\b[^>]*>([\s\S]*?)</h2>", document or "", re.I)
+    italic = re.findall(r"<p\b[^>]*font-style\s*:\s*italic[^>]*>([\s\S]*?)</p>", document or "", re.I)
+    return {"greeting": clean(h1.group(1)) if h1 else "", "h2": clean(h2.group(1)) if h2 else "", "signoff": clean(italic[-1]) if italic else ""}
+
+
+def count_forbidden(document):
+    """Сколько запрещённых оборотов (по основам слов) в видимом тексте: Counter {основа: число}."""
+    text = re.sub(r"\s+", " ", visible_text(document)).casefold().replace("ё", "е")
+    return Counter({stem: text.count(stem) for stem in FORBIDDEN_STEMS if stem in text})
+
+
 def evaluate_one(args, number, out_dir):
     headers = {"X-API-Key": args.api_key}
     base = args.base_url.rstrip("/")
@@ -61,7 +89,7 @@ def evaluate_one(args, number, out_dir):
             result = client.get(
                 base + "/template/result/" + job_id,
                 headers=headers,
-                params={"html": 1},
+                params={"html": 1, "attempts_html": 1} if args.attempts_html else {"html": 1},
             )
             result.raise_for_status()
             payload = result.json()
@@ -81,6 +109,12 @@ def evaluate_one(args, number, out_dir):
         filename = f"{number:03d}-{job_id}.html"
         (out_dir / filename).write_text(document, encoding="utf-8")
     attempts = template.get("attempts") or []
+    texts = extract_texts(document)
+    forbidden_final = count_forbidden(document)
+    # До автофикса: только если сервер запущен с TEMPLATE_KEEP_ATTEMPT_HTML=1 и скрипт с --attempts-html.
+    raw_documents = [item.get("raw_html") or "" for item in (payload.get("attempts_html") or [])]
+    forbidden_raw = count_forbidden(raw_documents[0]) if raw_documents else None
+    warnings_report = (template.get("report") or {}).get("warnings") or []
     first_valid = bool(attempts and not attempts[0].get("errors"))
     raw_rules = Counter(rule for attempt in attempts for rule in attempt.get("raw_errors", []))
     tokens = Counter()
@@ -105,6 +139,13 @@ def evaluate_one(args, number, out_dir):
         "bytes": len(document.encode("utf-8")),
         "html_file": filename,
         "raw_rule_counts": dict(raw_rules),
+        "greeting": texts["greeting"], "h2": texts["h2"], "signoff": texts["signoff"],
+        "forbidden_final": dict(forbidden_final),
+        "forbidden_before_autofix": dict(forbidden_raw) if forbidden_raw is not None else None,
+        "warning_lines": len(warnings_report),
+        "warning_rules": dict(Counter(str(item.get("rule")) for item in warnings_report)),
+        "had_a06": any("A06" in (attempt.get("raw_errors") or []) for attempt in attempts),
+        "first_attempt_error_details": (attempts[0].get("raw_error_details") or [])[:10] if attempts and not first_valid else [],
         "tokens": dict(tokens),
         "text_5grams": text_5grams(document),
         "colors": sorted(set(re.findall(r"#[0-9a-fA-F]{3,8}\b", document))),
@@ -120,7 +161,9 @@ def main():
     parser.add_argument("--model")
     parser.add_argument("--out", default="eval_out")
     parser.add_argument("--account-id", default="template-eval")
-    parser.add_argument("--seed", type=int, default=20261013)
+    # --seed-base: одинаковые брифы для двух моделей (seed письма = база + номер), сравнение честное.
+    parser.add_argument("--seed", "--seed-base", dest="seed", type=int, default=20261013)
+    parser.add_argument("--attempts-html", action="store_true", help="забирать HTML попыток (сервер с TEMPLATE_KEEP_ATTEMPT_HTML=1), чтобы считать запрещённые обороты до автофикса")
     parser.add_argument("--max-attempts", type=int, default=3)
     parser.add_argument("--poll-interval", type=float, default=4.0)
     parser.add_argument("--timeout", type=float, default=45.0)
@@ -180,6 +223,29 @@ def main():
             if completed else None
         ),
         "top_raw_rules": raw_rules.most_common(10),
+        "diversity": {
+            "distinct_greetings": len({item["greeting"] for item in completed if item.get("greeting")}),
+            "distinct_h2": len({item["h2"] for item in completed if item.get("h2")}),
+            "distinct_signoffs": len({item["signoff"] for item in completed if item.get("signoff")}),
+            "distinct_palettes": len({item.get("palette") for item in completed if item.get("palette")}),
+            "letters": len(completed),
+        },
+        "forbidden_in_final": sum(sum((item.get("forbidden_final") or {}).values()) for item in completed),
+        "forbidden_in_final_by_stem": Counter(
+            {stem: sum((item.get("forbidden_final") or {}).get(stem, 0) for item in completed) for stem in FORBIDDEN_STEMS}
+        ).most_common(10),
+        "forbidden_before_autofix": (
+            sum(sum((item.get("forbidden_before_autofix") or {}).values()) for item in completed)
+            if any(item.get("forbidden_before_autofix") is not None for item in completed) else None
+        ),
+        "letters_with_a06": sum(bool(item.get("had_a06")) for item in completed),
+        "warning_lines_per_letter": (
+            round(sum(item.get("warning_lines", 0) for item in completed) / len(completed), 2) if completed else None
+        ),
+        "first_pass_failures": [
+            {"job_id": item["job_id"], "details": item["first_attempt_error_details"]}
+            for item in completed if item.get("first_attempt_error_details")
+        ],
         "latency_seconds": {"p50": percentile(durations, 0.5), "p95": percentile(durations, 0.95)},
         "tokens": {
             key: sum((item.get("tokens") or {}).get(key, 0) for item in completed)

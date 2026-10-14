@@ -5,7 +5,7 @@ from ocr_service.email_template.prompt import PROMPT_VERSION, system_instruction
 def test_header_prompt_prevents_duplicate_wordmarks_and_overlap():
     prompt = system_instruction()
 
-    assert PROMPT_VERSION == "1.5"
+    assert PROMPT_VERSION == "1.6"
     assert "покажи текст {{brandName}} ровно один раз" in prompt
     assert "Декоративный акцент должен быть без текста" in prompt
     assert "Не используй position:absolute/fixed" in prompt

@@ -9,6 +9,7 @@
 #   powershell -ExecutionPolicy Bypass -File .\gen_batch.ps1
 #   powershell -ExecutionPolicy Bypass -File .\gen_batch.ps1 -Count 10 -Parallel 10 -CurrencyMethod 4
 #   powershell -ExecutionPolicy Bypass -File .\gen_batch.ps1 -Parallel 1          # one by one (baseline)
+#   powershell -ExecutionPolicy Bypass -File .\gen_batch.ps1 -Count 30 -Parallel 3 -OcrScale 3 -OcrFile "C:\...\bls\1.txt"   # 3x OCR load next to templates
 #
 # What it does:
 #   1. submits jobs keeping up to -Parallel of them active; a 429 (queue full / rate limit) is waited out and retried
@@ -26,10 +27,21 @@ param(
     [int]$CurrencyMethod = 4,         # 1..20, 0 = let the server choose
     [int]$MaxWait = 1800,             # overall limit for the whole run, seconds
     [int]$HealthEvery = 5,            # /health sampling period, seconds
+    [switch]$NoOcrProbe,              # OCR probe is ON by default: real OCR jobs (POST /ocr/submit) are sent while templates run
+    [switch]$OcrProbe,                # accepted for old command lines; the probe is on anyway (use -NoOcrProbe to turn it off)
+    [int]$OcrScale = 1,               # load multiplier for the OCR probe: x2 = twice as many probes in flight and twice as often (images per probe stay -OcrImages, so the baseline stays comparable)
+    [int]$OcrImages = 20,             # images per OCR probe job (taken from bls\1.txt)
+    [int]$OcrEvery = 12,              # start a new OCR probe every N seconds while templates are running
+    [string]$OcrFile = "",            # data-URL images, one per line (default: ocr_probe_images.txt next to this script)
     [switch]$NoOpen                   # do not open Explorer at the end
 )
 $ErrorActionPreference = "Stop"
 try { [Console]::OutputEncoding = [Text.Encoding]::UTF8 } catch {}
+$doOcr = -not $NoOcrProbe
+if ($OcrScale -lt 1) { $OcrScale = 1 }
+if ($OcrScale -gt 8) { $OcrScale = 8 }
+$ocrMaxProbes = 3 * $OcrScale
+$ocrEveryEff = [Math]::Max(2, [int][Math]::Round($OcrEvery / $OcrScale))
 
 # ------------------------------------------------------------------ helpers
 function Invoke-Api {
@@ -137,6 +149,44 @@ function Cut {
     return $S
 }
 
+function U {
+    # Cyrillic literals are written as \uXXXX escapes so this file stays ASCII-only (Windows PowerShell 5 reads it without BOM).
+    param([string]$S)
+    return [regex]::Unescape($S)
+}
+$script:ForbiddenStems = @("\u0441 \u0443\u0432\u0430\u0436\u0435\u043d\u0438\u0435\u043c", "\u0441 \u0442\u0435\u043f\u043b\u043e\u043c", "\u0440\u0430\u0434\u044b \u0432\u0430\u0441 \u043f\u0440\u0438\u0432\u0435\u0442\u0441\u0442\u0432\u043e\u0432\u0430\u0442\u044c", "\u0447\u0442\u043e \u043f\u0440\u043e\u0438\u0441\u0445\u043e\u0434\u0438\u0442", "\u043f\u0443\u0442\u044c \u0432\u0430\u0448\u0435\u0433\u043e \u0437\u0430\u043a\u0430\u0437\u0430", "\u043a\u0430\u043a \u043f\u0440\u043e\u0434\u0432\u0438\u0433\u0430\u0435\u0442\u0441\u044f", "\u043f\u0440\u044f\u043c\u043e \u0441\u0435\u0439\u0447\u0430\u0441", "\u043f\u0435\u0440\u0441\u043e\u043d\u0430\u043b\u044c\u043d", "\u043f\u043e\u0434 \u043a\u043e\u043d\u0442\u0440\u043e\u043b\u0435\u043c", "\u0431\u0435\u0440\u0435\u0436\u043d", "\u043c\u0430\u043a\u0441\u0438\u043c\u0443\u043c \u0432\u043d\u0438\u043c\u0430\u043d\u0438\u044f", "\u043d\u0430\u043a\u043b\u0430\u0434\u043d", "\u0441\u043b\u0443\u0436\u0431", "\u0441\u043f\u0435\u0446\u0438\u0430\u043b\u0438\u0441\u0442", "\u043e\u0442\u0434\u0435\u043b", "\u043c\u0430\u0441\u0442\u0435\u0440", "\u0441\u043a\u043b\u0430\u0434", "\u043a\u0443\u0440\u044c\u0435\u0440", "\u0442\u0440\u0435\u043a" | ForEach-Object { U $_ })
+function Get-VisibleText {
+    param([string]$Html)
+    $t = [regex]::Replace($Html, '<(style|script)\b[\s\S]*?</\1>', ' ', 'IgnoreCase')
+    $t = [regex]::Replace($t, '<[^>]*>', ' ')
+    $t = [System.Net.WebUtility]::HtmlDecode($t)
+    return ([regex]::Replace($t, '\s+', ' ')).ToLowerInvariant().Replace([string][char]0x0451, [string][char]0x0435)
+}
+function Get-Forbidden {
+    # Returns @{ Total = n; Stems = "stem:n,..." } for banned phrases found in the visible text.
+    param([string]$Html)
+    $t = Get-VisibleText $Html
+    $total = 0; $parts = @()
+    foreach ($st in $script:ForbiddenStems) {
+        $n = ([regex]::Matches($t, [regex]::Escape($st))).Count
+        if ($n -gt 0) { $total += $n; $parts += ("{0}:{1}" -f $st, $n) }
+    }
+    return @{ Total = $total; Stems = ($parts -join ",") }
+}
+function Strip-Tags {
+    param([string]$X)
+    return ([regex]::Replace([System.Net.WebUtility]::HtmlDecode([regex]::Replace($X, '<[^>]*>', ' ')), '\s+', ' ')).Trim()
+}
+function Get-LetterTexts {
+    param([string]$Html)
+    $g = ""; $h2 = ""; $sg = ""
+    $m = [regex]::Match($Html, '<h1\b[^>]*>([\s\S]*?)</h1>', 'IgnoreCase'); if ($m.Success) { $g = Strip-Tags $m.Groups[1].Value }
+    $m = [regex]::Match($Html, '<h2\b[^>]*>([\s\S]*?)</h2>', 'IgnoreCase'); if ($m.Success) { $h2 = Strip-Tags $m.Groups[1].Value }
+    $ms = [regex]::Matches($Html, '<p\b[^>]*font-style\s*:\s*italic[^>]*>([\s\S]*?)</p>', 'IgnoreCase')
+    if ($ms.Count -gt 0) { $sg = Strip-Tags $ms[$ms.Count - 1].Groups[1].Value }
+    return @{ Greeting = $g; H2 = $h2; Signoff = $sg }
+}
+
 # ------------------------------------------------------------------ config
 $dot = Get-DotEnv
 if (-not $Base) { $Base = (Find-Cfg @("TEMPLATE_BASE_URL")).Value }
@@ -161,7 +211,7 @@ Add-Content -Path $healthPath -Encoding UTF8 -Value "time,elapsed_s,http,health_
 
 $cmLabel = if ($CurrencyMethod -gt 0) { "$CurrencyMethod" } else { "(server choice)" }
 $modelLabel = if ($Model) { $Model } else { "(server choice)" }
-Write-Log ("Base={0} Model={1} Count={2} Parallel={3} CurrencyMethod={4}" -f $Base, $modelLabel, $Count, $Parallel, $cmLabel)
+Write-Log ("Base={0} Model={1} Count={2} Parallel={3} CurrencyMethod={4} OcrScale=x{5}" -f $Base, $modelLabel, $Count, $Parallel, $cmLabel, $OcrScale)
 Write-Log ("Output folder: {0}" -f $out)
 
 # ------------------------------------------------------------------ health sampling
@@ -221,9 +271,11 @@ function Save-Finished {
     $sec = [int]((Get-Date) - $Job.T0).TotalSeconds
     $rec = [ordered]@{
         Idx = $Job.Idx; JobId = $Job.Id; Status = $Final; Valid = ""; Attempts = ""; Seconds = $sec; Model = ""; Bytes = "";
-        FinalErrors = ""; FirstAttemptErrors = ""; FirstAfterAutofix = ""; Autofixes = ""; WarningRules = ""; Postprocess = ""; TextChars = ""; Error = ""
+        FinalErrors = ""; FirstAttemptErrors = ""; FirstAfterAutofix = ""; Autofixes = ""; WarningRules = ""; Postprocess = ""; TextChars = ""; Error = "";
+        Greeting = ""; H2 = ""; Signoff = ""; ForbiddenFinal = ""; ForbiddenRaw = ""; ForbiddenStems = ""; WarnLines = ""; A06 = ""
     }
-    $full = Invoke-Api -Method GET -Path ("/template/result/{0}" -f $Job.Id) -Headers $h
+    # attempts_html=1 is ignored by the server unless TEMPLATE_KEEP_ATTEMPT_HTML=1; with it we can count banned phrases BEFORE autofix.
+    $full = Invoke-Api -Method GET -Path ("/template/result/{0}?attempts_html=1" -f $Job.Id) -Headers $h
     if (-not $full.Ok) {
         $rec.Status = "fetch_failed"; $rec.Error = ("HTTP {0}" -f $full.Code)
         Write-Log ("job {0}: could not download result HTTP {1}" -f $idx, $full.Code) "Yellow"
@@ -281,9 +333,89 @@ function Save-Finished {
         Write-Utf8 (Join-Path $out ("template_{0}.html" -f $idx)) $view
     }
     if ($t.text) { Write-Utf8 (Join-Path $out ("template_{0}.txt" -f $idx)) ([string]$t.text) }
+    if ($html) {
+        $lt = Get-LetterTexts $html
+        $rec.Greeting = $lt.Greeting; $rec.H2 = $lt.H2; $rec.Signoff = $lt.Signoff
+        $fb = Get-Forbidden $html
+        $rec.ForbiddenFinal = $fb.Total; $rec.ForbiddenStems = $fb.Stems
+    }
+    if ($j.attempts_html -and @($j.attempts_html).Count -gt 0 -and $j.attempts_html[0].raw_html) {
+        $rec.ForbiddenRaw = (Get-Forbidden ([string]$j.attempts_html[0].raw_html)).Total
+    }
+    $rec.WarnLines = @($t.report.warnings).Count
+    $rec.A06 = [bool](@($first.raw_errors) -contains "A06")
     $color = if ($t.valid) { "Green" } else { "Yellow" }
     Write-Log ("job {0}: valid={1} attempts={2} {3}s bytes={4} errors=[{5}]" -f $idx, $t.valid, $rec.Attempts, $sec, $t.bytes, $rec.FinalErrors) $color
     [void]$summary.Add([pscustomobject]$rec)
+}
+
+
+# ------------------------------------------------------------------ OCR probe (real OCR jobs next to template generation)
+$ocr = @{ Images = @(); Probes = (New-Object System.Collections.ArrayList); Done = (New-Object System.Collections.ArrayList); Base = (New-Object System.Collections.ArrayList); Lost = 0; Last = (Get-Date).AddDays(-1) }
+function Load-OcrImages {
+    $cands = @()
+    if ($OcrFile) { $cands += $OcrFile }
+    if ($PSScriptRoot) { $cands += (Join-Path $PSScriptRoot "ocr_probe_images.txt"); $cands += (Join-Path $PSScriptRoot "..\bls\1.txt") }
+    $cands += (Join-Path (Get-Location).Path "ocr_probe_images.txt")
+    $cands += (Join-Path (Get-Location).Path "bls\1.txt")
+    foreach ($f in $cands) {
+        if (-not (Test-Path $f)) { continue }
+        $imgs = @()
+        foreach ($line in (Get-Content -Path $f -Encoding UTF8)) {
+            $m = [regex]::Match($line, 'data:image/[a-z]+;base64,[A-Za-z0-9+/=]+')
+            if ($m.Success) { $imgs += $m.Value }
+            if ($imgs.Count -ge $OcrImages) { break }
+        }
+        if ($imgs.Count -gt 0) { Write-Log ("OCR probe: {0} image(s) loaded from {1}" -f $imgs.Count, $f); return $imgs }
+    }
+    return @()
+}
+function Start-OcrProbe {
+    param([int]$TplActive, [bool]$IsBase = $false)
+    $body = (@{ images = $ocr.Images; account_id = "gen-batch-ocr-probe"; client_request_id = ("probe-" + [guid]::NewGuid().ToString("N")) } | ConvertTo-Json -Compress -Depth 4)
+    $r = Invoke-Api -Method POST -Path "/ocr/submit" -Headers @{} -Body $body -Timeout 60
+    if (-not $r.Ok) { Write-Log ("OCR probe submit failed HTTP {0}" -f $r.Code) "Yellow"; $ocr.Lost++; return $null }
+    $p = @{ Id = [string]$r.Json.job_id; T0 = (Get-Date); TplActive = $TplActive; Base = $IsBase; Fails = 0 }
+    [void]$ocr.Probes.Add($p)
+    return $p
+}
+function Poll-OcrProbes {
+    foreach ($p in @($ocr.Probes)) {
+        $r = Invoke-Api -Method GET -Path ("/ocr/result/{0}" -f $p.Id) -Headers @{} -Timeout 30
+        if (-not $r.Ok) {
+            $p.Fails++
+            if ($r.Code -eq 404 -or $p.Fails -ge 6) { $ocr.Lost++; $ocr.Probes.Remove($p) }
+            continue
+        }
+        if ($r.Json.status -eq "pending") { continue }
+        $sec = ((Get-Date) - $p.T0).TotalSeconds
+        $total = 0; $zeros = 0
+        if ($r.Json.status -eq "done") { foreach ($it in @($r.Json.results)) { $total++; if ([string]$it.text -eq "0" -or [string]$it.text -eq "") { $zeros++ } } }
+        $rec = @{ Sec = $sec; Status = [string]$r.Json.status; Total = $total; Zeros = $zeros; TplActive = $p.TplActive; QueueWaitMs = $r.Json.queue_wait_ms; ProcMs = $r.Json.processing_ms }
+        if ($p.Base) { [void]$ocr.Base.Add($rec) } else { [void]$ocr.Done.Add($rec) }
+        $ocr.Probes.Remove($p)
+        $col = if ($rec.Status -eq "done") { "DarkCyan" } else { "Red" }
+        Write-Log ("OCR probe {0}: {1} {2:N1}s zeros={3}/{4} (templates in flight: {5}){6}" -f $p.Id.Substring(0, 8), $rec.Status, $sec, $zeros, $total, $p.TplActive, $(if ($p.Base) { " [baseline]" } else { "" })) $col
+    }
+}
+function Get-Pctl {
+    param($Vals, [double]$Q)
+    $v = @($Vals | Sort-Object)
+    if ($v.Count -eq 0) { return 0 }
+    return $v[[int][Math]::Min($v.Count - 1, [Math]::Round($Q * ($v.Count - 1)))]
+}
+if ($doOcr) {
+    $ocr.Images = @(Load-OcrImages)
+    if ($ocr.Images.Count -eq 0) { Write-Log "OCR probe: ocr_probe_images.txt not found next to the script. Probe disabled." "Yellow"; $doOcr = $false }
+    else {
+        Write-Log "OCR probe: baseline, 4 OCR jobs while templates are idle (first one is warm-up)..."
+        for ($b = 0; $b -lt 4; $b++) {
+            $bp = Start-OcrProbe -TplActive 0 -IsBase $true
+            if (-not $bp) { continue }
+            $wait = Get-Date
+            while ($ocr.Probes.Count -gt 0 -and ((Get-Date) - $wait).TotalSeconds -lt 120) { Start-Sleep -Seconds 2; Poll-OcrProbes }
+        }
+    }
 }
 
 # ------------------------------------------------------------------ main loop
@@ -353,6 +485,15 @@ while ($true) {
         }
     }
 
+    # 2b) OCR probe: keep real OCR jobs flowing while templates run
+    if ($doOcr) {
+        if ($active.Count -gt 0 -and $ocr.Probes.Count -lt $ocrMaxProbes -and ((Get-Date) - $ocr.Last).TotalSeconds -ge $ocrEveryEff) {
+            [void](Start-OcrProbe -TplActive $active.Count)
+            $ocr.Last = Get-Date
+        }
+        Poll-OcrProbes
+    }
+
     # 3) health sample and a compact progress line
     if (((Get-Date) - $lastHealth).TotalSeconds -ge $HealthEvery) {
         Sample-Health $active.Count
@@ -373,12 +514,17 @@ while ($true) {
 foreach ($job in @($active)) {
     [void]$summary.Add([pscustomobject][ordered]@{ Idx = $job.Idx; JobId = $job.Id; Status = "unfinished"; Valid = ""; Attempts = ""; Seconds = [int]((Get-Date) - $job.T0).TotalSeconds; Model = ""; Bytes = ""; FinalErrors = ""; FirstAttemptErrors = ""; FirstAfterAutofix = ""; Autofixes = ""; WarningRules = ""; Postprocess = ""; TextChars = ""; Error = "run stopped" })
 }
+if ($doOcr) {
+    $w = Get-Date
+    while ($ocr.Probes.Count -gt 0 -and ((Get-Date) - $w).TotalSeconds -lt 90) { Start-Sleep -Seconds 2; Poll-OcrProbes }
+}
 Sample-Health 0
 $totalSec = [int]((Get-Date) - $tStart).TotalSeconds
 
 # ------------------------------------------------------------------ numbers for the dashboard
 $rows = @($summary | Sort-Object Idx)
-$rows | Export-Csv -Path (Join-Path $out "summary.csv") -NoTypeInformation -Encoding UTF8
+$csvCols = @("Idx","JobId","Status","Valid","Attempts","Seconds","Model","Bytes","FinalErrors","FirstAttemptErrors","FirstAfterAutofix","Autofixes","WarningRules","Postprocess","TextChars","Error","Greeting","H2","Signoff","ForbiddenFinal","ForbiddenRaw","ForbiddenStems","WarnLines","A06")
+$rows | Select-Object $csvCols | Export-Csv -Path (Join-Path $out "summary.csv") -NoTypeInformation -Encoding UTF8
 $done = @($rows | Where-Object { $_.Status -eq "done" })
 $valid = @($done | Where-Object { $_.Valid -eq $true })
 $invalid = @($done | Where-Object { $_.Valid -ne $true })
@@ -418,7 +564,7 @@ $dl = "-" * 118
 $bw = 30
 Add-Dash $eq "Cyan"
 Add-Dash ("  EMAIL TEMPLATE BATCH DASHBOARD   {0}" -f $stamp) "Cyan"
-Add-Dash ("  model={0}  method={1}  parallel={2}  wall={3}s  throughput={4} done/min" -f $modelLabel, $cmLabel, $Parallel, $totalSec, $perMin) "Cyan"
+Add-Dash ("  model={0}  method={1}  parallel={2}  ocr-scale=x{5}  wall={3}s  throughput={4} done/min" -f $modelLabel, $cmLabel, $Parallel, $totalSec, $perMin, $OcrScale) "Cyan"
 Add-Dash $eq "Cyan"
 Add-Dash ""
 Add-Dash ("  Valid (final)        [{0}] {1,3}%  {2}/{3}" -f (Get-Bar $valid.Count $Count $bw), (Get-Pct $valid.Count $Count), $valid.Count, $Count) "Green"
@@ -472,6 +618,27 @@ if ($top2.Count -eq 0) { Add-Dash "    none" "Green" }
 foreach ($e in $top2) { Add-Dash ("    {0,-5} [{1}] {2}" -f $e.Key, (Get-Bar $e.Value $done.Count 20), $e.Value) "Yellow" }
 Add-Dash ""
 
+$nDone = [Math]::Max($done.Count, 1)
+$dG = @($done | Where-Object { $_.Greeting } | ForEach-Object { $_.Greeting } | Select-Object -Unique).Count
+$dH = @($done | Where-Object { $_.H2 } | ForEach-Object { $_.H2 } | Select-Object -Unique).Count
+$dS = @($done | Where-Object { $_.Signoff } | ForEach-Object { $_.Signoff } | Select-Object -Unique).Count
+$need = [int][Math]::Ceiling(0.8 * $done.Count)
+$divOk = ($dG -ge $need -and $dH -ge $need -and $dS -ge $need)
+Add-Dash "  Text diversity (distinct / letters; goal: at least 80%):" "White"
+Add-Dash ("    greetings {0}/{1}   h2 {2}/{1}   signoffs {3}/{1}   goal >= {4}" -f $dG, $done.Count, $dH, $dS, $need) $(if ($divOk) { "Green" } else { "Yellow" })
+$fbFinal = 0; $fbRaw = 0; $fbRawKnown = 0
+foreach ($r in $done) {
+    if ($r.ForbiddenFinal -is [int]) { $fbFinal += [int]$r.ForbiddenFinal }
+    if ($r.ForbiddenRaw -is [int]) { $fbRaw += [int]$r.ForbiddenRaw; $fbRawKnown++ }
+}
+Add-Dash ("    banned phrases in final text: {0} (goal: 0; which ones: CSV column ForbiddenStems)" -f $fbFinal) $(if ($fbFinal -eq 0) { "Green" } else { "Yellow" })
+if ($fbRawKnown -gt 0) { Add-Dash ("    banned phrases BEFORE autofix (attempt 1, {0} letter(s)): {1}" -f $fbRawKnown, $fbRaw) "Gray" }
+else { Add-Dash "    banned phrases BEFORE autofix: n/a (start the server with TEMPLATE_KEEP_ATTEMPT_HTML=1)" "DarkGray" }
+$wl = 0; foreach ($r in $done) { if ($r.WarnLines -is [int]) { $wl += [int]$r.WarnLines } }
+$a06n = @($done | Where-Object { $_.A06 -eq $true }).Count
+Add-Dash ("    warning lines per letter: {0}  (goal <= 4)   letters with A06 on attempt 1: {1}" -f [Math]::Round($wl / $nDone, 2), $a06n) "Gray"
+Add-Dash ""
+
 $failed = @($rows | Where-Object { $_.Status -ne "done" -and $_.Error })
 if ($failed.Count -gt 0) {
     Add-Dash "  Failed jobs:" "Red"
@@ -489,6 +656,46 @@ if ($hs.Fails -eq 0 -and $hs.MaxCooldown -eq 0) {
     }
 } else {
     Add-Dash "    verdict: ATTENTION - failed health checks or keys in cooldown (see health_log.csv)" "Yellow"
+}
+if ($doOcr) {
+    Add-Dash ""
+    Add-Dash "  OCR under load (real OCR jobs sent while templates were being generated):" "White"
+    $bS = @($ocr.Base | ForEach-Object { [double]$_.Sec })
+    $dOk = @($ocr.Done | Where-Object { $_.Status -eq "done" })
+    $dS = @($dOk | ForEach-Object { [double]$_.Sec })
+    $dBad = @($ocr.Done | Where-Object { $_.Status -ne "done" }).Count
+    $bAvg = if ($bS.Count -gt 0) { [Math]::Round((($bS | Measure-Object -Average).Average), 1) } else { 0 }
+    Add-Dash ("    baseline (templates idle): {0} job(s), avg {1}s" -f $bS.Count, $bAvg) "Gray"
+    if ($dS.Count -gt 0) {
+        $dAvg = [Math]::Round((($dS | Measure-Object -Average).Average), 1)
+        $dP95 = [Math]::Round((Get-Pctl $dS 0.95), 1)
+        $dMax = [Math]::Round((($dS | Measure-Object -Maximum).Maximum), 1)
+        Add-Dash ("    under load: {0} job(s) ok, {1} failed, {2} lost; avg {3}s  p95 {4}s  max {5}s" -f $dS.Count, $dBad, $ocr.Lost, $dAvg, $dP95, $dMax) "Gray"
+        $tot = 0; $zer = 0
+        foreach ($x in $dOk) { $tot += $x.Total; $zer += $x.Zeros }
+        $bt = 0; $bz = 0
+        foreach ($x in @($ocr.Base | Where-Object { $_.Status -eq "done" })) { $bt += $x.Total; $bz += $x.Zeros }
+        $zPct = if ($tot -gt 0) { [Math]::Round(100.0 * $zer / $tot, 1) } else { 0 }
+        $bzPct = if ($bt -gt 0) { [Math]::Round(100.0 * $bz / $bt, 1) } else { 0 }
+        Add-Dash ("    zero results: baseline {0}%  under load {1}%  (a clear rise means OCR quality or keys suffered)" -f $bzPct, $zPct) "Gray"
+        # Server-side time (queue wait + processing) is the fair metric: the client time also contains my 3 s polling step.
+        $bSrv = @(@($ocr.Base | Where-Object { $_.Status -eq "done" -and $_.ProcMs -ne $null }) | Select-Object -Skip 1 | ForEach-Object { ([double]$_.ProcMs + [double]$_.QueueWaitMs) / 1000.0 })
+        $dSrv = @($dOk | Where-Object { $_.ProcMs -ne $null } | ForEach-Object { ([double]$_.ProcMs + [double]$_.QueueWaitMs) / 1000.0 })
+        $bSrvAvg = if ($bSrv.Count -gt 0) { [Math]::Round((($bSrv | Measure-Object -Average).Average), 2) } else { 0 }
+        $dSrvAvg = if ($dSrv.Count -gt 0) { [Math]::Round((($dSrv | Measure-Object -Average).Average), 2) } else { 0 }
+        $dSrvMax = if ($dSrv.Count -gt 0) { [Math]::Round((($dSrv | Measure-Object -Maximum).Maximum), 2) } else { 0 }
+        Add-Dash ("    client time slowdown (includes polling step, rough): x{0}" -f $(if ($bAvg -gt 0) { [Math]::Round($dAvg / $bAvg, 2) } else { 0 })) "Gray"
+        Add-Dash ("    SERVER time (queue+processing): baseline avg {0}s  under load avg {1}s  max {2}s" -f $bSrvAvg, $dSrvAvg, $dSrvMax) "White"
+        $ratio = if ($bSrvAvg -gt 0) { [Math]::Round($dSrvAvg / $bSrvAvg, 2) } else { 0 }
+        Add-Dash ("    server slowdown vs baseline: x{0}" -f $ratio) "White"
+        if ($dBad -eq 0 -and $ocr.Lost -eq 0 -and ($ratio -le 1.5 -or ($dSrvAvg - $bSrvAvg) -le 1.0) -and ($zPct - $bzPct) -le 3) {
+            Add-Dash "    verdict: OK - OCR kept its speed and quality while templates were generated" "Green"
+        } else {
+            Add-Dash "    verdict: ATTENTION - OCR slowed down, lost jobs or returned more zeros (see run_log.txt)" "Yellow"
+        }
+    } else {
+        Add-Dash "    no OCR probe finished during the run (run was too short or OCR submit failed)" "Yellow"
+    }
 }
 Add-Dash $eq "Cyan"
 

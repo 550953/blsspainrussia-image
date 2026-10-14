@@ -35,10 +35,10 @@ def test_v02_where_points_at_stray_placeholder():
 
 
 def test_s01_where_shows_banned_phrase():
-    html = Path(FIXTURES[0]).read_text(encoding="utf-8").replace("</p>", " Чай остывает быстрее, чем вещи.</p>", 1)
+    html = Path(FIXTURES[0]).read_text(encoding="utf-8").replace("</p>", " Срочно проверьте, пока чай остывает.</p>", 1)
     report = validator.validate(html)
     s01 = [i for i in report.errors if i.rule == "S01"]
-    assert s01 and "быстрее" in s01[0].where
+    assert s01 and "срочно" in s01[0].where
 
 
 def test_document_level_rule_still_gets_nonempty_where():
