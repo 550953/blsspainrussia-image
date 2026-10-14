@@ -103,7 +103,7 @@ def test_every_registered_validator_rule_has_a_negative_mutation():
         "V01", "V02", "V03", "V04", "V08", "V09", "V11",
         "T04", "T08", "T09", "T11", "T12", "T16", "T17", "T20",
         "S04", "S07", "S08", "S11", "S12",
-        "A02", "A03", "P01", "V10",
+        "A02", "A03", "A05", "P01", "V10",
         *(f"M{number:02d}" for number in range(1, 21)),
     }
     covered = already_mutated | set(ADDITIONAL_MUTATIONS)
@@ -135,8 +135,8 @@ def test_every_registered_validator_rule_has_a_negative_mutation():
         ("Позиция: {{productName}}", "Ваш заказ: {{productName}}", "S08", "W"),
         ("Мы сверяем состав", "Нажмите, чтобы продолжить. Мы сверяем состав", "S11", "W"),
         ("Команда {{brandName}}", "Команда скидка {{brandName}}", "S12", "W"),
-        ("✓ Принят", "Принят", "A03", "W"),
-        ("#f4f5f0", "#ff4b20", "P01", "W"),
+        ("✓ Принят", "Принят", "A03", "E"),
+        ("#f4f5f0", "#ff4b20", "P01", "E"),
         ("<strong style=\"color:#24352d;font-weight:700\">", "<strong>", "T16", "W"),
         ("</p>\n<ul style=", "</p>\n<p style=\"margin:0;color:#24352d;font-size:16px;line-height:1.5\">Ещё одно сообщение</p>\n<ul style=", "T17", "W"),
         ("font-size:24px;line-height:1.5;color:#24352d\">Добрый день",
@@ -266,3 +266,20 @@ def test_spam_terms_use_word_boundaries_but_still_catch_exact_promises():
     assert "S01" not in {issue.rule for issue in safe.errors}
     unsafe = validate(GOOD.replace("свежие детали", "urgent"))
     assert "S01" in {issue.rule for issue in unsafe.errors}
+
+
+def test_a05_round_indicator_must_be_square():
+    oval = ('<td width="28" style="width:28px;height:20px;line-height:20px;border-radius:14px;'
+            'background-color:#2e7d4f;color:#ffffff;text-align:center">1</td>')
+    source = GOOD.replace("<!-- Здесь вставляется тело письма -->", "<!-- Здесь вставляется тело письма -->", 1)
+    probe = source.replace("<body", "<body", 1)
+    # круг-овал встраиваем в отдельную таблицу сразу перед маркером тела письма
+    probe = probe.replace(
+        "<!-- Здесь вставляется тело письма -->",
+        '<table role="presentation" cellpadding="0" cellspacing="0" border="0"><tr>' + oval + "</tr></table>"
+        "<!-- Здесь вставляется тело письма -->", 1,
+    )
+    assert "A05" in {issue.rule for issue in validate(probe, 1).errors}
+    square = oval.replace("height:20px;line-height:20px", "height:28px;line-height:28px")
+    ok = probe.replace(oval, square)
+    assert "A05" not in {issue.rule for issue in validate(ok, 1).errors}

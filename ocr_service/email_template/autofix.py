@@ -1,8 +1,9 @@
 """Ограниченные механические исправления разметки без изменения текста письма."""
 import re
 from ..config import TEMPLATE_AUTOFIX_CONTRAST
-from .contrast import color_tokens, parse_color, ratio, suggest_fix
-from .validator import ALLOWED_VARS, MARKER, _Tree, _style, _text, _walk
+import colorsys
+from .contrast import color_tokens, is_red_orange, parse_color, ratio, suggest_fix
+from .validator import ALLOWED_VARS, MARKER, _Tree, _outer_footer_row, _style, _text, _walk
 
 
 _MARKER_PATTERN = re.compile(
@@ -318,6 +319,466 @@ def _fix_support_links(source: str):
     return updated, updated != source
 
 
+
+# ---------------------------------------------------------------------------
+# Дополнительные механические исправления (AF19–AF27).
+# Цель: убрать причины, из-за которых после первого автофикса оставались T21, T17, T16, T09, T10,
+# и тем самым не тратить второй вызов модели.
+# ---------------------------------------------------------------------------
+_BALANCE_TAGS = {
+    "html", "head", "body", "table", "tbody", "thead", "tr", "td", "th", "ul", "li", "p",
+    "h1", "h2", "h3", "a", "div", "span", "strong", "em", "b", "i",
+}
+_BALANCE_COUNTED = ("table", "tr", "td", "ul", "li", "p", "h1", "h2", "h3", "a", "html", "head", "body")
+_BLOCK_CLOSES_P = {"p", "h1", "h2", "h3", "ul", "table", "div"}
+_TOKEN = re.compile(r"<!--[\s\S]*?-->|<(/?)([a-zA-Z][a-zA-Z0-9]*)((?:\"[^\"]*\"|'[^']*'|[^'\">])*)>")
+
+
+def _counts_balanced(source):
+    for tag in _BALANCE_COUNTED:
+        if len(re.findall(r"<" + tag + r"\b", source, re.I)) != len(re.findall(r"</" + tag + r"\s*>", source, re.I)):
+            return False
+    return True
+
+
+def _fix_tag_balance(source):
+    """AF19: расставляет недостающие закрывающие теги и убирает лишние (по стеку).
+
+    Запускается только если счётчики открытий и закрытий не совпадают, исправный документ не трогает.
+    """
+    if _counts_balanced(source):
+        return source, False
+    out = []
+    stack = []
+    cursor = 0
+
+    def close_until(tag):
+        while stack:
+            top = stack.pop()
+            out.append("</" + top + ">")
+            if top == tag:
+                break
+
+    def nearest(tag, stop):
+        for item in reversed(stack):
+            if item == tag:
+                return True
+            if item in stop:
+                return False
+        return False
+
+    for match in _TOKEN.finditer(source):
+        out.append(source[cursor:match.start()])
+        cursor = match.end()
+        whole = match.group(0)
+        if whole.startswith("<!--"):
+            out.append(whole)
+            continue
+        closing, name, attrs = match.group(1), match.group(2).lower(), match.group(3)
+        if name not in _BALANCE_TAGS:
+            out.append(whole)
+            continue
+        if closing:
+            if name in stack:
+                while stack and stack[-1] != name:
+                    out.append("</" + stack.pop() + ">")
+                stack.pop()
+                out.append(whole)
+            # лишний закрывающий тег без пары выбрасываем
+            continue
+        if name == "li" and nearest("li", {"ul"}):
+            close_until("li")
+        elif name in ("td", "th") and (nearest("td", {"tr", "table"}) or nearest("th", {"tr", "table"})):
+            while stack and stack[-1] not in ("td", "th"):
+                out.append("</" + stack.pop() + ">")
+            if stack:
+                out.append("</" + stack.pop() + ">")
+        elif name == "tr" and nearest("tr", {"table"}):
+            close_until("tr")
+        elif name in _BLOCK_CLOSES_P and nearest("p", {"td", "th", "li", "body", "table"}):
+            close_until("p")
+        out.append(whole)
+        if not attrs.rstrip().endswith("/"):
+            stack.append(name)
+    out.append(source[cursor:])
+    result = "".join(out)
+    # Хвост: недостающие закрытия вставляем перед </body></html>, если они есть, иначе в конец.
+    inner = "".join("</" + tag + ">" for tag in reversed(stack) if tag not in ("body", "html"))
+    outer = ("</body>" if "body" in stack else "") + ("</html>" if "html" in stack else "")
+    if inner or outer:
+        end = re.search(r"</body\s*>\s*(?:</html\s*>)?\s*$", result, re.I)
+        if end and not outer:
+            result = result[:end.start()] + inner + result[end.start():]
+        else:
+            result = result.rstrip() + inner + outer
+    return result, result != source
+
+
+def _promote_h3(source):
+    """AF21a: если блока h2 нет, а после номера заказа есть h3 — это и есть заголовок сообщения."""
+    if re.search(r"<h2\b", source, re.I):
+        return source, False
+    transaction = source.find("{{transactionalId}}")
+    match = re.search(r"<h3\b", source[max(transaction, 0):], re.I)
+    if not match:
+        return source, False
+    start = max(transaction, 0) + match.start()
+    close = re.search(r"</h3\s*>", source[start:], re.I)
+    if not close:
+        return source, False
+    end = start + close.start()
+    updated = (
+        source[:start] + "<h2" + source[start + 3:end] + "</h2>" + source[end + len(close.group(0)):]
+    )
+    return updated, True
+
+
+def _message_bounds(source):
+    marker = _MARKER_PATTERN.search(source)
+    if not marker:
+        return None
+    tree = _tree(source)
+    nodes = list(_walk(tree.root))
+    main_table = next(
+        (n for n in nodes if n.tag == "table" and re.fullmatch(r"\d+", n.attrs.get("width", ""))
+         and 520 <= int(n.attrs["width"]) <= 600), None,
+    )
+    mailto = next((n for n in nodes if n.tag == "a" and n.attrs.get("href", "").lower().startswith("mailto:")), None)
+    end = len(source)
+    if mailto is not None:
+        row = _outer_footer_row(mailto, main_table, marker.start())
+        if row is not None:
+            end = row.start_pos
+    return marker.end(), max(end, marker.end())
+
+
+def _message_text_color(area):
+    for tag in ("h2", "p", "li"):
+        found = re.search(r"<" + tag + r"\b[^>]*style\s*=\s*[\"'][^\"']*?(?<![\w-])color\s*:\s*(#[0-9a-fA-F]{3,8})", area, re.I)
+        if found:
+            return found.group(1)
+    return "#222222"
+
+
+def _fix_message_styles(source):
+    """AF20: теги тела сообщения без inline style получают стиль (T16)."""
+    bounds = _message_bounds(source)
+    if not bounds:
+        return source, False
+    start, end = bounds
+    area = source[start:end]
+    color = _message_text_color(area)
+    styles = {
+        "h1": "margin:0 0 12px;font-size:22px;line-height:1.4;color:%s" % color,
+        "h2": "margin:0 0 12px;font-size:20px;line-height:1.4;color:%s" % color,
+        "h3": "margin:0 0 12px;font-size:18px;line-height:1.4;color:%s" % color,
+        "p": "margin:0 0 14px;font-size:15px;line-height:1.5;color:%s" % color,
+        "ul": "margin:0 0 14px;padding-left:20px;font-size:15px;line-height:1.5;color:%s" % color,
+        "li": "margin:0 0 6px;font-size:15px;line-height:1.5;color:%s" % color,
+        "hr": "border:none;border-top:1px solid #d6d6d6;margin:16px 0",
+        "strong": "font-weight:700", "b": "font-weight:700",
+        "em": "font-style:italic", "i": "font-style:italic",
+    }
+
+    def add(match):
+        name, attrs = match.group(1).lower(), match.group(2)
+        if re.search(r"\bstyle\s*=", attrs, re.I):
+            return match.group(0)
+        slash = ""
+        if attrs.rstrip().endswith("/"):
+            attrs = attrs.rstrip()[:-1]
+            slash = " /"
+        return "<" + match.group(1) + attrs.rstrip() + ' style="' + styles[name] + '"' + slash + ">"
+
+    updated = re.sub(r"<(h1|h2|h3|p|ul|li|hr|strong|em|b|i)\b([^>]*)>", add, area, flags=re.I)
+    if updated == area:
+        return source, False
+    return source[:start] + updated + source[end:], True
+
+
+def _fix_message_structure(source):
+    """AF21: механически дотягивает блок сообщения до T17 (hr, strong, курсив, ровно три li)."""
+    bounds = _message_bounds(source)
+    if not bounds:
+        return source, False
+    start, end = bounds
+    area = source[start:end]
+    before = area
+    color = _message_text_color(area)
+
+    # ровно три пункта: лишние отбрасываем
+    items = list(re.finditer(r"<li\b[^>]*>[\s\S]*?</li\s*>", area, re.I))
+    if len(items) > 3 and len(re.findall(r"<li\b", area, re.I)) == len(items):
+        for item in reversed(items[3:]):
+            area = area[:item.start()] + area[item.end():]
+
+    # разделитель после списка
+    if not re.search(r"<hr\b", area, re.I):
+        close = re.search(r"</ul\s*>", area, re.I)
+        if close:
+            hr = '<hr style="border:none;border-top:1px solid #d6d6d6;margin:16px 0">'
+            area = area[:close.end()] + hr + area[close.end():]
+
+    # выделение strong в первом абзаце: первые слова простого текста
+    if not re.search(r"<strong\b", area, re.I):
+        first = re.search(r"(<p\b[^>]*>)(\s*)([^<\s][^<]*)", area, re.I)
+        if first:
+            words = first.group(3).split(" ")
+            take = min(3, len(words))
+            lead, rest = " ".join(words[:take]), " ".join(words[take:])
+            replacement = (
+                first.group(1) + first.group(2) + '<strong style="font-weight:700">' + lead + "</strong>"
+                + ((" " + rest) if rest else "")
+            )
+            area = area[:first.start()] + replacement + area[first.end():]
+
+    # курсивная подпись: последний абзац блока
+    if not re.search(r"<(?:em|i)\b|font-style\s*:\s*italic", area, re.I):
+        paragraphs = list(re.finditer(r"<p\b[^>]*>", area, re.I))
+        if paragraphs:
+            last = paragraphs[-1]
+            tag, changed = _set_style_property(last.group(0), "font-style", "italic")
+            if changed:
+                area = area[:last.start()] + tag + area[last.end():]
+
+    if area == before:
+        return source, False
+    return source[:start] + area + source[end:], True
+
+
+def _fix_ordered_list(source):
+    """AF22: <ol> запрещён (T24): заменяем на <ul>."""
+    updated = re.sub(r"<(/?)ol\b", r"<\1ul", source, flags=re.I)
+    return updated, updated != source
+
+
+def _fix_page_backgrounds(source):
+    """AF23: T09. bgcolor и background-color нужны у body и основной таблицы; цвет берём у соседей."""
+    tree = _tree(source)
+    nodes = list(_walk(tree.root))
+    body = next((n for n in nodes if n.tag == "body"), None)
+    main = next(
+        (n for n in nodes if n.tag == "table" and re.fullmatch(r"\d+", n.attrs.get("width", ""))
+         and 520 <= int(n.attrs["width"]) <= 600), None,
+    )
+
+    def own_color(node):
+        value = node.attrs.get("bgcolor") or _style(node).get("background-color") or ""
+        value = value.strip()
+        return value if re.fullmatch(r"#[0-9a-fA-F]{3,8}", value) else ""
+
+    def inherited(node):
+        current = node.parent if node is not None else None
+        while current is not None:
+            color = own_color(current)
+            if color:
+                return color
+            current = current.parent
+        return ""
+
+    first_table = next((n for n in nodes if n.tag == "table"), None)
+    transforms = []
+    for node in (body, main):
+        if node is None or (node.attrs.get("bgcolor") and _style(node).get("background-color")):
+            continue
+        color = own_color(node) or inherited(node)
+        if not color and node is body and first_table is not None:
+            color = own_color(first_table)
+        color = color or "#ffffff"
+
+        def make(color):
+            def edit(tag):
+                changed = False
+                if not re.search(r"\bbgcolor\s*=", tag, re.I):
+                    tag = tag[:-1].rstrip() + ' bgcolor="' + color + '">'
+                    changed = True
+                if not re.search(r"background-color\s*:", tag, re.I):
+                    tag, did = _set_style_property(tag, "background-color", color)
+                    changed = changed or did
+                return tag, changed
+            return edit
+        transforms.append((node.start_pos, make(color)))
+    if not transforms:
+        return source, False
+    return _edit_node_tags(source, transforms)
+
+
+_PREHEADER_STYLE = (
+    ("display", "none"), ("font-size", "1px"), ("line-height", "1px"), ("max-height", "0"),
+    ("max-width", "0"), ("opacity", "0"), ("overflow", "hidden"), ("mso-hide", "all"),
+)
+
+
+def _fix_preheader(source):
+    """AF24: T10. Прехедер первым в body, полный набор скрывающих стилей, длина не больше 110."""
+    body = re.search(r"<body\b[^>]*>", source, re.I)
+    if not body:
+        return source, False
+    original = source
+    pattern = r"<body\b[^>]*>(?:\s|<!--[\s\S]*?-->)*(<(?:div|span)\b[^>]*>)([\s\S]*?)(</(?:div|span)\s*>)"
+    first = re.search(pattern, source, re.I)
+    if not first or not re.search(r"display\s*:\s*none", first.group(1), re.I):
+        hidden = re.search(
+            r"<(div|span)\b[^>]*display\s*:\s*none[^>]*>[\s\S]*?</\1\s*>", source[body.end():], re.I,
+        )
+        if hidden:
+            block = hidden.group(0)
+            at = body.end() + hidden.start()
+            source = source[:at] + source[at + len(block):]
+            body = re.search(r"<body\b[^>]*>", source, re.I)
+            source = source[:body.end()] + block + source[body.end():]
+        first = re.search(pattern, source, re.I)
+        if not first:
+            return source, source != original
+    open_tag, text = first.group(1), first.group(2)
+    new_tag = open_tag
+    flat = re.sub(r"\s", "", (_style_value(open_tag).group(2) if _style_value(open_tag) else "").lower())
+    for name, value in _PREHEADER_STYLE:
+        if (name + ":" + value) not in flat:
+            new_tag, _ = _set_style_property(new_tag, name, value)
+    pairs = re.findall(r"(?:&nbsp;&zwnj;|&#160;&#8204;)", text, re.I)
+    visible = re.sub(r"(?:&nbsp;&zwnj;|&#160;&#8204;)", "", text, flags=re.I)
+    plain = re.sub(r"<[^>]*>", "", visible)
+    measured = plain.replace("{{transactionalId}}", "1234567890").strip()
+    if len(measured) > 110 and "<" not in visible:
+        words, kept = plain.strip().split(), []
+        for word in words:
+            candidate = " ".join(kept + [word])
+            if len(candidate.replace("{{transactionalId}}", "1234567890")) > 108:
+                break
+            kept.append(word)
+        trimmed = " ".join(kept).rstrip(",;:—-– ")
+        if len(trimmed.replace("{{transactionalId}}", "1234567890")) >= 50:
+            visible = trimmed
+    needs_pairs = len(pairs) < 6
+    trimmed_now = visible != re.sub(r"(?:&nbsp;&zwnj;|&#160;&#8204;)", "", text, flags=re.I)
+    if new_tag == open_tag and not needs_pairs and not trimmed_now:
+        return source, source != original
+    text = (visible + "&nbsp;&zwnj;" * 6) if (needs_pairs or trimmed_now) else text
+    replacement = new_tag + text + first.group(3)
+    source = source[:first.start(1)] + replacement + source[first.end(3):]
+    return source, source != original
+
+
+def _fix_round_shapes(source):
+    """AF25: круги этапов и знака должны быть квадратными: width == height, line-height по высоте."""
+    tree = _tree(source)
+    transforms = []
+    for node in _walk(tree.root):
+        style = _style(node)
+        radius = style.get("border-radius", "")
+        if not radius:
+            continue
+        width = re.fullmatch(r"(\d+(?:\.\d+)?)px", style.get("width", "").strip(), re.I)
+        height = re.fullmatch(r"(\d+(?:\.\d+)?)px", style.get("height", "").strip(), re.I)
+        if node.tag == "td":
+            width = width or re.fullmatch(r"(\d+(?:\.\d+)?)", node.attrs.get("width", "").strip())
+            height = height or re.fullmatch(r"(\d+(?:\.\d+)?)", node.attrs.get("height", "").strip())
+        if not (width and height):
+            continue
+        w, h = float(width.group(1)), float(height.group(1))
+        radius_value = radius.strip()
+        full_round = radius_value.endswith("%") and float(re.sub(r"[^\d.]", "", radius_value.split()[0]) or 0) >= 50
+        if not full_round and re.fullmatch(r"\d+(?:\.\d+)?px", radius_value, re.I):
+            full_round = float(radius_value[:-2]) >= max(w, h) / 2 - 0.5
+        # Круг — почти квадратная фигура. Узкие плашки и полоски (32x6) трогать нельзя.
+        if not full_round or w > 80 or h > 80 or min(w, h) / max(w, h) < 0.6:
+            continue
+        side = max(w, h)
+        line = style.get("line-height", "")
+        wrong_line = bool(node.text.strip() or node.children) and line.strip() != ("%gpx" % side)
+        if w == h and not wrong_line:
+            continue
+
+        def make(side, node=node):
+            def edit(tag):
+                changed = False
+                for prop in ("width", "height"):
+                    tag, did = _set_style_property(tag, prop, "%gpx" % side)
+                    changed = changed or did
+                tag, did = _set_style_property(tag, "line-height", "%gpx" % side)
+                changed = changed or did
+                for attr in ("width", "height"):
+                    if re.search(r"\b" + attr + r"\s*=", tag, re.I):
+                        tag = re.sub(r"(\b" + attr + r"\s*=\s*[\"']?)\d+(?:\.\d+)?", lambda m: m.group(1) + ("%g" % side), tag, count=1, flags=re.I)
+                        changed = True
+                return tag, changed
+            return edit
+        transforms.append((node.start_pos, make(side)))
+    if not transforms:
+        return source, False
+    return _edit_node_tags(source, transforms)
+
+
+def _fix_done_mark(source):
+    """AF26: A03. Если в индикаторе нет отметки завершённого этапа, ставим ✓ перед подписью первого этапа."""
+    body = re.search(r"<body\b", source, re.I)
+    detail = source.find("{{productName}}", body.start() if body else 0)
+    marker = _MARKER_PATTERN.search(source)
+    if detail < 0 or not marker or detail >= marker.start():
+        return source, False
+    zone = source[detail:marker.start()]
+    if re.search(r"(?:&#10003;|&#x2713;|✓|&#x2714;)", zone, re.I):
+        return source, False
+    plain = re.sub(r"<[^>]*>", " ", zone)
+    if re.search(r"\b(?:готово|завершен\w*|доставлен\w*|выполнен\w*|completed|done)\b", plain, re.I):
+        return source, False
+    stage = re.search(r">\s*(?:\d+[.)]\s*)?((?:заказ\s+)?(?:подтвержд|принят|оформлен)[^<]*)<", zone, re.I)
+    if not stage:
+        return source, False
+    at = detail + stage.start(1)
+    return source[:at] + "&#10003; " + source[at:], True
+
+
+def _fix_red_orange(source):
+    """AF29: P01. Красный/оранжевый сдвигаем в тёплый зелёно-бирюзовый, сохраняя светлоту (контраст не страдает)."""
+    changed = False
+
+    def shift(match):
+        nonlocal changed
+        value = match.group(0)
+        rgb = parse_color(value)
+        if rgb is None or not is_red_orange(value):
+            return value
+        _h, light, sat = colorsys.rgb_to_hls(*(c / 255.0 for c in rgb))
+        r, g, b = colorsys.hls_to_rgb(0.45, light, min(sat, 0.55))
+        changed = True
+        return "#%02x%02x%02x" % (round(r * 255), round(g * 255), round(b * 255))
+
+    def in_tag(match):
+        tag = match.group(0)
+        return re.sub(r"#[0-9a-fA-F]{6}\b|#[0-9a-fA-F]{3}\b", shift, tag)
+
+    updated = re.sub(r"<[a-zA-Z][^>]*>", in_tag, source)
+    return updated, changed
+
+
+_SAFE_REPLACEMENTS = (
+    (re.compile(r"прямо\s+сейчас", re.I), "сейчас"),
+)
+
+
+def _fix_banned_phrases(source):
+    """AF27: S01. Безопасная замена единичных стоп-фраз в видимом тексте (без правки тегов)."""
+    changed = False
+
+    def replace_text(match):
+        nonlocal changed
+        text = match.group(0)
+        for pattern, value in _SAFE_REPLACEMENTS:
+            def sub(found, value=value):
+                word = found.group(0)
+                return value.capitalize() if word[:1].isupper() else value
+            new = pattern.sub(sub, text)
+            if new != text:
+                changed = True
+                text = new
+        return text
+
+    updated = re.sub(r">[^<]+(?=<)", replace_text, source)
+    return updated, changed
+
+
 def apply(source: str):
     original = source
     fixes = []
@@ -340,6 +801,18 @@ def apply(source: str):
     updated = re.sub(r"<!--\s*Здесь\s+вставляется\s+тело\s+письма\s*-->", MARKER, source, flags=re.I)
     if updated != source: fixes.append("AF03")
     source = updated
+    updated, balanced = _fix_tag_balance(source)
+    if balanced:
+        source = updated
+        fixes.append("AF19")
+    updated, ol_changed = _fix_ordered_list(source)
+    if ol_changed:
+        source = updated
+        fixes.append("AF22")
+    updated, h3_changed = _promote_h3(source)
+    if h3_changed:
+        source = updated
+        fixes.append("AF28")
     updated, marker_changed = _fix_marker(source)
     if marker_changed:
         source = updated
@@ -519,6 +992,18 @@ def apply(source: str):
         fixes.append("AF11")
     if quotes_changed:
         fixes.append("AF12")
+    for fix_id, function in (
+        ("AF20", _fix_message_styles), ("AF21", _fix_message_structure), ("AF23", _fix_page_backgrounds),
+        ("AF24", _fix_preheader), ("AF25", _fix_round_shapes), ("AF26", _fix_done_mark),
+        ("AF27", _fix_banned_phrases), ("AF29", _fix_red_orange),
+    ):
+        try:
+            updated, did = function(source)
+        except Exception:
+            continue
+        if did:
+            source = updated
+            fixes.append(fix_id)
     updated, contrast_changed = _fix_contrast(source)
     if contrast_changed:
         source = updated

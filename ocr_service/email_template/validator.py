@@ -963,7 +963,32 @@ def validate(source: str, currency_method: Optional[int] = None) -> Report:
         re.search(r"(?:&#10003;|&#x2713;|✓|&#x2714;)", indicator_source, re.I)
         or re.search(r"\b(?:готово|завершен\w*|доставлен\w*|выполнен\w*|completed|done)\b", html.unescape(re.sub(r"<[^>]*>", " ", indicator_source)), re.I)
     ):
-        _issue(report, "A03", "W", "Добавьте текстовую или графическую отметку завершённого этапа")
+        _issue(report, "A03", "E", "Добавьте текстовую или графическую отметку завершённого этапа: ✓ или слово «готово» у первого этапа")
+    for node in nodes:
+        node_style = _style(node)
+        radius_text = node_style.get("border-radius", "").strip()
+        w_match = re.fullmatch(r"(\d+(?:\.\d+)?)px", node_style.get("width", "").strip(), re.I)
+        h_match = re.fullmatch(r"(\d+(?:\.\d+)?)px", node_style.get("height", "").strip(), re.I)
+        if node.tag == "td":
+            w_match = w_match or re.fullmatch(r"(\d+(?:\.\d+)?)", node.attrs.get("width", "").strip())
+            h_match = h_match or re.fullmatch(r"(\d+(?:\.\d+)?)", node.attrs.get("height", "").strip())
+        if not (radius_text and w_match and h_match):
+            continue
+        w_px, h_px = float(w_match.group(1)), float(h_match.group(1))
+        if not w_px or not h_px or w_px > 80 or h_px > 80 or min(w_px, h_px) / max(w_px, h_px) < 0.6:
+            continue
+        first_radius = radius_text.split()[0]
+        if first_radius.endswith("%"):
+            round_shape = float(re.sub(r"[^\d.]", "", first_radius) or 0) >= 50
+        else:
+            round_shape = bool(re.fullmatch(r"\d+(?:\.\d+)?px", first_radius, re.I)) and float(first_radius[:-2]) >= max(w_px, h_px) / 2 - 0.5
+        if not round_shape:
+            continue
+        has_text = bool(_text(node).strip().replace("\u00a0", ""))
+        line_match = re.fullmatch(r"(\d+(?:\.\d+)?)px", node_style.get("line-height", "").strip(), re.I)
+        if w_px != h_px or (has_text and (not line_match or float(line_match.group(1)) != h_px)):
+            _issue(report, "A05", "E", "Круг должен быть квадратным: width и height равны, line-height равен высоте, иначе он станет овалом")
+            break
     color_values = set(re.findall(r"#[0-9a-fA-F]{3,8}\b", source))
     palette_values = []
     for node in nodes:
@@ -973,7 +998,7 @@ def validate(source: str, currency_method: Optional[int] = None) -> Report:
         palette_values.extend(color_tokens(styles.get("background", "")))
         palette_values.extend(color_tokens(node.attrs.get("bgcolor", "")))
     if any(is_red_orange(color) for color in palette_values):
-        _issue(report, "P01", "W", "В палитре найден насыщенный красный или оранжевый цвет")
+        _issue(report, "P01", "E", "В палитре найден насыщенный красный или оранжевый цвет: замени его цветом из выданной палитры")
     if not 4 <= len(color_values) <= 10:
         _issue(report, "P02", "W", "Рекомендуется использовать от 4 до 10 различных hex-цветов")
     emojis = [
@@ -993,7 +1018,7 @@ def validate(source: str, currency_method: Optional[int] = None) -> Report:
 
 _WARNING_RULES = {
     "V09", "V10", "V11", "V12", "T13", "T14", "T25", "S02", "S07", "S08", "S09", "S11", "S12",
-    "A03", "A04", "P01", "P02",
+    "A04", "P02",
     *(f"M{number:02d}" for number in range(1, 21)),
 }
 _MIXED_SEVERITY_RULES = {"T04", "T16", "T17", "T23", "S02", "S04"}
@@ -1024,7 +1049,7 @@ RULES: Dict[str, dict] = {
         "S13": "Запрещённый text-transform",
         "L01": "Порядок блоков", "L02": "Индикатор этапов", "A01": "Контраст текста",
         "A02": "Контраст знака валюты", "A03": "Индикатор без опоры на цвет", "A04": "Проверка контраста",
-        "P01": "Ограниченная палитра", "P02": "Количество цветов",
+        "P01": "Ограниченная палитра", "P02": "Количество цветов", "A05": "Круги без искажения",
         "V10": "Способ оформления валюты", "M01": "Выбранное оформление знака валюты",
         "M07": "Выравнивание знака", "M08": "Знак после суммы", "M09": "Подчёркивание знака",
         "M02": "Приподнятый знак валюты", "M03": "Круглая плашка знака", "M04": "Скруглённая плашка",
