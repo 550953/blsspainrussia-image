@@ -965,6 +965,9 @@ def _fix_red_orange(source):
 
 _SAFE_REPLACEMENTS = (
     (re.compile(r"прямо\s+сейчас", re.I), "сейчас"),
+    # Типовой оборот из прогонов («Вот что происходит сейчас:», «Ниже описано то, что происходит сейчас:»).
+    (re.compile(r"описано\s+то,\s+что\s+происходит(?:\s+сейчас|\s+дальше)?", re.I), "описаны наши шаги"),
+    (re.compile(r"что\s+происходит(?:\s+сейчас|\s+дальше)?", re.I), "как идёт работа"),
 )
 
 
@@ -987,6 +990,26 @@ def _fix_banned_phrases(source):
 
     updated = re.sub(r">[^<]+(?=<)", replace_text, source)
     return updated, changed
+
+
+def _fix_missing_h1(source):
+    """AF33: нет <h1>, приветствие лежит в <td>: оборачиваем текст ячейки (22-28px, жирный, с {{name}}) в <h1> с теми же стилями."""
+    if re.search(r"<h1\b", source, re.I):
+        return source, False
+    marker = source.find("Здесь вставляется тело письма")
+    limit = marker if marker > 0 else len(source)
+    for cell in re.finditer(r"(<td\b([^>]*)>)\s*([^<>]*\{\{\s*name\s*\}\}[^<>]*?)\s*(</td>)", source[:limit], re.I):
+        style = _style_value(cell.group(1))
+        if not style:
+            continue
+        size = re.search(r"(?:^|;)\s*font-size\s*:\s*(\d+(?:\.\d+)?)px", style.group(2), re.I)
+        if not size or not 22 <= float(size.group(1)) <= 28:
+            continue
+        keep = [part.strip() for part in style.group(2).split(";")
+                if re.match(r"\s*(?:font-family|font-size|font-weight|color|line-height|text-align)\s*:", part, re.I)]
+        h1 = '<h1 style="margin:0;padding:0;' + ";".join(keep) + ';">' + cell.group(3).strip() + "</h1>"
+        return source[:cell.start(3)] + h1 + source[cell.end(3):], True
+    return source, False
 
 
 def apply(source: str):
@@ -1013,9 +1036,17 @@ def apply(source: str):
     canon = {re.sub(r"[^a-z0-9]", "", name.lower()): name for name in ALLOWED_VARS}
     canon["transactionid"] = "transactionalId"
 
+    import difflib
+
     def _canonical(match):
         key = re.sub(r"[^a-z0-9]", "", match.group(1).lower())
-        return "{{" + canon[key] + "}}" if key in canon else match.group(0)
+        if key in canon:
+            return "{{" + canon[key] + "}}"
+        # Опечатка вроде {{transactionlId}}: одно однозначное совпадение с порогом 0,88; неизвестные переменные не трогаем.
+        targets = {canon[k] for k in difflib.get_close_matches(key, list(canon), n=3, cutoff=0.88)}
+        if len(targets) == 1:
+            return "{{" + targets.pop() + "}}"
+        return match.group(0)
 
     updated = re.sub(r"\{\{\s*([A-Za-z][A-Za-z0-9_\-]*)\s*\}\}", _canonical, source)
     if updated != source: fixes.append("AF02")
@@ -1048,13 +1079,20 @@ def apply(source: str):
         source = updated
         fixes.append("AF15")
     before_tables = source
-    source = re.sub(
-        r"<table\b([^>]*)>",
-        lambda m: "<table" + m.group(1) +
-        "".join(' {}="{}"'.format(k, v) for k, v in (("role", "presentation"), ("cellpadding", "0"), ("cellspacing", "0"), ("border", "0")) if not re.search(r"\b" + k + r"\s*=", m.group(1), re.I))
-        + ">",
-        source, flags=re.I,
-    )
+    _TABLE_ATTRS = (("role", "presentation"), ("cellpadding", "0"), ("cellspacing", "0"), ("border", "0"))
+
+    def fix_table_attrs(match):
+        attrs = match.group(1)
+        for key, value in _TABLE_ATTRS:
+            found = re.search(r"\s" + key + r"\s*=\s*(?:\"[^\"]*\"|'[^']*'|[^\s>]+)", attrs, re.I)
+            if found:
+                # Неверное значение (border="1", role="none", cellpadding="8") T08 считает ошибкой: заменяем.
+                attrs = attrs[:found.start()] + ' {}="{}"'.format(key, value) + attrs[found.end():]
+            else:
+                attrs += ' {}="{}"'.format(key, value)
+        return "<table" + attrs + ">"
+
+    source = re.sub(r"<table\b([^>]*)>", fix_table_attrs, source, flags=re.I)
     if source != before_tables: fixes.append("AF04")
     preheader = re.search(r"(<(?:div|span)\b[^>]*>)([\s\S]*?)(</(?:div|span)\s*>)", source, re.I)
     if preheader:
@@ -1217,7 +1255,7 @@ def apply(source: str):
     for fix_id, function in (
         ("AF20", _fix_message_styles), ("AF21", _fix_message_structure), ("AF23", _fix_page_backgrounds),
         ("AF24", _fix_preheader), ("AF25", _fix_round_shapes), ("AF30", _fix_stretched_circles), ("AF31", _fix_text_metrics), ("AF32", _fix_span_spacing), ("AF26", _fix_done_mark),
-        ("AF27", _fix_banned_phrases), ("AF29", _fix_red_orange),
+        ("AF27", _fix_banned_phrases), ("AF29", _fix_red_orange), ("AF33", _fix_missing_h1),
     ):
         try:
             updated, did = function(source)

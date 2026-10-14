@@ -85,8 +85,9 @@ def test_prompt_version_and_supplement_cover_new_bans_steps_and_jokes():
 def test_currency_contract_depends_on_method():
     plate = prompt.build_user_message(director.pick_brief(seed=5, currency_method=4, record=False).public())
     plain = prompt.build_user_message(director.pick_brief(seed=5, currency_method=1, record=False).public())
-    assert "соседних ячейках" in plate and "обычными <span>" not in plate
-    assert "обычными <span>" in plain and "соседних ячейках" not in plain
+    # Контракт плашки отменён (живой прогон: M04 в 10 из 10, T26 в 3 из 10): для всех способов одна и та же строка про <span>.
+    assert "соседних ячейках" not in plate and "соседних ячейках" not in plain
+    assert "обычными <span>" in plate and "обычными <span>" in plain
 
 
 # ---------------------------------------------------------------- S01, S14, S08

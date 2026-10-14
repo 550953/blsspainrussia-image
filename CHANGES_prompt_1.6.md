@@ -6,3 +6,5 @@ validator.py: S01 «быстрее» только предупреждение; 
 autofix.py: AF32 (T27) убирает padding/margin до 8px на span, ставит &nbsp;.
 scripts/eval_templates.py: метрики разнообразия и запрещённых оборотов, --seed-base, --attempts-html.
 scripts/gen_batch.ps1: -OcrScale, метрики разнообразия в дашборде.
+
+Патч 2: prompt.py без контракта плашки; autofix.py: AF04 (неверные значения атрибутов таблиц), AF02 (опечатки переменных), AF27 («что происходит»), AF33 (h1 из td).
