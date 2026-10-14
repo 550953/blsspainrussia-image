@@ -16,4 +16,11 @@
 
 Проверено: python -m pytest -q → 344 passed, 1 skipped (pytest, httpx, fastapi, uvicorn установлены).
 Живой Gemini не запускался.
-Следующий пакет: B.
+Пакет D (частично, сделан раньше B ради доказательной базы по V02):
+- D.1 where: validator._fill_where заполняет фрагмент до 120 символов у каждой ошибки и предупреждения (V02, S01, A06, T10 и др. по месту; остальным «весь документ: …»).
+- D.3 флаг TEMPLATE_KEEP_ATTEMPT_HTML (по умолчанию 0): до 3 попыток по 40 КБ (raw_html и final_html) хранятся в job; отдаются через GET /template/result/{id}?attempts_html=1 только с X-API-Key; без флага параметр игнорируется.
+- error_details: severity + where, до 10; raw_error_details теперь по ВСЕМ правилам (раньше только T10/T17/T18/V08/A06), до 10.
+- Не сделано: D.2 группировка T14 (count/suppressed), D.4 метрики eval и --seed-base, D.5 мутации для D.2.
+Тесты: tests/test_where_and_attempt_html.py. pytest: 350 passed (1 плавающий тест test_rate_limit_quota_is_model_scoped… иногда падает на сравнении времени == 900; не связан с правками).
+Живой Gemini не запускался.
+Следующий пакет: B (затем D.2/D.4, C).

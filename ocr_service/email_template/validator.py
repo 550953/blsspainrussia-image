@@ -237,6 +237,76 @@ def _fragment(source: str, start: int, end: Optional[int] = None, limit: int = 2
     return excerpt[:limit]
 
 
+_WHERE_LIMIT = 120
+_CONTENT_PATTERNS = {
+    "S06": r"ваш заказ оформлен|спасибо за покупку|мы рады сообщить|уважаемый клиент",
+    "S08": r"\b(?:статус заказа|ваш заказ)\b",
+    "S10": r"\b(ты|тебе|тебя|твой|твоя|твое|твои|тобой)\b",
+    "S11": r"\b(?:нажмите|кликните|жмите|click\s+here)\b",
+    "S12": r"\b(?:акци\w*|скидк\w*|распродаж\w*|sale|discount|offer)\b",
+    "S02": r"!",
+}
+_SOURCE_PATTERNS = {
+    "V01": r"<title\b", "V03": r"<title\b", "T11": r"border-radius", "T17": r"<ul\b", "T01": r"<!doctype|<html\b",
+    "S05": r"<button\b|<input\b", "T25": r"font-size\s*:\s*[\d.]+(?:pt|em|rem|%)", "T07": r"<img\b", "T09": r"<img\b",
+    "T08": r"<a\b", "T06": r"<(?:div|section|article|header|footer)\b",
+}
+
+
+def _fill_where(report, source, content_text, nodes, preheader):
+    """Каждому замечанию без фрагмента подбирает короткий фрагмент (до 120 символов): по одному коду не понять, что сработало."""
+    def around(text, match):
+        return _fragment(text, match.start(), match.end(), _WHERE_LIMIT)
+
+    def locate(rule):
+        if rule == "V02":
+            bad = re.search(r"\{\{\{|\{%|\$\{|\[\[|&#123;|\{\s|\s\}|(?<!\{)\{(?!\{)|(?<!\})\}(?!\})", source)
+            if bad:
+                return around(source, bad)
+            allowed = {"{{" + name + "}}" for name in ALLOWED_VARS}
+            for token in re.finditer(r"\{\{[\s\S]*?\}\}", source):
+                if token.group(0) not in allowed:
+                    return around(source, token)
+        elif rule == "S01":
+            for term in BANNED:
+                phrase = term[:-1] if term.endswith("*") else term
+                pattern = re.escape(phrase).replace(r"\ ", r"\s+") + (r"\w*" if term.endswith("*") else "")
+                hit = re.search(r"(?<!\w)" + pattern + r"(?!\w)", content_text)
+                if hit:
+                    return around(content_text, hit)
+        elif rule in _CONTENT_PATTERNS:
+            hit = re.search(_CONTENT_PATTERNS[rule], content_text)
+            if hit:
+                return around(content_text, hit)
+        elif rule == "T10":
+            if preheader:
+                return _fragment(source, preheader.start(), preheader.end(), _WHERE_LIMIT)
+            body = re.search(r"<body\b[^>]*>", source, re.I)
+            if body:
+                return around(source, body)
+        elif rule == "A06":
+            for cell in find_stretched_circles(nodes):
+                pos = getattr(cell, "start_pos", None)
+                if pos is not None:
+                    return _fragment(source, pos, None, _WHERE_LIMIT)
+            hit = re.search(r"border-radius", source)
+            if hit:
+                return around(source, hit)
+        elif rule in _SOURCE_PATTERNS:
+            hit = re.search(_SOURCE_PATTERNS[rule], source, re.I)
+            if hit:
+                return around(source, hit)
+        return "весь документ: " + _fragment(source, 0, None, 60)
+
+    for issues in (report.errors, report.warnings):
+        for issue in issues:
+            if not issue.where:
+                issue.where = locate(issue.rule)[:_WHERE_LIMIT]
+            else:
+                issue.where = issue.where[:_WHERE_LIMIT]
+
+
+
 def _contrast_message(label, foreground, background, observed):
     message = f"{label}: контраст {observed:.2f}:1, требуется не менее 4.5:1."
     if TEMPLATE_CONTRAST_SUGGEST:
@@ -1128,6 +1198,7 @@ def validate(source: str, currency_method: Optional[int] = None) -> Report:
         )
         if invented:
             _issue(report, "S14", "W", "Не выдумывай подробности, которых ты не знаешь (склад, мастера, курьер, трек-номер, сроки): «%s»" % invented.group(0), invented.group(0))
+    _fill_where(report, source, content_text, nodes, preheader)
     report.ok = not report.errors
     return report
 

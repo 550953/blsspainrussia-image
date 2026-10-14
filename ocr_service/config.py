@@ -209,6 +209,8 @@ TEMPLATE_POSTPROCESS = os.getenv("TEMPLATE_POSTPROCESS", "1").strip().lower() no
 # Строгий режим Outlook: T26 (таблица внутри строки с текстом) и P03 (тёплая заливка индикатора)
 # становятся ошибками и запускают ремонт. По умолчанию это предупреждения.
 TEMPLATE_STRICT_OUTLOOK = os.getenv("TEMPLATE_STRICT_OUTLOOK", "0").strip().lower() in {"1", "true", "yes", "on"}
+# Отладка: хранить в памяти HTML каждой попытки (до 3 штук по 40 КБ, TTL как у результата) и отдавать через ?attempts_html=1.
+TEMPLATE_KEEP_ATTEMPT_HTML = os.getenv("TEMPLATE_KEEP_ATTEMPT_HTML", "0").strip().lower() in {"1", "true", "yes", "on"}
 TEMPLATE_HISTORY = _template_int("TEMPLATE_HISTORY", 12, 1)
 TEMPLATE_STORE_MAX = _template_int("TEMPLATE_STORE_MAX", 100, 1)
 TEMPLATE_VALIDATE_RATE_PER_MIN = _template_int("TEMPLATE_VALIDATE_RATE_PER_MIN", 30, 1)

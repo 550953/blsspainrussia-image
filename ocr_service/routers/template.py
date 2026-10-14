@@ -17,7 +17,7 @@ from ..config import (
     TEMPLATE_BREAKER_FAILS, TEMPLATE_BREAKER_PAUSE_SECONDS, TEMPLATE_DAILY_CAP,
     TEMPLATE_DAILY_TOKEN_CAP, TEMPLATE_MODELS, TEMPLATE_QUEUE_MAX_WAIT_SECONDS, TEMPLATE_JOB_DEADLINE_SECONDS,
     TEMPLATE_RESULT_TTL_SECONDS, TEMPLATE_RESERVE_KEYS_FOR_OCR,
-    TEMPLATE_STORE_MAX, TEMPLATE_SUBMIT_RATE_PER_MIN, TEMPLATE_VALIDATE_RATE_PER_MIN, TEMPLATE_HISTORY,
+    TEMPLATE_KEEP_ATTEMPT_HTML, TEMPLATE_STORE_MAX, TEMPLATE_SUBMIT_RATE_PER_MIN, TEMPLATE_VALIDATE_RATE_PER_MIN, TEMPLATE_HISTORY,
 )
 from ..email_template.director import FONTS, HEADERS, INDICATORS, PALETTES, make_brief, set_history_size
 from ..email_template.generate import run_template_job
@@ -369,7 +369,7 @@ async def submit(request: Request):
 
 
 @router.get("/template/result/{job_id}")
-async def result(job_id: str, request: Request, html: int = 1):
+async def result(job_id: str, request: Request, html: int = 1, attempts_html: int = 0):
     namespace = _auth(request)
     _clean_store()
     job = TEMPLATE_JOBS.get(job_id)
@@ -400,6 +400,8 @@ async def result(job_id: str, request: Request, html: int = 1):
         payload["template"] = dict(payload["template"])
         payload["template"].pop("html", None)
         payload["template"].pop("text", None)
+    if attempts_html and TEMPLATE_KEEP_ATTEMPT_HTML and job.get("attempts_html"):
+        payload["attempts_html"] = job["attempts_html"]
     return payload
 
 

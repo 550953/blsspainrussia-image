@@ -10,6 +10,7 @@ from ..config import (
     TEMPLATE_MODELS, TEMPLATE_REPAIR_MODEL, TEMPLATE_REPAIR_TEMPERATURE,
     TEMPLATE_RESULT_TTL_SECONDS,
     TEMPLATE_POSTPROCESS, TEMPLATE_TEMPERATURE,
+    TEMPLATE_KEEP_ATTEMPT_HTML,
 )
 from ..telemetry import (
     TEMPLATE_STATS, _job_log, ensure_template_day, record_template_run,
@@ -246,14 +247,21 @@ async def run_template_job(job_id: str, job: dict):
                 "warnings": sorted(set(issue["rule"] for issue in report_warnings)),
                 # Текст и фрагмент оставшихся ошибок: по одним кодам (T10, T17) не понять, какая подпроверка сработала.
                 "error_details": [
-                    {"rule": item["rule"], "message": str(item.get("message", ""))[:220], "where": str(item.get("where", ""))[:120]}
-                    for item in report_errors[:8]
+                    {"rule": item["rule"], "severity": "E", "message": str(item.get("message", ""))[:220], "where": str(item.get("where", ""))[:120]}
+                    for item in report_errors[:10]
                 ],
+                # Ошибки модели до автофикса: все правила, чтобы видеть, что именно ушло на повторный вызов (V02 и т. п.).
                 "raw_error_details": [
-                    {"rule": item["rule"], "message": str(item.get("message", ""))[:160]}
-                    for item in raw_errors if item["rule"] in {"T10", "T17", "T18", "V08", "A06"}
-                ][:8],
+                    {"rule": item["rule"], "severity": "E", "message": str(item.get("message", ""))[:160], "where": str(item.get("where", ""))[:120]}
+                    for item in raw_errors
+                ][:10],
             }
+            if TEMPLATE_KEEP_ATTEMPT_HTML and len(job.setdefault("attempts_html", [])) < 3:
+                job["attempts_html"].append({
+                    "n": number,
+                    "raw_html": (raw_html or "").encode("utf-8")[:40960].decode("utf-8", "ignore"),
+                    "final_html": (fixed if report is not None else "").encode("utf-8")[:40960].decode("utf-8", "ignore"),
+                })
             attempts.append(current)
             if number > 1 and len(current["errors"]) >= len(attempts[-2].get("errors", [])):
                 no_progress += 1
