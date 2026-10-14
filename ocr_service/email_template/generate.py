@@ -244,6 +244,15 @@ async def run_template_job(job_id: str, job: dict):
                 "raw_errors": sorted(set(issue["rule"] for issue in raw_errors)),
                 "autofixes": fixes, "errors": sorted(set(issue["rule"] for issue in report_errors)),
                 "warnings": sorted(set(issue["rule"] for issue in report_warnings)),
+                # Текст и фрагмент оставшихся ошибок: по одним кодам (T10, T17) не понять, какая подпроверка сработала.
+                "error_details": [
+                    {"rule": item["rule"], "message": str(item.get("message", ""))[:220], "where": str(item.get("where", ""))[:120]}
+                    for item in report_errors[:8]
+                ],
+                "raw_error_details": [
+                    {"rule": item["rule"], "message": str(item.get("message", ""))[:160]}
+                    for item in raw_errors if item["rule"] in {"T10", "T17", "T18", "V08", "A06"}
+                ][:8],
             }
             attempts.append(current)
             if number > 1 and len(current["errors"]) >= len(attempts[-2].get("errors", [])):

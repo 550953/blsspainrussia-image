@@ -7,9 +7,10 @@ from typing import Dict, List, Optional
 
 from ..config import (
     TEMPLATE_CONTRAST_SUGGEST, TEMPLATE_DISABLED_RULES, TEMPLATE_HTML_ERROR_BYTES, TEMPLATE_MAX_HTML_BYTES,
+    TEMPLATE_STRICT_OUTLOOK,
 )
 from .contrast import (
-    color_tokens, is_pure_text_color, is_red_orange, node_bg, node_fg, ratio,
+    color_tokens, is_pure_text_color, is_red_orange, is_warm_fill, node_bg, node_fg, ratio,
     suggest_background_fix, suggest_fix,
 )
 
@@ -144,6 +145,73 @@ def _outer_footer_row(mail_node, main_table=None, after=-1):
 
 def _style(node):
     return dict((m.group(1).strip().lower(), m.group(2).strip()) for m in re.finditer(r"([\w-]+)\s*:\s*([^;]+)", node.attrs.get("style", "")))
+
+
+def _declared_px(node, name: str):
+    """Ширина/высота в px из style или числового атрибута td; None, если не задана."""
+    found = re.fullmatch(r"(\d+(?:\.\d+)?)px", _style(node).get(name, "").strip(), re.I)
+    if found:
+        return float(found.group(1))
+    if node.tag == "td":
+        raw = str(node.attrs.get(name, "")).strip()
+        if re.fullmatch(r"\d+(?:\.\d+)?", raw):
+            return float(raw)
+    return None
+
+
+def round_cell_side(node):
+    """Сторона круглой ячейки td до 80px (почти квадрат с радиусом от половины стороны) или None."""
+    if node.tag != "td":
+        return None
+    radius_text = _style(node).get("border-radius", "").strip()
+    width, height = _declared_px(node, "width"), _declared_px(node, "height")
+    if not (radius_text and width and height) or width > 80 or height > 80 or min(width, height) / max(width, height) < 0.6:
+        return None
+    first = radius_text.split()[0]
+    if first.endswith("%"):
+        round_shape = float(re.sub(r"[^\d.]", "", first) or 0) >= 50
+    else:
+        round_shape = bool(re.fullmatch(r"\d+(?:\.\d+)?px", first, re.I)) and float(first[:-2]) >= max(width, height) / 2 - 0.5
+    return max(width, height) if round_shape else None
+
+
+def _table_rows(table):
+    """Строки таблицы: прямые tr и tr внутри tbody/thead/tfoot."""
+    rows = []
+    for child in table.children:
+        if child.tag == "tr":
+            rows.append(child)
+        elif child.tag in {"tbody", "thead", "tfoot"}:
+            rows.extend(grand for grand in child.children if grand.tag == "tr")
+    return rows
+
+
+def _row_cells(row):
+    return [cell for cell in row.children if cell.tag in {"td", "th"}]
+
+
+def find_stretched_circles(nodes) -> list:
+    """Круглые td, которые растянутся в овал: в той же колонке другой строки лежит ячейка с текстом.
+
+    Колонка берёт ширину самой широкой ячейки, поэтому width у td-круга не работает.
+    Лечится вложенной таблицей фиксированной ширины вокруг круга (автофикс AF30).
+    """
+    found = []
+    for table in (node for node in nodes if node.tag == "table"):
+        rows = _table_rows(table)
+        grid = [_row_cells(row) for row in rows]
+        for r_idx, cells in enumerate(grid):
+            for c_idx, cell in enumerate(cells):
+                if round_cell_side(cell) is None:
+                    continue
+                for o_idx, other_cells in enumerate(grid):
+                    if o_idx == r_idx or c_idx >= len(other_cells):
+                        continue
+                    other = other_cells[c_idx]
+                    if _text(other).replace("\u00a0", " ").strip() and "table" not in {child.tag for child in other.children}:
+                        found.append(cell)
+                        break
+    return found
 
 
 def _issue(report, rule, severity, message, where=""):
@@ -539,15 +607,18 @@ def validate(source: str, currency_method: Optional[int] = None) -> Report:
         style_text = (pre_style.group(2) if pre_style else "").lower().replace(" ", "")
         required = ("display:none", "font-size:1px", "line-height:1px", "max-height:0", "max-width:0",
                     "opacity:0", "overflow:hidden", "mso-hide:all")
-        if any(item not in style_text for item in required):
-            _issue(report, "T10", "E", "Прехедер должен содержать полный набор скрывающих стилей")
+        missing_styles = [item for item in required if item not in style_text]
+        if missing_styles:
+            _issue(report, "T10", "E", "Прехедер должен содержать полный набор скрывающих стилей; не хватает: " + ", ".join(missing_styles))
         visible = re.sub(r"&nbsp;&zwnj;|&#160;&#8204;", "", preheader.group(3), flags=re.I)
         visible = html.unescape(re.sub(r"<[^>]*>", "", visible)).replace("{{transactionalId}}", "1234567890").strip()
         report.stats["preheader_chars"] = len(visible)
         if not 50 <= len(visible) <= 110:
-            _issue(report, "T10", "E", "Текст прехедера должен быть длиной 50–110 символов")
-        if len(re.findall(r"(?:&nbsp;&zwnj;|&#160;&#8204;)", preheader.group(3), re.I)) < 3:
-            _issue(report, "T10", "E", "В конце прехедера нужны минимум три пары &nbsp;&zwnj;")
+            _issue(report, "T10", "E", "Текст прехедера должен быть длиной 50–110 символов; сейчас %d (с {{transactionalId}} как 10 цифр)" % len(visible))
+        pair_count = len(re.findall(r"(?:&nbsp;&zwnj;|&#160;&#8204;)", preheader.group(3), re.I))
+        report.stats["preheader_pairs"] = pair_count
+        if pair_count < 3:
+            _issue(report, "T10", "E", "В конце прехедера нужны минимум три пары &nbsp;&zwnj;; сейчас %d" % pair_count)
     email_node = next((node for node in nodes if "{{email}}" in node.text), None)
     mail_node = anchors[0] if anchors else None
     footer_root = _outer_footer_row(mail_node, main_table, marker_pos) if mail_node else None
@@ -579,13 +650,16 @@ def validate(source: str, currency_method: Optional[int] = None) -> Report:
                 _issue(report, "T11", "E", "Для border-radius требуется border-collapse:separate")
         size = re.search(r"(\d+(?:\.\d+)?)\s*px", st.get("font-size", ""))
         size_value = float(size.group(1)) if size else None
+        # Пустые ячейки-распорки и кружки индикатора не несут текста: предупреждения T13/T14 на них шум.
+        has_text = bool(_text(node).replace("\u00a0", " ").strip())
+        is_round = round_cell_side(node) is not None
         zero_spacer = bool(
             size_value == 0
             and not html.unescape(node.text or "").replace("\xa0", " ").strip()
         )
         if size and size_value < 12 and id(node) != id(preheader_node) and not zero_spacer:
             _issue(report, "T12", "E", "Размер текста не должен быть меньше 12 px", node.tag)
-        elif size and 12 <= float(size.group(1)) < 15 and id(node) not in footer_nodes and not (
+        elif size and 12 <= float(size.group(1)) < 15 and has_text and not is_round and id(node) not in footer_nodes and not (
             detail_start >= 0 and detail_start <= node.start_pos < marker_pos
             and len((node.text or "").strip()) <= 30
         ):
@@ -604,7 +678,7 @@ def validate(source: str, currency_method: Optional[int] = None) -> Report:
             float(line_px.group(1)) / float(font_size.group(1))
             if line_px and font_size and float(font_size.group(1)) > 0 else None
         )
-        if line_ratio is not None and id(node) != id(preheader_node) and not 1.4 <= line_ratio <= 1.6:
+        if line_ratio is not None and has_text and not is_round and id(node) != id(preheader_node) and not 1.4 <= line_ratio <= 1.6:
             _issue(report, "T14", "W", "Рекомендуемый межстрочный интервал: 1.4–1.6", node.tag)
         if node.tag == "a" and ("padding" in st or "background" in st):
             _issue(report, "S05", "E", "Ссылка не должна выглядеть как кнопка")
@@ -730,6 +804,7 @@ def validate(source: str, currency_method: Optional[int] = None) -> Report:
         message_paragraphs = [
             node for node in nodes
             if node.tag == "p" and marker_pos <= node.start_pos < message_end
+            and _style(node).get("font-style", "").lower() != "italic"
             and not any(
                 descendant is not node and (
                     descendant.tag in {"em", "i"}
@@ -1012,16 +1087,57 @@ def validate(source: str, currency_method: Optional[int] = None) -> Report:
     preheader_text = preheader.group(3) if preheader else ""
     if any(char in content_text for char in "🚨⚡⚠️❗‼") or len(emojis) > 1 or re.search(r"[\U0001F000-\U0001FAFF\U00002600-\U000026FF\U00002700-\U000027BF\U00002B00-\U00002BFF\ufe0f]", important_text + preheader_text):
         _issue(report, "S03", "E", "Эмодзи в письме запрещены правилами шаблона")
+    # --- A06: круг-ячейка растягивается по колонке с подписью и становится овалом
+    if find_stretched_circles(nodes):
+        _issue(report, "A06", "E", "Круг лежит в одной колонке с подписью и растянется в овал: вложи его в отдельную таблицу фиксированной ширины (width=размер круга)")
+    # --- T26: таблица внутри строки с текстом ломает выравнивание в Outlook
+    outlook_severity = "E" if TEMPLATE_STRICT_OUTLOOK else "W"
+    for node in nodes:
+        if node.tag != "table":
+            continue
+        inline_style = _style(node).get("display", "").lower() in {"inline-table", "inline-block", "inline"}
+        ancestor, inside_text = node.parent, False
+        while ancestor is not None and ancestor.tag not in {"td", "th", "body", "root"}:
+            if ancestor.tag in {"p", "span", "a", "li", "h1", "h2", "h3", "em", "strong", "b", "i"}:
+                inside_text = True
+                break
+            ancestor = ancestor.parent
+        if inline_style or inside_text:
+            _issue(report, "T26", outlook_severity, "Таблица внутри строки текста или display:inline-table: Outlook сломает выравнивание. Делай знак и сумму обычными span в одном абзаце", node.tag)
+            break
+    # --- P03: тёплая (красно-оранжевая, терракотовая) заливка ячейки в блоке индикатора
+    if detail_start >= 0 and marker_pos >= 0:
+        for node in nodes:
+            if node.tag not in {"td", "th", "table", "tr"} or not detail_start <= node.start_pos < marker_pos:
+                continue
+            fills = color_tokens(node.attrs.get("bgcolor", "")) + color_tokens(_style(node).get("background-color", "")) + color_tokens(_style(node).get("background", ""))
+            if any(is_warm_fill(color) for color in fills):
+                _issue(report, "P03", outlook_severity, "Тёплая заливка в блоке деталей и индикатора: используй цвета из выданной палитры", node.tag)
+                break
+    # --- T27: padding/margin на span Outlook игнорирует
+    for node in nodes:
+        if node.tag == "span" and any(prop.startswith(("padding", "margin")) for prop in _style(node)):
+            _issue(report, "T27", "W", "Outlook игнорирует padding и margin на span: отступы задавай ячейкой таблицы или пробелом", node.tag)
+            break
+    # --- S14: выдуманные подробности (склад, мастера, курьер, трек) до блока сообщения
+    if marker_pos >= 0:
+        head_text = html.unescape(re.sub(r"<[^>]*>", " ", source[:marker_pos]))
+        invented = re.search(
+            r"\bмастер\w*|\bсклад(?:а|е|у|ом|ы|ов|ах)?\b|\bкурьер\w*|\bтрек(?:[-\s]?номер\w*)?\b",
+            head_text, re.I,
+        )
+        if invented:
+            _issue(report, "S14", "W", "Не выдумывай подробности, которых ты не знаешь (склад, мастера, курьер, трек-номер, сроки): «%s»" % invented.group(0), invented.group(0))
     report.ok = not report.errors
     return report
 
 
 _WARNING_RULES = {
     "V09", "V10", "V11", "V12", "T13", "T14", "T25", "S02", "S07", "S08", "S09", "S11", "S12",
-    "A04", "P02",
+    "A04", "P02", "T27", "S14",
     *(f"M{number:02d}" for number in range(1, 21)),
 }
-_MIXED_SEVERITY_RULES = {"T04", "T16", "T17", "T23", "S02", "S04"}
+_MIXED_SEVERITY_RULES = {"T04", "T16", "T17", "T23", "S02", "S04", "T26", "P03"}
 RULES: Dict[str, dict] = {
     rule: {
         "id": rule,
@@ -1050,6 +1166,9 @@ RULES: Dict[str, dict] = {
         "L01": "Порядок блоков", "L02": "Индикатор этапов", "A01": "Контраст текста",
         "A02": "Контраст знака валюты", "A03": "Индикатор без опоры на цвет", "A04": "Проверка контраста",
         "P01": "Ограниченная палитра", "P02": "Количество цветов", "A05": "Круги без искажения",
+        "A06": "Круг не растянется по колонке", "T26": "Таблица внутри строки текста (Outlook)",
+        "T27": "Padding/margin на span (Outlook)", "P03": "Тёплая заливка индикатора",
+        "S14": "Выдуманные подробности",
         "V10": "Способ оформления валюты", "M01": "Выбранное оформление знака валюты",
         "M07": "Выравнивание знака", "M08": "Знак после суммы", "M09": "Подчёркивание знака",
         "M02": "Приподнятый знак валюты", "M03": "Круглая плашка знака", "M04": "Скруглённая плашка",

@@ -87,6 +87,11 @@ ADDITIONAL_MUTATIONS = {
         1,
     ),
     "S14": lambda s: s.replace("Мы подготовили свежие детали", "Наши мастера подготовили свежие детали", 1),
+    "A06": lambda s: s.replace(
+        '<tr><td style="padding:6px 10px;color:#24352d;font-size:14px;line-height:1.5">✓ Принят</td>',
+        '<tr><td width="28" height="28" style="width:28px;height:28px;line-height:28px;border-radius:14px;text-align:center;color:#24352d;font-size:14px">1</td></tr>'
+        '<tr><td style="padding:6px 10px;color:#24352d;font-size:14px;line-height:1.5">✓ Принят</td>', 1,
+    ),
     "P02": lambda s: __import__("re").sub(r"#[0-9a-fA-F]{3,8}", "#24352d", s),
 }
 

@@ -55,19 +55,69 @@ HEADERS = [
 # Каждый индикатор описан так, чтобы он собирался в почтовой вёрстке без искажений и без вида кнопок.
 # Общее для всех: у первого этапа символ &#10003; и цвет «выполнено», второй этап жирный и с акцентом, третий приглушённый.
 INDICATORS = [
-    "три прямоугольных сегмента в одной таблице (скругление не больше 3px, без рамок и теней, не похожи на кнопки), подпись внутри",
-    "точки с соединяющими линиями: точка 14x14 в отдельной ячейке, линия-ячейка высотой 3px между точками, подписи под точками",
+    "три колонки в одной таблице: над подписью цветная полоска высотой 6px (без заливки под текстом, без рамок и теней), подпись обычным текстом, у первого этапа &#10003;",
+    "точки с соединяющими линиями: каждая точка 14x14 лежит в собственной вложенной таблице width=\"14\" (атрибут и style), линия — отдельная ячейка width=\"40\" высотой 3px с bgcolor и &nbsp; внутри, подписи под точками",
     "прогресс-бар из трёх секций высотой 8px с подписями под ним",
     "три карточки со ступенчатым сдвигом через padding-left 0 / 16px / 32px, карточки без скруглений-таблеток",
-    "круги с цифрами и соединением: каждый круг строго width:28px;height:28px;line-height:28px;text-align:center;border-radius:14px, у первого вместо цифры &#10003;",
+    "круги с цифрами: каждый круг — собственная вложенная таблица width=\"28\" (атрибут и style) с одной ячейкой 28x28, line-height:28px, text-align:center, border-radius:14px; у первого вместо цифры &#10003;; подпись лежит в другой строке, а не в ячейке круга",
     "три строки-этапа друг под другом, слева у каждой квадрат-маркер 12x12 и цветная вертикальная полоска 3px у края строки",
-    "три кружка 26x26 (width, height и line-height по 26px) с галочкой / точкой / пустым контуром и подписями под ними",
-    "лента из трёх прямоугольных шагов с разной заливкой, скругление не больше 4px, подпись внутри",
+    "три кружка с галочкой / точкой / пустым контуром: каждый кружок — собственная вложенная таблица width=\"26\" (атрибут и style) с одной ячейкой 26x26, line-height:26px; подпись лежит под ним в другой строке",
+    "лента из трёх шагов без плашек: цветная линия 4px над каждой подписью (у первого этапа сплошная «выполнено», у второго акцентная, у третьего светлая), подписи обычным текстом",
+]
+
+# Тексты письма выдаёт сервер, а не модель: иначе она из раза в раз пишет одни и те же приветствие, заголовок и подпись.
+# В текстах нет «ваш заказ» (S08), «спасибо за покупку» (S06), «прямо сейчас» (S01), обращения на «ты», склада, курьера и сроков.
+GREETINGS = [
+    "Привет, {{name}}",
+    "{{name}}, заказ в системе",
+    "{{name}}, заказ принят, дальше мы сами",
+    "Добрый день, {{name}}",
+    "Рады знакомству, {{name}}",
+    "Вот и вы, {{name}}",
+    "{{name}}, всё получилось",
+    "Здравствуйте, {{name}}",
+    "{{name}}, мы начали работу",
+    "Приятно познакомиться, {{name}}",
+]
+HEADINGS = [
+    "Следующие шаги",
+    "Заглянем за кулисы",
+    "Как мы готовим заказ",
+    "Что будет дальше",
+    "Закулисье заказа",
+    "Маршрут заказа",
+    "Три шага до отправки",
+    "Как всё устроено",
+    "От заявки до отправки",
+    "Что мы делаем дальше",
+]
+SIGNOFFS = [
+    "Спокойного дня от {{brandName}}",
+    "Остаёмся на связи, {{brandName}}",
+    "Всего хорошего, {{brandName}}",
+    "Будем держать вас в курсе, {{brandName}}",
+    "До связи, {{brandName}}",
+    "Хорошего дня, {{brandName}}",
+    "Пишите, если что-то непонятно, — {{brandName}}",
+    "Мы рядом, {{brandName}}",
+    "Берегите себя, {{brandName}}",
+    "На связи, {{brandName}}",
+]
+VOICES = [
+    "через конкретику: что именно будет сделано на каждом этапе, без общих слов",
+    "первый абзац начни с вопроса, который читатель мог бы задать сам, и сразу ответь на него",
+    "спокойно и уверенно: заказ принят, всё идёт по плану, без оправданий и восторгов",
+    "от первого лица множественного числа: «мы проверяем», «мы сообщим», живыми короткими фразами",
+    "коротко и по делу: два предложения без образов",
+    "с одной лёгкой шуткой про ожидание, остальное строго по делу",
+    "как сообщение коллеги: просто, тепло, без канцелярита и без пафоса",
+    "через сравнение с обычной жизнью, но одно и только понятное",
 ]
 CURRENCY_METHODS = list(range(1, 21))
 HISTORY_DEFAULT = 12
 _lock = threading.Lock()
 _history: Deque[Tuple[str, str, str, int]] = deque(maxlen=HISTORY_DEFAULT)
+_text_history: Deque[Tuple[str, str, str, str]] = deque(maxlen=HISTORY_DEFAULT)
 # Совместимое имя для кода, который раньше читал историю напрямую.
 HISTORY = _history
 
@@ -81,6 +131,10 @@ class DesignBrief:
     indicator: str
     currency_method: int
     avoid_palettes: List[str] = field(default_factory=list)
+    greeting: str = ""
+    heading: str = ""
+    signoff: str = ""
+    voice: str = ""
 
     def public(self) -> dict:
         values = asdict(self)
@@ -89,15 +143,17 @@ class DesignBrief:
 
 
 def set_history_size(n: int) -> None:
-    global _history, HISTORY
+    global _history, HISTORY, _text_history
     with _lock:
         _history = deque(list(_history), maxlen=max(int(n), 1))
+        _text_history = deque(list(_text_history), maxlen=max(int(n), 1))
         HISTORY = _history
 
 
 def reset_history() -> None:
     with _lock:
         _history.clear()
+        _text_history.clear()
 
 
 def _resolve(pool, value, name):
@@ -149,13 +205,21 @@ def pick_brief(seed: Optional[int] = None, currency_method: Optional[int] = None
         selected_method = currency_method or _pick(
             rng, CURRENCY_METHODS, [row[3] for row in history], 8,
         )
+        # Тексты выбираются после дизайна, чтобы выбор палитры, шапки и индикатора по одному seed не менялся.
+        texts = list(_text_history)
+        selected_greeting = _resolve(GREETINGS, overrides.get("greeting"), "greeting") or _pick(rng, GREETINGS, [row[0] for row in texts], min(5, len(GREETINGS) - 1))
+        selected_heading = _resolve(HEADINGS, overrides.get("heading"), "heading") or _pick(rng, HEADINGS, [row[1] for row in texts], min(5, len(HEADINGS) - 1))
+        selected_signoff = _resolve(SIGNOFFS, overrides.get("signoff"), "signoff") or _pick(rng, SIGNOFFS, [row[2] for row in texts], min(5, len(SIGNOFFS) - 1))
+        selected_voice = _resolve(VOICES, overrides.get("voice"), "voice") or _pick(rng, VOICES, [row[3] for row in texts], min(4, len(VOICES) - 1))
         brief = DesignBrief(
             seed=seed, palette_family=selected_palette, fonts=selected_fonts, header=selected_header,
             indicator=selected_indicator, currency_method=selected_method,
             avoid_palettes=[row[0] for row in history][-5:],
+            greeting=selected_greeting, heading=selected_heading, signoff=selected_signoff, voice=selected_voice,
         )
         if record:
             _history.append((selected_palette, selected_header, selected_indicator, selected_method))
+            _text_history.append((selected_greeting, selected_heading, selected_signoff, selected_voice))
         return brief
 
 

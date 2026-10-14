@@ -3,7 +3,7 @@ import re
 from ..config import TEMPLATE_AUTOFIX_CONTRAST
 import colorsys
 from .contrast import color_tokens, is_red_orange, parse_color, ratio, suggest_fix
-from .validator import ALLOWED_VARS, MARKER, _Tree, _outer_footer_row, _style, _text, _walk
+from .validator import ALLOWED_VARS, MARKER, _Tree, _outer_footer_row, _style, _text, _walk, find_stretched_circles, round_cell_side
 
 
 _MARKER_PATTERN = re.compile(
@@ -603,6 +603,7 @@ def _fix_page_backgrounds(source):
     return _edit_node_tags(source, transforms)
 
 
+_PREHEADER_FILLERS = (" — детали вашего заказа уже готовы к просмотру", ". Сообщим, когда статус изменится")
 _PREHEADER_STYLE = (
     ("display", "none"), ("font-size", "1px"), ("line-height", "1px"), ("max-height", "0"),
     ("max-width", "0"), ("opacity", "0"), ("overflow", "hidden"), ("mso-hide", "all"),
@@ -650,6 +651,17 @@ def _fix_preheader(source):
         trimmed = " ".join(kept).rstrip(",;:—-– ")
         if len(trimmed.replace("{{transactionalId}}", "1234567890")) >= 50:
             visible = trimmed
+    # Слишком короткий прехедер (меньше 50 символов) дополняем нейтральной фразой без новых фактов.
+    plain_now = re.sub(r"<[^>]*>", "", visible)
+    if "<" not in visible and len(plain_now.replace("{{transactionalId}}", "1234567890").strip()) < 50:
+        for filler in _PREHEADER_FILLERS:
+            candidate = (plain_now.rstrip(" .,;:") + filler).strip()
+            if len(candidate.replace("{{transactionalId}}", "1234567890")) > 108:
+                break
+            plain_now = candidate
+            if len(plain_now.replace("{{transactionalId}}", "1234567890")) >= 50:
+                break
+        visible = plain_now
     needs_pairs = len(pairs) < 6
     trimmed_now = visible != re.sub(r"(?:&nbsp;&zwnj;|&#160;&#8204;)", "", text, flags=re.I)
     if new_tag == open_tag and not needs_pairs and not trimmed_now:
@@ -705,6 +717,115 @@ def _fix_round_shapes(source):
                 return tag, changed
             return edit
         transforms.append((node.start_pos, make(side)))
+    if not transforms:
+        return source, False
+    return _edit_node_tags(source, transforms)
+
+
+def _fix_stretched_circles(source):
+    """AF30: A06. Круг-ячейка в одной колонке с подписью растягивается в овал: оборачиваем его в таблицу фиксированной ширины."""
+    tree = _tree(source)
+    stretched = find_stretched_circles(list(_walk(tree.root)))
+    if not stretched:
+        return source, False
+    edits = []
+    for node in stretched:
+        side = round_cell_side(node)
+        start = node.start_pos
+        open_end = _tag_end(source, start)
+        close = re.compile(r"</td\s*>", re.I).search(source, open_end)
+        if not side or not close or re.search(r"<(?:td|th|table)\b", source[open_end:close.start()], re.I):
+            continue
+        open_tag = source[start:open_end]
+        outer_attrs = "".join(
+            " " + found.group(0).strip() for found in (
+                re.search(r"\b" + name + r"\s*=\s*(?:\"[^\"]*\"|'[^']*'|[^\s>]+)", open_tag, re.I) for name in ("colspan", "rowspan")
+            ) if found
+        )
+        inner_tag = re.sub(r"\s\b(?:colspan|rowspan)\s*=\s*(?:\"[^\"]*\"|'[^']*'|[^\s>]+)", "", open_tag, flags=re.I)
+        for attr in ("width", "height"):
+            if not re.search(r"\s" + attr + r"\s*=", inner_tag, re.I):
+                inner_tag = "<td " + attr + '="%g"' % side + inner_tag[3:]
+        # Выравнивание внешней ячейки берём у подписи в той же колонке, чтобы круг стоял над подписью.
+        align = "left"
+        parent_row = node.parent
+        table = parent_row.parent if parent_row is not None else None
+        while table is not None and table.tag != "table":
+            table = table.parent
+        if table is not None and parent_row is not None:
+            column = [c for c in parent_row.children if c.tag in {"td", "th"}].index(node)
+            for row in (r for r in table.children if r.tag in {"tr", "tbody"}):
+                for tr in ([row] if row.tag == "tr" else [x for x in row.children if x.tag == "tr"]):
+                    cells = [c for c in tr.children if c.tag in {"td", "th"}]
+                    if tr is not parent_row and column < len(cells) and _text(cells[column]).strip():
+                        label = cells[column]
+                        found = (label.attrs.get("align") or _style(label).get("text-align") or "").strip().lower()
+                        if found in {"left", "center", "right"}:
+                            align = found
+                        break
+        wrapped = (
+            '<td align="%s" valign="top" style="padding:0"%s>' % (align, outer_attrs)
+            + '<table role="presentation" cellpadding="0" cellspacing="0" border="0" width="%g" '
+              'style="width:%gpx;border-collapse:separate"><tr>' % (side, side)
+            + inner_tag + source[open_end:close.start()] + "</td></tr></table></td>"
+        )
+        edits.append((start, close.end(), wrapped))
+    if not edits:
+        return source, False
+    for start, end, wrapped in sorted(edits, reverse=True):
+        source = source[:start] + wrapped + source[end:]
+    return source, True
+
+
+def _fix_text_metrics(source):
+    """AF31: T13/T14. Межстрочный интервал 1.4–1.6 у абзацев, пунктов и ячеек с текстом; 12–14px в блоке сообщения -> 15px.
+
+    Не трогаем кружки (у них line-height равен высоте), пустые ячейки-распорки, заголовки и span со знаком валюты.
+    """
+    marker = _MARKER_PATTERN.search(source)
+    message_end = source.lower().find("</tr", marker.end()) if marker else -1
+    tree = _tree(source)
+    transforms = []
+    for node in _walk(tree.root):
+        if node.tag not in {"p", "li", "td"} or round_cell_side(node) is not None:
+            continue
+        own_text = html_text = (node.text or "").replace("\u00a0", " ").strip()
+        if not own_text:
+            continue
+        style = _style(node)
+        size = re.fullmatch(r"(\d+(?:\.\d+)?)px", style.get("font-size", "").strip(), re.I)
+        size_value = float(size.group(1)) if size else None
+        new_size = None
+        if (
+            marker and node.tag in {"p", "li"} and size_value is not None and 12 <= size_value < 15
+            and marker.start() <= node.start_pos < (message_end if message_end > 0 else len(source))
+        ):
+            new_size = 15
+            size_value = 15.0
+        line = style.get("line-height", "").strip()
+        ratio_value = None
+        if re.fullmatch(r"\d+(?:\.\d+)?", line):
+            ratio_value = float(line)
+        else:
+            line_px = re.fullmatch(r"(\d+(?:\.\d+)?)px", line, re.I)
+            if line_px and size_value:
+                ratio_value = float(line_px.group(1)) / size_value
+        new_line = "1.5" if ratio_value is not None and not 1.4 <= ratio_value <= 1.6 else None
+        if new_size is None and new_line is None:
+            continue
+
+        def make(new_size=new_size, new_line=new_line):
+            def edit(tag):
+                changed = False
+                if new_size is not None:
+                    tag, did = _set_style_property(tag, "font-size", "%gpx" % new_size)
+                    changed = changed or did
+                if new_line is not None:
+                    tag, did = _set_style_property(tag, "line-height", new_line)
+                    changed = changed or did
+                return tag, changed
+            return edit
+        transforms.append((node.start_pos, make()))
     if not transforms:
         return source, False
     return _edit_node_tags(source, transforms)
@@ -994,7 +1115,7 @@ def apply(source: str):
         fixes.append("AF12")
     for fix_id, function in (
         ("AF20", _fix_message_styles), ("AF21", _fix_message_structure), ("AF23", _fix_page_backgrounds),
-        ("AF24", _fix_preheader), ("AF25", _fix_round_shapes), ("AF26", _fix_done_mark),
+        ("AF24", _fix_preheader), ("AF25", _fix_round_shapes), ("AF30", _fix_stretched_circles), ("AF31", _fix_text_metrics), ("AF26", _fix_done_mark),
         ("AF27", _fix_banned_phrases), ("AF29", _fix_red_orange),
     ):
         try:
