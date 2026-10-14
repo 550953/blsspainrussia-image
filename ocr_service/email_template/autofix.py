@@ -992,6 +992,59 @@ def _fix_banned_phrases(source):
     return updated, changed
 
 
+def _fix_currency_entity(source):
+    """AF34: V08. Знак доллара, записанный сущностью (&#36;, &#x24;, &dollar;), в видимом тексте заменяем на «$»."""
+    def replace_text(match):
+        return re.sub(r"&#0*36;|&#x0*24;|&dollar;", lambda _m: "$", match.group(0), flags=re.I)
+
+    updated = re.sub(r">[^<]+(?=<)", replace_text, source)
+    return updated, updated != source
+
+
+def _same_case(word, value):
+    return value[:1].upper() + value[1:] if word[:1].isupper() else value
+
+
+_SERVICE_CASES = {"а": "а", "е": "е", "у": "у", "ы": "и", "ой": "ой", "ою": "ой"}  # служба/службе/службу/службы/службой -> доставка/доставке/доставку/доставки/доставкой
+
+# Выдуманные подробности и заезженные обороты, которые модель пишет, игнорируя запрет в промпте (прогоны 164259, 164616, 170803).
+_INVENTED_RULES = (
+    # «Мы бережно относимся к каждой детали» -> «Мы внимательно относимся ...»
+    (re.compile(r"\b(бережно)(\s+относ\w+)", re.I), lambda m: _same_case(m.group(1), "внимательно") + m.group(2)),
+    # «бережно проверяем» -> «проверяем» (наречие убираем, следующее слово с заглавной, если наречие начинало фразу)
+    (re.compile(r"\b(бережно)\s+(\w)", re.I),
+     lambda m: m.group(2).upper() if m.group(1)[:1].isupper() else m.group(2)),
+    (re.compile(r"\bбережн(?:ый|ая|ое|ые|ого|ой|ую|ым|ых)\s+(\w)", re.I),
+     lambda m: m.group(1)),
+    (re.compile(r"\bпод\s+контролем\s+специалистов\b", re.I), lambda m: _same_case(m.group(0), "в работе у нашей команды")),
+    (re.compile(r"\bна\s+склад\b", re.I), lambda m: _same_case(m.group(0), "в работу")),
+    (re.compile(r"\bна\s+складе\b", re.I), lambda m: _same_case(m.group(0), "в системе")),
+    (re.compile(r"\bсо\s+склада\b", re.I), lambda m: _same_case(m.group(0), "из системы")),
+    (re.compile(r"\bслужб(а|е|у|ы|ой|ою)\s+доставк(?:а|и|е|у|ой|ою)\b", re.I),
+     lambda m: _same_case(m.group(0), "доставк" + _SERVICE_CASES[m.group(1).lower()])),
+    # «передан в работу мастерской» -> «передан в работу»
+    (re.compile(r"\s+мастерск\w+(?=[\s.,;:!?]|$)", re.I), lambda m: ""),
+)
+
+
+def _fix_invented_phrases(source):
+    """AF35: S14/S08. Безопасные замены выдуманных подробностей («бережно», «склад», «служба доставки», «мастерская», «под контролем специалистов») в видимом тексте."""
+    changed = False
+
+    def replace_text(match):
+        nonlocal changed
+        text = match.group(0)
+        for pattern, repl in _INVENTED_RULES:
+            new = pattern.sub(repl, text)
+            if new != text:
+                changed = True
+                text = new
+        return text
+
+    updated = re.sub(r">[^<]+(?=<)", replace_text, source)
+    return updated, changed
+
+
 def _fix_missing_h1(source):
     """AF33: нет <h1>, приветствие лежит в <td>: оборачиваем текст ячейки (22-28px, жирный, с {{name}}) в <h1> с теми же стилями."""
     if re.search(r"<h1\b", source, re.I):
@@ -1255,7 +1308,7 @@ def apply(source: str):
     for fix_id, function in (
         ("AF20", _fix_message_styles), ("AF21", _fix_message_structure), ("AF23", _fix_page_backgrounds),
         ("AF24", _fix_preheader), ("AF25", _fix_round_shapes), ("AF30", _fix_stretched_circles), ("AF31", _fix_text_metrics), ("AF32", _fix_span_spacing), ("AF26", _fix_done_mark),
-        ("AF27", _fix_banned_phrases), ("AF29", _fix_red_orange), ("AF33", _fix_missing_h1),
+        ("AF27", _fix_banned_phrases), ("AF35", _fix_invented_phrases), ("AF34", _fix_currency_entity), ("AF29", _fix_red_orange), ("AF33", _fix_missing_h1),
     ):
         try:
             updated, did = function(source)

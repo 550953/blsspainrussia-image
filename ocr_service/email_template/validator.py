@@ -805,7 +805,9 @@ def validate(source: str, currency_method: Optional[int] = None) -> Report:
         sign_node = next((node for node in nodes if "$" in node.text), None)
         price_node = next((node for node in nodes if "{{price}}" in node.text), None)
         price_pos = source.find("{{price}}")
-        sign_pos = source.find("$")
+        # Знак может быть записан сущностью (&#36;, &#x24;, &dollar;): для браузера это тот же «$» (письмо 17 из прогона 164616).
+        sign_match = re.search(r"\$|&#0*36;|&#x0*24;|&dollar;", source, re.I)
+        sign_pos = sign_match.start() if sign_match else -1
         price_area = source[max(0, price_pos - 300):price_pos + 300] if price_pos >= 0 else ""
         sign_area = source[max(0, sign_pos - 300):sign_pos + 150] if sign_pos >= 0 else ""
         if currency_method not in (8, 15):
