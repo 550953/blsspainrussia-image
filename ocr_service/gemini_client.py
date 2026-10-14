@@ -263,6 +263,20 @@ async def _call_gemini_nonstream(client, payload, model, key, profile, timeout):
     return _generation_result(data, model)
 
 
+def _payload_text_chars(payload: dict) -> int:
+    """Грубая оценка размера запроса по числу символов текста (системная инструкция + реплики)."""
+    total = 0
+    system = payload.get("systemInstruction") or {}
+    for part in system.get("parts", ()) if isinstance(system, dict) else ():
+        if isinstance(part, dict) and isinstance(part.get("text"), str):
+            total += len(part["text"])
+    for item in payload.get("contents") or ():
+        for part in item.get("parts", ()) if isinstance(item, dict) else ():
+            if isinstance(part, dict) and isinstance(part.get("text"), str):
+                total += len(part["text"])
+    return total
+
+
 async def call_gemini_generate(
     contents: list,
     system_instruction: str,
@@ -284,12 +298,19 @@ async def call_gemini_generate(
     client = _get_http_client(proxy_url, profile=profile)
     timeout = float(hard_timeout or TEMPLATE_HARD_TIMEOUT)
     if profile == "long":
-        from .config import TEMPLATE_STREAM_FIRST_BYTE_TIMEOUT, TEMPLATE_STREAM_STALL_TIMEOUT
+        from .config import (
+            TEMPLATE_LARGE_REQUEST_CHARS, TEMPLATE_REPAIR_FIRST_BYTE_TIMEOUT,
+            TEMPLATE_STREAM_FIRST_BYTE_TIMEOUT, TEMPLATE_STREAM_STALL_TIMEOUT,
+        )
+        first_byte_timeout = TEMPLATE_STREAM_FIRST_BYTE_TIMEOUT
+        if _payload_text_chars(payload) > TEMPLATE_LARGE_REQUEST_CHARS:
+            # Ремонтный (многоходовой) запрос: первый байт приходит позже, чем у первой генерации.
+            first_byte_timeout = max(first_byte_timeout, TEMPLATE_REPAIR_FIRST_BYTE_TIMEOUT)
         try:
             return await asyncio.wait_for(
                 _call_gemini_stream(
                     client, payload, model, key, timeout, TEMPLATE_CONNECT_TIMEOUT,
-                    TEMPLATE_STREAM_FIRST_BYTE_TIMEOUT, TEMPLATE_STREAM_STALL_TIMEOUT,
+                    first_byte_timeout, TEMPLATE_STREAM_STALL_TIMEOUT,
                 ),
                 timeout=timeout,
             )

@@ -8,7 +8,10 @@ from typing import Dict, List, Optional
 from ..config import (
     TEMPLATE_CONTRAST_SUGGEST, TEMPLATE_DISABLED_RULES, TEMPLATE_HTML_ERROR_BYTES, TEMPLATE_MAX_HTML_BYTES,
 )
-from .contrast import color_tokens, is_red_orange, node_bg, node_fg, ratio, suggest_fix
+from .contrast import (
+    color_tokens, is_pure_text_color, is_red_orange, node_bg, node_fg, ratio,
+    suggest_background_fix, suggest_fix,
+)
 
 ALLOWED_VARS = ("brandName", "name", "productName", "transactionalId", "price", "supportEmail", "email")
 MARKER = "<!-- Здесь вставляется тело письма -->"
@@ -161,6 +164,11 @@ def _fragment(source: str, start: int, end: Optional[int] = None, limit: int = 2
 def _contrast_message(label, foreground, background, observed):
     message = f"{label}: контраст {observed:.1f}:1, требуется не менее 4.5:1."
     if TEMPLATE_CONTRAST_SUGGEST:
+        if is_pure_text_color(foreground):
+            # Белый/чёрный текст на цветной плашке: правим плашку, а не текст.
+            bg_suggested = suggest_background_fix(foreground, background, 4.5)
+            if bg_suggested:
+                return message + f" Замените цвет фона {background} на {bg_suggested}, цвет текста {foreground} оставьте."
         suggested = suggest_fix(foreground, background, 4.5)
         if suggested:
             if ratio(suggested, background) is not None and ratio(suggested, background) >= 4.5:
@@ -418,20 +426,17 @@ def validate(source: str, currency_method: Optional[int] = None) -> Report:
     if any(re.search(r"mailto:[^\"'>]*\?", node.attrs.get("href", ""), re.I) for node in anchors):
         _issue(report, "V09", "W", "Уберите параметры запроса из mailto-ссылки")
     price_at = source.find("{{price}}")
-    row_start = source.rfind("<tr", 0, price_at) if price_at >= 0 else -1
-    row_end = source.lower().find("</tr", price_at) if price_at >= 0 else -1
-    price_row = source[row_start:row_end + 5] if row_start >= 0 and row_end >= 0 else (
-        source[max(0, price_at - 300):price_at + 300] if price_at >= 0 else ""
-    )
-    visible_price_row = html.unescape(re.sub(r"<[^>]*>", " ", price_row))
-    marker_in_row = visible_price_row.find("{{price}}")
-    price_context = visible_price_row[max(0, marker_in_row - 300):marker_in_row + 307] if marker_in_row >= 0 else ""
+    # Знак и сумма часто лежат в соседних ячейках вложенных таблиц, поэтому смотрим на видимый текст
+    # всего документа со свёрнутыми пробелами, а не на одну <tr> и не на «сырые» символы с отступами.
+    visible_all = re.sub(r"\s+", " ", html.unescape(re.sub(r"<[^>]*>", " ", source)))
     has_currency_sign = (
-        re.search(r"\$\s*\{\{price\}\}|\{\{price\}\}[\s\S]{0,300}\$", price_context, re.I)
+        re.search(r"\$\s*\{\{price\}\}|\{\{price\}\}[\s\S]{0,40}\$", visible_all, re.I)
         if currency_method in (8, 15)
-        else re.search(r"\$\s*\{\{price\}\}", price_context, re.I)
+        else re.search(r"\$\s*\{\{price\}\}", visible_all, re.I)
     )
-    if not has_currency_sign and not (currency_method == 15 and re.search(r"\{\{price\}\}[\s\S]{0,300}\bUSD\b", price_context, re.I)):
+    if not has_currency_sign and not (
+        currency_method == 15 and re.search(r"\{\{price\}\}[\s\S]{0,40}\bUSD\b", visible_all, re.I)
+    ):
         _issue(report, "V08", "E", "Рядом с суммой должен быть знак $ или подпись USD")
     if price_at >= 0:
         price_node = next((node for node in nodes if "{{price}}" in node.text), None)
@@ -605,7 +610,8 @@ def validate(source: str, currency_method: Optional[int] = None) -> Report:
         price_area = source[max(0, price_pos - 300):price_pos + 300] if price_pos >= 0 else ""
         sign_area = source[max(0, sign_pos - 300):sign_pos + 150] if sign_pos >= 0 else ""
         if currency_method not in (8, 15):
-            if sign_pos < 0 or price_pos < 0 or abs(sign_pos - price_pos) > 300:
+            # Близость уже проверена по видимому тексту (V08 выше); здесь только наличие знака.
+            if sign_pos < 0 or price_pos < 0:
                 _issue(report, "V08", "E", "Знак валюты должен находиться рядом с {{price}}")
         elif price_pos >= 0 and not re.search(r"\{\{price\}\}[\s\S]{0,300}(?:\$|\bUSD\b)", price_area, re.I):
             _issue(report, "M08", "W", "Для способа 8 или 15 знак или USD должны идти после суммы")
@@ -706,7 +712,7 @@ def validate(source: str, currency_method: Optional[int] = None) -> Report:
             ("h2", r"<h2\b", "В блоке сообщения обязателен h2"),
             ("p", r"<p\b", "В блоке сообщения обязателен абзац"),
             ("strong", r"<strong\b", "В блоке сообщения нужен strong"),
-            ("ul", r"<ul\b", "В блоке сообщения нужен маркированный список"),
+            ("ul", r"<ul\b", "В блоке сообщения нужен настоящий маркированный список: <ul> с тремя <li> (не строки таблицы и не символы «•»)"),
             ("hr", r"<hr\b", "В блоке сообщения нужен разделитель"),
             ("italic", r"<(?:em|i)\b|font-style\s*:\s*italic", "В блоке сообщения нужна курсивная подпись"),
         ):
@@ -761,6 +767,11 @@ def validate(source: str, currency_method: Optional[int] = None) -> Report:
             brand_position, name_position, product_position, transactional_position,
             price_position, marker_pos, h2_position, ul_position, hr_position,
             italic_position, support_position, token_position("{{email}}", support_position + 1),
+        ]
+        # h2/ul/hr/курсив: если блока нет, об этом сообщает T17; L01 не должен дублировать ошибку каскадом.
+        positions = [
+            pos for index, pos in enumerate(positions)
+            if not (pos < 0 and 6 <= index <= 9)  # индексы h2, ul, hr, курсив в списке выше
         ]
         if any(pos < 0 for pos in positions) or positions != sorted(positions):
             _issue(report, "L01", "E", "Блоки и обязательные переменные расположены не в заданном порядке")

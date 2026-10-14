@@ -354,6 +354,8 @@ async def generate(contents, system_instruction, model_chain, job_id, generation
     previous_slow_key = None
     previous_slow_proxy = None
     previous_model_rejection = None
+    dead_key_refunds = 0   # ключи с PROJECT_ACCESS_DENIED не тратят бюджет повторов (до 3 раз за вызов)
+    timeout_hits = 0       # таймауты в рамках одного вызова generate()
 
     def detail_for(code, category=None, error=None, model=None, key_name=None):
         return _error_detail(
@@ -365,7 +367,7 @@ async def generate(contents, system_instruction, model_chain, job_id, generation
             error_code=code, api_trace=api_trace,
         )
 
-    while api_attempts < TEMPLATE_INFRA_RETRIES:
+    while api_attempts - dead_key_refunds < TEMPLATE_INFRA_RETRIES:
         remaining = deadline - time.monotonic() - TEMPLATE_DEADLINE_MARGIN
         if remaining < TEMPLATE_MIN_CALL_SECONDS:
             code = "ocr_priority_timeout" if yielded_to_ocr else "deadline"
@@ -558,13 +560,22 @@ async def generate(contents, system_instruction, model_chain, job_id, generation
             timed_out = True
             record_template_proxy_error("generation_timeout")
             previous_slow_key, previous_slow_proxy = idx, proxy
-            penalty_hits, penalty_seconds = _penalize_slow_route(idx, proxy)
-            _job_log(
-                "tpl_slow_route_penalty", job_id, component="email_template",
-                key_name=key_name, proxy=_proxy_label(proxy),
-                hits=penalty_hits, cooldown_s=round(penalty_seconds),
-                slow_route_penalties=slow_route_penalty_count(),
-            )
+            timeout_hits += 1
+            if timeout_hits <= 1:
+                penalty_hits, penalty_seconds = _penalize_slow_route(idx, proxy)
+                _job_log(
+                    "tpl_slow_route_penalty", job_id, component="email_template",
+                    key_name=key_name, proxy=_proxy_label(proxy),
+                    hits=penalty_hits, cooldown_s=round(penalty_seconds),
+                    slow_route_penalties=slow_route_penalty_count(),
+                )
+            else:
+                # Тот же запрос завис и на другом маршруте: причина в модели/размере запроса,
+                # а не в канале. Маршрут не штрафуем, но ротацию ключа и канала сохраняем.
+                _job_log(
+                    "tpl_slow_route_skip_penalty", job_id, component="email_template",
+                    key_name=key_name, proxy=_proxy_label(proxy), timeouts_in_call=timeout_hits,
+                )
             # Не удерживаем ключ на дополнительную проверку канала.
             gemini_pool.release(idx)
             if proxy is not None:
@@ -586,6 +597,8 @@ async def generate(contents, system_instruction, model_chain, job_id, generation
             last_error = exc
             request_error = exc
             http_status = exc.http_status
+            if exc.category == "PROJECT_ACCESS_DENIED" and dead_key_refunds < 3:
+                dead_key_refunds += 1
             if exc.category == "RATE_LIMIT_OR_QUOTA":
                 gemini_pool.release(idx, error=exc, model=model)
             elif (
@@ -641,8 +654,16 @@ async def generate(contents, system_instruction, model_chain, job_id, generation
         if error_category and error_category != "generation_timeout":
             record_template_proxy_error(error_category)
         code = _public_error_code(request_error) if request_error else "generation_unavailable"
+        key_level_error = isinstance(request_error, GeminiAPIError) and (
+            request_error.category in {"INVALID_API_KEY", "PROJECT_ACCESS_DENIED"}
+            or request_error.category.startswith("BILLING_")
+        )
         if isinstance(request_error, GeminiAPIError):
-            if request_error.http_status in (400, 403, 404):
+            if key_level_error:
+                # Отказ касается ключа/проекта, а не модели: два «залоченных» ключа подряд
+                # не должны давать быстрый model_rejected.
+                pass
+            elif request_error.http_status in (400, 403, 404):
                 if (
                     previous_model_rejection
                     and previous_model_rejection["model"] == model

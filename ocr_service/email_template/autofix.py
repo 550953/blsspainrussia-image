@@ -448,11 +448,15 @@ def apply(source: str):
             return match.group(0)
         tag_name = re.match(r"<([a-z0-9]+)", match.group(0), re.I).group(1)
         return "<" + tag_name + updated + ">"
-    for tag in ("body", "table"):
-        updated = re.sub(r"<" + tag + r"\b([^>]*)>", sync_background, source, count=1, flags=re.I)
+    # body, первая таблица (внешняя обёртка) и основная таблица письма (width 520–600).
+    # Раньше правилась только первая <table>, и у основной таблицы bgcolor не появлялся (T09).
+    main_table_pattern = r"<table\b((?=[^>]*\bwidth\s*=\s*[\"']?(?:5[2-9]\d|600)\b)[^>]*)>"
+    for pattern in (r"<body\b([^>]*)>", r"<table\b([^>]*)>", main_table_pattern):
+        updated = re.sub(pattern, sync_background, source, count=1, flags=re.I)
         if updated != source:
             source = updated
-            fixes.append("AF09")
+            if "AF09" not in fixes:
+                fixes.append("AF09")
     link = re.search(r"<a\b([^>]*)>", source, re.I)
     if link:
         style_match = re.search(r"\bstyle\s*=\s*([\"'])(.*?)\1", link.group(1), re.I | re.S)

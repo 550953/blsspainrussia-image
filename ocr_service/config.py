@@ -188,6 +188,10 @@ TEMPLATE_CONNECT_TIMEOUT = _template_float("TEMPLATE_CONNECT_TIMEOUT", 8, 1)
 TEMPLATE_HARD_TIMEOUT = _template_float("TEMPLATE_HARD_TIMEOUT", 150, 15)
 TEMPLATE_STREAM_FIRST_BYTE_TIMEOUT = _template_float("TEMPLATE_STREAM_FIRST_BYTE_TIMEOUT", 25, 1)
 TEMPLATE_STREAM_STALL_TIMEOUT = _template_float("TEMPLATE_STREAM_STALL_TIMEOUT", 30, 1)
+# Ремонтный запрос тяжелее первого (≈9 тыс. входных токенов против ≈4,7 тыс.): модель с thinking
+# отдаёт первый байт позже. Для «больших» запросов ждём первый байт дольше базового значения.
+TEMPLATE_REPAIR_FIRST_BYTE_TIMEOUT = _template_float("TEMPLATE_REPAIR_FIRST_BYTE_TIMEOUT", 75, 1)
+TEMPLATE_LARGE_REQUEST_CHARS = _template_int("TEMPLATE_LARGE_REQUEST_CHARS", 22000, 1000)
 TEMPLATE_PROXY_PREFLIGHT_TIMEOUT = _template_float("TEMPLATE_PROXY_PREFLIGHT_TIMEOUT", 7, 1)
 TEMPLATE_LEASE_TTL = max(TEMPLATE_HARD_TIMEOUT + 30, _template_float("TEMPLATE_LEASE_TTL", 180, 1))
 TEMPLATE_MODEL_COOLDOWN = _template_float("TEMPLATE_MODEL_COOLDOWN", 60, 1)

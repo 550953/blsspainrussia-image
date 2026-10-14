@@ -146,6 +146,42 @@ def suggest_fix(foreground: str, background: str, target: float = 4.5) -> Option
     return min(candidates)[1] if candidates else None
 
 
+def suggest_background_fix(foreground: str, background: str, target: float = 4.5) -> Optional[str]:
+    """Двигает светлоту фона (оттенок сохраняется), оставляя цвет текста прежним.
+
+    Нужна для «чистого» белого/чёрного текста на цветной плашке: затемнять сам белый текст бессмысленно,
+    правильнее чуть затемнить плашку (например, зелёный бейдж со знаком «$»).
+    """
+    bg = parse_color(background)
+    if bg is None or ratio(foreground, background) is None:
+        return None
+    if ratio(foreground, background) >= target:
+        return None
+    red, green, blue = (channel / 255.0 for channel in bg)
+    hue, lightness, saturation = colorsys.rgb_to_hls(red, green, blue)
+    candidates = []
+    for direction in (-1, 1):
+        current = lightness
+        for _ in range(100):
+            current = min(1.0, max(0.0, current + direction * 0.01))
+            rgb = colorsys.hls_to_rgb(hue, current, saturation)
+            color = "#" + "".join("%02x" % round(channel * 255) for channel in rgb)
+            contrast = ratio(foreground, color)
+            if contrast is not None and contrast >= target:
+                candidates.append((abs(current - lightness), color))
+                break
+    return min(candidates)[1] if candidates else None
+
+
+def is_pure_text_color(value: str) -> bool:
+    """True для почти белого или почти чёрного текста: такой цвет лучше не менять, а править фон."""
+    rgb = parse_color(value)
+    if rgb is None:
+        return False
+    _hue, lightness, _saturation = colorsys.rgb_to_hls(*(channel / 255.0 for channel in rgb))
+    return lightness >= 0.92 or lightness <= 0.08
+
+
 def is_red_orange(value: str) -> bool:
     """True для насыщенных красно-оранжевых цветов из палитры."""
     rgb = parse_color(value)
