@@ -105,17 +105,31 @@ async def run_template_job(job_id: str, job: dict):
                 else:
                     candidates = list(job.get("models") or [])
                 alternate_model = _repair_model_candidate(setting, candidates, attempts[-1].get("model"))
+                issues = [item for item in last_report_errors if item.get("rule") in persistent]
+                # Surgical rules: keep dialogue history so the model edits existing HTML
+                # instead of rewriting from scratch (compact_restart).
+                surgical_only = bool(persistent) and persistent.issubset(
+                    {"A01", "A02", "S01", "T17", "T21", "V02", "V08"}
+                )
                 if alternate_model:
                     request_models = [alternate_model]
                     repair_strategy = "alternate_model"
+                    repair = build_repair_message(issues, compact=True)
+                    contents = [{"role": "user", "parts": [{"text": initial + "\n\n" + repair}]}]
+                elif surgical_only and history:
+                    repair_strategy = "surgical_persist"
+                    repair = build_repair_message(issues, compact=False)
+                    contents = [{"role": "user", "parts": [{"text": initial}]}] + list(history) + [
+                        {"role": "user", "parts": [{"text": repair}]},
+                    ]
                 else:
                     repair_strategy = "compact_restart"
-                issues = [item for item in last_report_errors if item.get("rule") in persistent]
-                repair = build_repair_message(issues, compact=True)
-                contents = [{"role": "user", "parts": [{"text": initial + "\n\n" + repair}]}]
+                    repair = build_repair_message(issues, compact=True)
+                    contents = [{"role": "user", "parts": [{"text": initial + "\n\n" + repair}]}]
                 _job_log(
                     "tpl_repair_strategy", job_id, component="email_template", attempt=number,
-                    strategy=repair_strategy, model=request_models[0] if repair_strategy == "alternate_model" else attempts[-1].get("model"),
+                    strategy=repair_strategy,
+                    model=request_models[0] if repair_strategy == "alternate_model" else attempts[-1].get("model"),
                     persistent_rule_ids=sorted(persistent)[:12],
                 )
             call_started = time.monotonic()
