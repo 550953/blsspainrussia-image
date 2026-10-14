@@ -204,6 +204,11 @@ TEMPLATE_SLOW_ROUTE_COOLDOWN = _template_float("TEMPLATE_SLOW_ROUTE_COOLDOWN", 6
 TEMPLATE_QUOTA_BLOCK_SECONDS = _template_int("TEMPLATE_QUOTA_BLOCK_SECONDS", 900, 60)
 TEMPLATE_CONTRAST_SUGGEST = os.getenv("TEMPLATE_CONTRAST_SUGGEST", "1").strip().lower() not in {"0", "false", "no"}
 TEMPLATE_AUTOFIX_CONTRAST = os.getenv("TEMPLATE_AUTOFIX_CONTRAST", "1").strip().lower() in {"1", "true", "yes", "on"}
+# Постпроцессор писем (метатеги, text-size-adjust, mso-table-*) и text/plain в ответе.
+TEMPLATE_POSTPROCESS = os.getenv("TEMPLATE_POSTPROCESS", "1").strip().lower() not in {"0", "false", "no"}
+# Строгий режим Outlook: T26 (таблица внутри строки с текстом) и P03 (тёплая заливка индикатора)
+# становятся ошибками и запускают ремонт. По умолчанию это предупреждения.
+TEMPLATE_STRICT_OUTLOOK = os.getenv("TEMPLATE_STRICT_OUTLOOK", "0").strip().lower() in {"1", "true", "yes", "on"}
 TEMPLATE_HISTORY = _template_int("TEMPLATE_HISTORY", 12, 1)
 TEMPLATE_STORE_MAX = _template_int("TEMPLATE_STORE_MAX", 100, 1)
 TEMPLATE_VALIDATE_RATE_PER_MIN = _template_int("TEMPLATE_VALIDATE_RATE_PER_MIN", 30, 1)

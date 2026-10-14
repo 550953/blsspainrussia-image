@@ -9,13 +9,13 @@ from ..config import (
     TEMPLATE_DAILY_TOKEN_CAP, TEMPLATE_MAX_ATTEMPTS, TEMPLATE_MAX_HTML_BYTES, TEMPLATE_MAX_OUTPUT_TOKENS,
     TEMPLATE_MODELS, TEMPLATE_REPAIR_MODEL, TEMPLATE_REPAIR_TEMPERATURE,
     TEMPLATE_RESULT_TTL_SECONDS,
-    TEMPLATE_TEMPERATURE,
+    TEMPLATE_POSTPROCESS, TEMPLATE_TEMPERATURE,
 )
 from ..telemetry import (
     TEMPLATE_STATS, _job_log, ensure_template_day, record_template_run,
     record_template_usage, template_success_p50_ms,
 )
-from . import autofix
+from . import autofix, postprocess
 from .extract import parse
 from .prompt import PROMPT_VERSION, build_repair_message, build_user_message, base_prompt, prompt_sha1
 from .runner import GenerationDeadline, TemplateGenerationError, generate as call_model
@@ -184,6 +184,7 @@ async def run_template_job(job_id: str, job: dict):
                 })
             raw_html = parsed.html
             fixes = []
+            post_ids = []
             report = None
             raw_report = None
             output_bytes = len(raw_html.encode("utf-8"))
@@ -208,6 +209,19 @@ async def run_template_job(job_id: str, job: dict):
                 report = after
                 if fixes:
                     _job_log("tpl_autofix", job_id, component="email_template", attempt=number, fix_ids=fixes)
+                # Постпроцессор: метатеги, text-size-adjust, mso-table-*. Откат, если ошибок стало больше.
+                if TEMPLATE_POSTPROCESS:
+                    pp_html, post_ids = postprocess.apply(fixed)
+                    if post_ids:
+                        if len(pp_html.encode("utf-8")) > 40000:
+                            pp_report = await asyncio.to_thread(validate, pp_html, job["brief"]["currency_method"])
+                        else:
+                            pp_report = validate(pp_html, job["brief"]["currency_method"])
+                        if len(pp_report.errors) <= len(report.errors) and len(pp_html.encode("utf-8")) <= TEMPLATE_MAX_HTML_BYTES:
+                            fixed, report = pp_html, pp_report
+                            _job_log("tpl_postprocess", job_id, component="email_template", attempt=number, fix_ids=post_ids)
+                        else:
+                            post_ids = []
             report_errors = [dict(rule=x["rule"], message=x["message"], where=x.get("where", "")) for x in parsed.errors]
             raw_errors = list(report_errors)
             if raw_report is not None:
@@ -253,6 +267,8 @@ async def run_template_job(job_id: str, job: dict):
                     "stats": {"bytes": output_bytes},
                 },
                 "tail": parsed.tail,
+                "postprocess": post_ids,
+                "text": postprocess.plain_text(fixed) if report is not None else "",
                 "api_trace": [
                     trace for item in attempts for trace in item.get("api_trace", [])
                 ],

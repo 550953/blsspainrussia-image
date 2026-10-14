@@ -7,9 +7,10 @@ from typing import Dict, List, Optional
 
 from ..config import (
     TEMPLATE_CONTRAST_SUGGEST, TEMPLATE_DISABLED_RULES, TEMPLATE_HTML_ERROR_BYTES, TEMPLATE_MAX_HTML_BYTES,
+    TEMPLATE_STRICT_OUTLOOK,
 )
 from .contrast import (
-    color_tokens, is_pure_text_color, is_red_orange, node_bg, node_fg, ratio,
+    color_tokens, is_pure_text_color, is_red_orange, is_warm_fill, node_bg, node_fg, ratio,
     suggest_background_fix, suggest_fix,
 )
 
@@ -979,16 +980,75 @@ def validate(source: str, currency_method: Optional[int] = None) -> Report:
     preheader_text = preheader.group(3) if preheader else ""
     if any(char in content_text for char in "🚨⚡⚠️❗‼") or len(emojis) > 1 or re.search(r"[\U0001F000-\U0001FAFF\U00002600-\U000026FF\U00002700-\U000027BF\U00002B00-\U00002BFF\ufe0f]", important_text + preheader_text):
         _issue(report, "S03", "E", "Эмодзи в письме запрещены правилами шаблона")
+    # Outlook (Word-движок) и «выдуманные факты»: T26, T27, P03, S14
+    def _blank(value):
+        return not re.sub(r"[\s\u200b-\u200d\u2060\ufeff]", "", html.unescape(value or ""))
+
+    outlook_severity = "E" if TEMPLATE_STRICT_OUTLOOK else "W"
+    inline_wrappers = {"span", "div", "font", "a", "b", "strong", "em", "i"}
+    for node in nodes:
+        if _style(node).get("display", "").lower() == "inline-table":
+            _issue(report, "T26", outlook_severity, "display:inline-table: Outlook выведет таблицу блоком, на новой строке", node.tag)
+            break
+        if node.tag == "table":
+            sign_only = re.sub(r"\s", "", html.unescape(_text(node)).replace("\xa0", ""))
+            if "$" not in sign_only or len(sign_only) > 3:
+                continue
+            holder = node.parent
+            while holder is not None and holder.tag in inline_wrappers and "{{price}}" not in _text(holder).replace(_text(node), "", 1):
+                holder = holder.parent
+            if (
+                holder is not None and holder.tag not in {"root", "html", "body"}
+                and "{{price}}" in _text(holder).replace(_text(node), "", 1)
+            ):
+                _issue(
+                    report, "T26", outlook_severity,
+                    "Знак валюты лежит во вложенной таблице рядом с суммой: Outlook перенесёт его на новую строку. "
+                    "Оформите знак через span в той же строке текста",
+                    "$",
+                )
+                break
+    for node in nodes:
+        if node.tag == "span":
+            span_style = _style(node)
+            if any(key.startswith("padding") or key.startswith("margin") for key in span_style):
+                _issue(report, "T27", "W", "padding/margin у span игнорируются в Outlook; отступы задавайте на td", "span")
+                break
+    if detail_start >= 0 and marker_pos >= 0:
+        for node in nodes:
+            if not detail_start <= node.start_pos < marker_pos:
+                continue
+            node_style = _style(node)
+            fills = (
+                color_tokens(node_style.get("background-color", ""))
+                + color_tokens(node_style.get("background", ""))
+                + color_tokens(node.attrs.get("bgcolor", ""))
+            )
+            if any(is_warm_fill(color) for color in fills):
+                _issue(
+                    report, "P03", outlook_severity,
+                    "Красно-оранжевая или терракотовая заливка блока индикатора: используйте холодные цвета палитры",
+                    node.tag,
+                )
+                break
+    pre_marker_text = re.sub(r"\{\{[^}]*\}\}", " ", html.unescape(re.sub(r"<[^>]*>", " ", source[:marker_pos] if marker_pos >= 0 else source)))
+    pre_marker_text = pre_marker_text.casefold().replace("ё", "е")
+    invented = re.search(
+        r"\b(?:мастер\w*|склад(?:а|е|у|ом|ы|ов)?|курьер\w*|трек[\s-]?(?:номер|код)\w*|пункт\w*\s+выдачи|ремесленник\w*)\b",
+        pre_marker_text,
+    )
+    if invented:
+        _issue(report, "S14", "W", "Не придумывайте факты о бизнесе (мастера, склад, курьеры, трек-номер)", invented.group(0))
     report.ok = not report.errors
     return report
 
 
 _WARNING_RULES = {
     "V09", "V10", "V11", "V12", "T13", "T14", "T25", "S02", "S07", "S08", "S09", "S11", "S12",
-    "A03", "A04", "P01", "P02",
+    "A03", "A04", "P01", "P02", "T27", "S14",
     *(f"M{number:02d}" for number in range(1, 21)),
 }
-_MIXED_SEVERITY_RULES = {"T04", "T16", "T17", "T23", "S02", "S04"}
+_MIXED_SEVERITY_RULES = {"T04", "T16", "T17", "T23", "S02", "S04", "T26", "P03"}
 RULES: Dict[str, dict] = {
     rule: {
         "id": rule,
@@ -1017,6 +1077,8 @@ RULES: Dict[str, dict] = {
         "L01": "Порядок блоков", "L02": "Индикатор этапов", "A01": "Контраст текста",
         "A02": "Контраст знака валюты", "A03": "Индикатор без опоры на цвет", "A04": "Проверка контраста",
         "P01": "Ограниченная палитра", "P02": "Количество цветов",
+        "P03": "Тёплая заливка индикатора", "T26": "Таблица внутри строки с текстом",
+        "T27": "Padding и margin у span", "S14": "Выдуманные факты о бизнесе",
         "V10": "Способ оформления валюты", "M01": "Выбранное оформление знака валюты",
         "M07": "Выравнивание знака", "M08": "Знак после суммы", "M09": "Подчёркивание знака",
         "M02": "Приподнятый знак валюты", "M03": "Круглая плашка знака", "M04": "Скруглённая плашка",

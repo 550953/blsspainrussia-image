@@ -399,6 +399,7 @@ async def result(job_id: str, request: Request, html: int = 1):
     if html == 0 and payload["template"]:
         payload["template"] = dict(payload["template"])
         payload["template"].pop("html", None)
+        payload["template"].pop("text", None)
     return payload
 
 

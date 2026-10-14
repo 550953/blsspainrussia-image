@@ -190,3 +190,13 @@ def is_red_orange(value: str) -> bool:
     hue, lightness, saturation = colorsys.rgb_to_hls(*(channel / 255.0 for channel in rgb))
     degrees = hue * 360.0
     return (degrees >= 345 or degrees <= 45) and saturation >= 0.6 and 0.25 <= lightness <= 0.75
+
+
+def is_warm_fill(value: str) -> bool:
+    """True для красно-оранжевых и терракотовых заливок (шире is_red_orange: ловит приглушённые тона)."""
+    rgb = parse_color(value)
+    if rgb is None:
+        return False
+    hue, lightness, saturation = colorsys.rgb_to_hls(*(channel / 255.0 for channel in rgb))
+    degrees = hue * 360.0
+    return (degrees >= 345 or degrees <= 40) and saturation >= 0.35 and 0.3 <= lightness <= 0.75

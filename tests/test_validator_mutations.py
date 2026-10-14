@@ -72,6 +72,21 @@ ADDITIONAL_MUTATIONS = {
     ).replace("background-color:#ffffff", "background-color:transparent")
      .replace('bgcolor="#f4f5f0"', 'bgcolor="transparent"')
      .replace('bgcolor="#ffffff"', 'bgcolor="transparent"'),
+    "T26": lambda s: s.replace(
+        '<span style="color:#4f6953;font-size:18px;vertical-align:super">$</span>',
+        '<table role="presentation" cellpadding="0" cellspacing="0" border="0" style="display:inline-table"><tr><td style="color:#4f6953;font-size:18px">$</td></tr></table>',
+        1,
+    ),
+    "T27": lambda s: s.replace(
+        '<span style="color:#24352d;font-size:26px;font-weight:700">',
+        '<span style="padding:0 4px;color:#24352d;font-size:26px;font-weight:700">', 1,
+    ),
+    "P03": lambda s: s.replace(
+        '<td style="padding:6px 10px;color:#24352d;font-size:14px;line-height:1.5">В сборке</td>',
+        '<td bgcolor="#e07a5f" style="padding:6px 10px;background-color:#e07a5f;color:#24352d;font-size:14px;line-height:1.5">В сборке</td>',
+        1,
+    ),
+    "S14": lambda s: s.replace("Мы подготовили свежие детали", "Наши мастера подготовили свежие детали", 1),
     "P02": lambda s: __import__("re").sub(r"#[0-9a-fA-F]{3,8}", "#24352d", s),
 }
 
