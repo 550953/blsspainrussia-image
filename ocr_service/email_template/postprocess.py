@@ -92,6 +92,7 @@ def apply(source: str) -> Tuple[str, List[str]]:
 # ---------------------------------------------------------------- text/plain
 
 _SKIP = {"head", "title", "style", "script"}
+_HEADING = "\x01"
 _VOID = {"br", "hr", "meta", "link", "img", "input", "area", "base", "col", "embed", "param", "source", "track", "wbr"}
 _BLOCK_START = {"p", "div", "h1", "h2", "h3", "ul", "ol", "table", "tr"}
 _BLOCK_END = {"p", "h1", "h2", "h3", "ul", "ol", "table"}
@@ -130,6 +131,8 @@ class _PlainText(HTMLParser):
                 self.out.append("\n- ")
             elif tag in _BLOCK_START:
                 self.out.append("\n")
+                if tag in ("h1", "h2", "h3"):
+                    self.out.append(_HEADING)  # служебная метка: заголовок не бывает этапом индикатора
         self.stack.append((tag, hidden))
 
     def handle_startendtag(self, tag, attrs):
@@ -170,76 +173,105 @@ class _PlainText(HTMLParser):
 
 
 _VALUE_TOKEN = re.compile(r"^(?:[$€£₽]|USD|EUR|RUB|\{\{price\}\})$", re.I)
+_MARKER = re.compile(r"[✓✔•■▪●○◦·]|\d")
+_DONE = "✓✔"
+_MAX_STAGES = 5
+
+
+def _is_stage(line: str) -> bool:
+    cand = line.strip()
+    return bool(cand) and len(cand) <= 40 and ":" not in cand and not cand.startswith("- ") \
+        and not re.search(r"[.!?,]$", cand) and "{{" not in cand and not cand.startswith(_HEADING)
+
+
+def _collect_stages(lines: List[str], start: int):
+    """Собирает индикатор этапов от строки start: маркеры (✓ • ■ цифра) и подписи этапов.
+    Возвращает (этапы [(подпись, пройден)], индекс после последней подписи, были ли маркеры)."""
+    queue, stages, seen_marker, end, k = [], [], False, start, start
+    while k < len(lines) and len(stages) < _MAX_STAGES:
+        cand = lines[k].strip()
+        if not cand:
+            k += 1
+            continue
+        if cand.startswith(_HEADING):
+            break
+        if _MARKER.fullmatch(cand):
+            queue.append(cand)
+            seen_marker = True
+            k += 1
+            continue
+        done, label = False, cand
+        if cand[0] in _DONE and len(cand) > 1:
+            done, label, seen_marker = True, cand[1:].strip(), True
+        if not _is_stage(label):
+            break
+        if queue and queue.pop(0) in _DONE:
+            done = True
+        stages.append((label, done))
+        k += 1
+        end = k
+    return stages, end, seen_marker
 
 
 def _tidy_plain_lines(text: str) -> str:
-    """Лечит раскладку таблиц в text/plain: одиночные символы, разорванные «Сумма: $ {{price}}», индикатор этапов."""
-    out, pending, marked = [], "", set()
-    for line in text.split("\n"):
-        bare = line.strip()
-        if bare and len(bare) <= 2 and not re.search(r"[^\W_]{2}", bare) and not re.search(r"\{|\}", bare) and not re.fullmatch(r"[$€£₽]", bare):
-            if bare == "✓":
-                pending = "✓ "
-            continue  # маркеры ■ • ▪ и прочие одиночные символы не печатаем
-        if bare and pending:
-            line = pending + bare
-            marked.add(len(out))
-            pending = ""
-        out.append(line)
+    """Лечит раскладку таблиц в text/plain: «Сумма: $ {{price}}» одной строкой, индикатор этапов одной строкой, одиночные символы."""
+    lines = [line.strip() for line in text.split("\n")]
     # 1) «Сумма:» + знак валюты + значение -> одна строка
     merged, i = [], 0
-    while i < len(out):
-        line = out[i]
-        if line.strip().endswith(":") and "{{" not in line.strip()[:-1]:
+    while i < len(lines):
+        line = lines[i]
+        if line.endswith(":") and "{{" not in line[:-1] and not line.startswith(_HEADING):
             j, tokens = i + 1, []
-            while j < len(out) and len(tokens) < 3:
-                if not out[j].strip():
+            while j < len(lines) and len(tokens) < 3:
+                if not lines[j]:
                     j += 1
                     continue
-                if len(out[j].strip()) <= 12 and _VALUE_TOKEN.match(out[j].strip()):
-                    tokens.append(out[j].strip())
+                if len(lines[j]) <= 12 and _VALUE_TOKEN.match(lines[j]):
+                    tokens.append(lines[j])
                     j += 1
                     continue
                 break
             if tokens:
-                merged.append(line.strip() + " " + " ".join(tokens))
+                merged.extend([line + " " + " ".join(tokens), ""])
                 i = j
                 continue
         merged.append(line)
         i += 1
-    # 2) индикатор этапов после строки «Сумма: …» -> «Статус: ✓ А → Б (сейчас) → В»
-    def _stage(line):
-        cand = line.strip()
-        return bool(cand) and len(cand) <= 40 and ":" not in cand and not cand.startswith("- ") \
-            and not re.search(r"[.!?,]$", cand) and "{{" not in cand
-
+    # 2) индикатор этапов (3–5 подписей с маркерами) -> «Статус: ✓ А → Б (сейчас) → В»
     result, i = [], 0
     while i < len(merged):
-        line = merged[i]
-        result.append(line)
-        i += 1
-        if not (line.startswith("Сумма:") and "{{price}}" in line):
-            continue
-        j, run = i, []
-        while j < len(merged) and len(run) < 4:
-            if not merged[j].strip():
-                j += 1
+        cand = merged[i]
+        if cand and (_MARKER.fullmatch(cand) or (cand[0] in _DONE and len(cand) > 1)):
+            stages, end, seen = _collect_stages(merged, i)
+            if seen and len(stages) >= 3:
+                current = next((k for k, (_, done) in enumerate(stages) if not done), None)
+                has_done = any(done for _, done in stages)
+                parts = []
+                for k, (label, done) in enumerate(stages):
+                    if done:
+                        label = "✓ " + label
+                    elif k == current and has_done:
+                        label += " (сейчас)"
+                    parts.append(label)
+                result.extend(["", "Статус: " + " → ".join(parts), ""])
+                i = end
                 continue
-            if not _stage(merged[j]):
-                break
-            run.append((j, merged[j].strip()))
-            j += 1
-        start = next((k for k, (_, text) in enumerate(run) if text.startswith("✓")), 0)
-        if len(run) - start < 3:
+        result.append(cand)
+        i += 1
+    # 3) одиночные символы отдельными строками не печатаем (✓ переезжает к следующей подписи)
+    out, pending = [], ""
+    for line in result:
+        line = line.replace(_HEADING, "")
+        bare = line.strip()
+        if bare and len(bare) <= 2 and not re.search(r"[^\W_]{2}", bare) and not re.search(r"\{|\}", bare) and not re.fullmatch(r"[$€£₽]", bare):
+            if bare == "✓":
+                pending = "✓ "
             continue
-        run = run[:start + 3]
-        names = [text for _, text in run[start:]]
-        first = names[0] if names[0].startswith("✓") else "✓ " + names[0]
-        result.append("")
-        result.append("Статус: %s → %s (сейчас) → %s" % (first, names[1], names[2]))
-        result.append("")
-        i = run[-1][0] + 1
-    return "\n".join(result)
+        if bare and pending:
+            line = pending + bare
+            pending = ""
+        out.append(line)
+    return "\n".join(out)
 
 
 def plain_text(source: str) -> str:
@@ -256,6 +288,7 @@ def plain_text(source: str) -> str:
         text = text.replace(ch, "")
     lines = [re.sub(r"[ \t]+", " ", line).strip() for line in text.split("\n")]
     text = _tidy_plain_lines("\n".join(lines))
+    text = text.replace(_HEADING, "")
     text = re.sub(r"\n{3,}", "\n\n", text)
     text = re.sub(r"(- [^\n]*)\n\n(?=- )", r"\1\n", text).strip()
     return text + "\n" if text else ""

@@ -66,3 +66,33 @@ def test_plain_text_is_idempotent_on_fixtures():
     for path in FIXTURES:
         html, _ = autofix.apply(Path(path).read_text(encoding="utf-8"))
         assert postprocess.plain_text(html) == postprocess.plain_text(html)
+
+
+def test_four_stage_indicator_keeps_all_stages_and_marks_real_current():
+    html = ("<body><p>Сумма:</p><p>$</p><p>{{price}}</p><p>✓</p><p>Принят</p><p>✓</p><p>Собран</p>"
+            "<p>•</p><p>В пути</p><p>•</p><p>Вручён</p><h2>Далее</h2></body>")
+    assert "Статус: ✓ Принят → ✓ Собран → В пути (сейчас) → Вручён" in postprocess.plain_text(html)
+
+
+def test_no_current_marker_when_nothing_or_everything_is_done():
+    none_done = "<body><p>•</p><p>А</p><p>•</p><p>Б</p><p>•</p><p>В</p></body>"
+    all_done = "<body><p>✓</p><p>А</p><p>✓</p><p>Б</p><p>✓</p><p>В</p></body>"
+    assert "Статус: А → Б → В" in postprocess.plain_text(none_done)
+    assert "(сейчас)" not in postprocess.plain_text(all_done)
+
+
+def test_three_short_lines_without_markers_are_not_a_status():
+    html = "<body><p>Сумма: $ {{price}}</p><p>Да</p><p>Нет</p><p>Может</p></body>"
+    assert "Статус:" not in postprocess.plain_text(html)
+
+
+def test_status_without_sum_line_and_heading_is_not_a_stage():
+    html = "<body><p>✓ Принят</p><p>В сборке</p><p>Отправка</p><h2>Что дальше</h2><p>Текст письма.</p></body>"
+    text = postprocess.plain_text(html)
+    assert "Статус: ✓ Принят → В сборке (сейчас) → Отправка" in text
+    assert "Что дальше" in text and "→ Что дальше" not in text
+
+
+def test_blank_line_kept_after_merged_sum_without_status():
+    text = postprocess.plain_text("<body><p>Сумма:</p><p>$</p><p>{{price}}</p><h2>Что дальше</h2></body>")
+    assert "Сумма: $ {{price}}\n\nЧто дальше" in text

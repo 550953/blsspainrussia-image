@@ -1,3 +1,4 @@
+from ocr_service.email_template.prompt import PROMPT_VERSION
 import asyncio
 import hashlib
 import json
@@ -95,7 +96,7 @@ def test_submit_enforces_closed_whitelist_and_idempotency(api):
     first = post_submit(api, **payload)
     second = post_submit(api, **payload)
     assert first.status_code == second.status_code == 200
-    assert first.json()["prompt_version"] == second.json()["prompt_version"] == "1.2"
+    assert first.json()["prompt_version"] == second.json()["prompt_version"] == PROMPT_VERSION
     assert first.json()["reused"] is False
     assert second.json()["reused"] is True
     assert first.json()["job_id"] == second.json()["job_id"]
