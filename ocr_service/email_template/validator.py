@@ -162,7 +162,7 @@ def _fragment(source: str, start: int, end: Optional[int] = None, limit: int = 2
 
 
 def _contrast_message(label, foreground, background, observed):
-    message = f"{label}: контраст {observed:.1f}:1, требуется не менее 4.5:1."
+    message = f"{label}: контраст {observed:.2f}:1, требуется не менее 4.5:1."
     if TEMPLATE_CONTRAST_SUGGEST:
         if is_pure_text_color(foreground):
             # Белый/чёрный текст на цветной плашке: правим плашку, а не текст.
@@ -768,13 +768,31 @@ def validate(source: str, currency_method: Optional[int] = None) -> Report:
             price_position, marker_pos, h2_position, ul_position, hr_position,
             italic_position, support_position, token_position("{{email}}", support_position + 1),
         ]
+        position_labels = [
+            "{{brandName}} (шапка)", "{{name}} (приветствие)", "{{productName}} (товар в блоке деталей)",
+            "{{transactionalId}} (номер заказа)", "{{price}} (сумма)", "маркер тела письма",
+            "<h2>", "<ul>", "<hr>", "курсивная подпись", "{{supportEmail}}", "{{email}}",
+        ]
         # h2/ul/hr/курсив: если блока нет, об этом сообщает T17; L01 не должен дублировать ошибку каскадом.
-        positions = [
-            pos for index, pos in enumerate(positions)
+        kept = [
+            (label, pos) for index, (label, pos) in enumerate(zip(position_labels, positions))
             if not (pos < 0 and 6 <= index <= 9)  # индексы h2, ul, hr, курсив в списке выше
         ]
+        positions = [pos for _label, pos in kept]
         if any(pos < 0 for pos in positions) or positions != sorted(positions):
-            _issue(report, "L01", "E", "Блоки и обязательные переменные расположены не в заданном порядке")
+            # Называем конкретное место: так модель в ремонте понимает, что именно переставить.
+            culprit = next((label for label, pos in kept if pos < 0), None)
+            if culprit is None:
+                culprit = next(
+                    (kept[i + 1][0] for i in range(len(kept) - 1) if kept[i][1] > kept[i + 1][1]), None,
+                )
+            _issue(
+                report, "L01", "E",
+                "Нарушен порядок блоков. Нужно строго сверху вниз: шапка {{brandName}} → приветствие {{name}} → "
+                "детали: товар {{productName}}, затем номер заказа {{transactionalId}}, затем сумма {{price}} → "
+                "индикатор → маркер → h2 → ul → hr → курсивная подпись → {{supportEmail}} → {{email}}."
+                + (" Сейчас не на своём месте: " + culprit + "." if culprit else ""),
+            )
     for tag in ("table", "tr", "td", "ul", "li", "p", "h1", "h2", "h3", "a", "html", "head", "body"):
         opened = len(re.findall(r"<" + tag + r"\b", source, re.I))
         closed = len(re.findall(r"</" + tag + r"\s*>", source, re.I))

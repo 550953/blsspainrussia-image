@@ -111,8 +111,11 @@ async def _call_gemini_stream(
     stream_url = GEMINI_REST_URL.format(model=model).replace(
         ":generateContent", ":streamGenerateContent"
     )
+    # read-timeout httpx действует и пока ждём заголовки ответа. Если он меньше first_byte_timeout
+    # (stall=30 против 75), вызов обрывается раньше нужного (~31 с). Реальные пределы first-byte и
+    # stall ниже проверяются явно через asyncio.wait_for, поэтому здесь берём максимум.
     request_timeout = httpx.Timeout(
-        max(1.0, min(stall_timeout, timeout)),
+        max(1.0, min(max(stall_timeout, first_byte_timeout), timeout)),
         connect=min(connect_timeout, max(1.0, timeout)),
         write=min(30.0, max(1.0, timeout)),
         pool=min(10.0, max(1.0, timeout)),

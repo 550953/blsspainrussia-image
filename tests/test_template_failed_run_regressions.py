@@ -223,3 +223,56 @@ def test_large_repair_request_gets_longer_first_byte_timeout(monkeypatch):
             proxy_url=None, profile="long", hard_timeout=100,
         ))
     assert captured == [25.0, 75.0]
+
+
+# ---- второй неудачный прогон (job 9fdce507…): L01 из-за порядка деталей, контраст на границе ------
+
+FIXTURE3 = Path(__file__).parent / "fixtures" / "real_flash38_run3.html"
+
+
+def test_l01_names_the_misplaced_block_when_order_number_precedes_product():
+    # В этом письме «Номер заказа» стоит выше товара, а промпт требует: товар, номер заказа, сумма.
+    report = validate(FIXTURE3.read_text(encoding="utf-8"), 1)
+    messages = [item.message for item in report.errors if item.rule == "L01"]
+    assert messages
+    assert "{{transactionalId}} (номер заказа)" in messages[0]
+    assert "товар {{productName}}, затем номер заказа {{transactionalId}}" in messages[0]
+
+
+def test_contrast_message_shows_two_decimals_so_borderline_values_are_not_misleading():
+    import re
+    report = validate(FIXTURE3.read_text(encoding="utf-8"), 1)
+    first = next(item.message for item in report.errors if item.rule == "A01")
+    match = re.search(r"контраст (\d\.\d\d):1", first)
+    assert match and float(match.group(1)) < 4.5
+
+
+def test_first_user_message_reminds_about_details_order_and_real_ul():
+    from ocr_service.email_template import prompt
+    brief = {
+        "seed": 1, "palette_family": "p", "fonts": "Georgia + Verdana", "header": "h",
+        "indicator": "i", "currency_method": 3, "avoid_palettes": [],
+    }
+    message = prompt.build_user_message(brief)
+    assert "{{productName}}, номер заказа {{transactionalId}}, сумма {{price}}" in message
+    assert "<ul>" in message and "<li>" in message
+
+
+def test_httpx_read_timeout_is_not_shorter_than_first_byte_timeout():
+    """Регрессия: ремонтные вызовы обрывались на ~31 с, потому что read-timeout httpx = stall (30 с)."""
+    from ocr_service import gemini_client
+
+    captured = []
+
+    class Client:
+        def stream(self, *_args, **kwargs):
+            captured.append(kwargs["timeout"])
+            raise RuntimeError("stop after capturing the timeout")
+
+    try:
+        asyncio.run(gemini_client._call_gemini_stream(
+            Client(), {}, "unit-model", "key", 150, 8, 75.0, 30.0,
+        ))
+    except RuntimeError:
+        pass
+    assert captured and captured[0].read >= 75.0
