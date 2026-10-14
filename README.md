@@ -63,6 +63,7 @@ curl -X POST http://localhost:8000/template/submit \
 | `TEMPLATE_API_KEYS` | пусто | Список клиентских ключей через запятую |
 | `TEMPLATE_MODELS` | пусто | Разрешённые модели для писем; задайте модель, уже используемую OCR, и проверьте через `/template/selfcheck` |
 | `TEMPLATE_REPAIR_MODEL` | пусто | Необязательная модель для последней попытки при повторяющихся ошибках; `next` выбирает следующую модель из `TEMPLATE_MODELS` |
+| `TEMPLATE_PINNED_FALLBACK` | `1` | Если в submit указана `model`, она идёт первой, остальные из `TEMPLATE_MODELS` остаются запасными при 503/429; `0` = строго одна модель |
 | `TEMPLATE_MAX_CONCURRENCY` | `3` | Параллельные генерации, ограничиваются доступными ключами |
 | `TEMPLATE_RESERVE_KEYS_FOR_OCR` | `5` | Резерв ключей Gemini для OCR |
 | `TEMPLATE_YIELD_TO_OCR` | `1` | Приоритет ожидающим/активным OCR-заданиям |

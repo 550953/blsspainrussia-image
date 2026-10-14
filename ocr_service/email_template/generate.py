@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 
 from ..config import (
     TEMPLATE_DAILY_TOKEN_CAP, TEMPLATE_MAX_ATTEMPTS, TEMPLATE_MAX_HTML_BYTES, TEMPLATE_MAX_OUTPUT_TOKENS,
-    TEMPLATE_MODELS, TEMPLATE_REPAIR_MODEL, TEMPLATE_REPAIR_TEMPERATURE,
+    TEMPLATE_MODELS, TEMPLATE_PINNED_FALLBACK, TEMPLATE_REPAIR_MODEL, TEMPLATE_REPAIR_TEMPERATURE,
     TEMPLATE_RESULT_TTL_SECONDS,
     TEMPLATE_POSTPROCESS, TEMPLATE_TEMPERATURE,
     TEMPLATE_KEEP_ATTEMPT_HTML,
@@ -29,6 +29,17 @@ def _persistent_rules(attempts):
     previous = set(attempts[-2].get("errors", []))
     current = set(attempts[-1].get("errors", []))
     return previous & current
+
+
+def _request_chain(job) -> list:
+    """Цепочка моделей для вызова: указанная в submit идёт первой, остальные из TEMPLATE_MODELS как запасные."""
+    chain = [m for m in (job.get("models") or []) if m]
+    pinned = job.get("model")
+    if not pinned:
+        return chain
+    if not TEMPLATE_PINNED_FALLBACK:
+        return [pinned]
+    return [pinned] + [m for m in chain if m != pinned]
 
 
 def _repair_model_candidate(setting, models, current_model):
@@ -94,7 +105,7 @@ async def run_template_job(job_id: str, job: dict):
                 "temperature": TEMPLATE_TEMPERATURE if number == 1 else TEMPLATE_REPAIR_TEMPERATURE,
                 "maxOutputTokens": TEMPLATE_MAX_OUTPUT_TOKENS,
             }
-            request_models = [job.get("model")] if job.get("model") else list(job["models"])
+            request_models = _request_chain(job)
             persistent = _persistent_rules(attempts) if number == max_attempts else set()
             repair_strategy = None
             if persistent:

@@ -155,6 +155,7 @@ function U {
     return [regex]::Unescape($S)
 }
 $script:ForbiddenStems = @("\u0441 \u0443\u0432\u0430\u0436\u0435\u043d\u0438\u0435\u043c", "\u0441 \u0442\u0435\u043f\u043b\u043e\u043c", "\u0440\u0430\u0434\u044b \u0432\u0430\u0441 \u043f\u0440\u0438\u0432\u0435\u0442\u0441\u0442\u0432\u043e\u0432\u0430\u0442\u044c", "\u0447\u0442\u043e \u043f\u0440\u043e\u0438\u0441\u0445\u043e\u0434\u0438\u0442", "\u043f\u0443\u0442\u044c \u0432\u0430\u0448\u0435\u0433\u043e \u0437\u0430\u043a\u0430\u0437\u0430", "\u043a\u0430\u043a \u043f\u0440\u043e\u0434\u0432\u0438\u0433\u0430\u0435\u0442\u0441\u044f", "\u043f\u0440\u044f\u043c\u043e \u0441\u0435\u0439\u0447\u0430\u0441", "\u043f\u0435\u0440\u0441\u043e\u043d\u0430\u043b\u044c\u043d", "\u043f\u043e\u0434 \u043a\u043e\u043d\u0442\u0440\u043e\u043b\u0435\u043c", "\u0431\u0435\u0440\u0435\u0436\u043d", "\u043c\u0430\u043a\u0441\u0438\u043c\u0443\u043c \u0432\u043d\u0438\u043c\u0430\u043d\u0438\u044f", "\u043d\u0430\u043a\u043b\u0430\u0434\u043d", "\u0441\u043b\u0443\u0436\u0431", "\u0441\u043f\u0435\u0446\u0438\u0430\u043b\u0438\u0441\u0442", "\u043e\u0442\u0434\u0435\u043b", "\u043c\u0430\u0441\u0442\u0435\u0440", "\u0441\u043a\u043b\u0430\u0434", "\u043a\u0443\u0440\u044c\u0435\u0440", "\u0442\u0440\u0435\u043a" | ForEach-Object { U $_ })
+$script:ForbiddenWhole = @("\u0441\u043a\u043b\u0430\u0434", "\u043e\u0442\u0434\u0435\u043b", "\u0442\u0440\u0435\u043a" | ForEach-Object { U $_ })
 function Get-VisibleText {
     param([string]$Html)
     $t = [regex]::Replace($Html, '<(style|script)\b[\s\S]*?</\1>', ' ', 'IgnoreCase')
@@ -168,7 +169,11 @@ function Get-Forbidden {
     $t = Get-VisibleText $Html
     $total = 0; $parts = @()
     foreach ($st in $script:ForbiddenStems) {
-        $n = ([regex]::Matches($t, [regex]::Escape($st))).Count
+        # Word-start boundary for every stem; short stems (sklad, otdel, trek) must be a whole word with an optional case ending,
+        # otherwise they match inside harmless words. Check is on visible text only.
+        $pat = '(?<![\p{L}\p{N}])' + [regex]::Escape($st)
+        if ($script:ForbiddenWhole -contains $st) { $pat += ((U '(?:\u0430|\u0435|\u0443|\u043e\u043c|\u044b|\u043e\u0432|\u0430\u0445)?') + '(?![\p{L}\p{N}])') }
+        $n = ([regex]::Matches($t, $pat)).Count
         if ($n -gt 0) { $total += $n; $parts += ("{0}:{1}" -f $st, $n) }
     }
     return @{ Total = $total; Stems = ($parts -join ",") }
@@ -581,6 +586,8 @@ for ($n = 1; $n -le $maxAtt; $n++) {
 }
 $needRepair = @($done | Where-Object { [int]$_.Attempts -gt 1 }).Count
 Add-Dash ("  Needed a repair call [{0}] {1,3}%  {2}/{3} done jobs (each costs about one more generation)" -f (Get-Bar $needRepair ([Math]::Max($done.Count, 1)) 20), (Get-Pct $needRepair $done.Count), $needRepair, $done.Count) "Gray"
+$modelParts = @($done | Where-Object { $_.Model } | Group-Object Model | Sort-Object Count -Descending | ForEach-Object { "{0} x{1}" -f $_.Name, $_.Count })
+if ($modelParts.Count -gt 0) { Add-Dash ("  Models that produced the final letter: {0}" -f ($modelParts -join ", ")) "White" }
 Add-Dash ("  Time per job (done): avg {0}s  p50 {1}s  max {2}s" -f $avgSec, $p50Sec, $maxSec) "White"
 Add-Dash ""
 Add-Dash $dl "DarkGray"

@@ -158,6 +158,9 @@ if TEMPLATE_API_KEY_WARNINGS:
     print(f"[pid={os.getpid()}] Template auth warning: {len(TEMPLATE_API_KEY_WARNINGS)} short client API key(s)")
 TEMPLATE_MODELS = [item.strip() for item in os.getenv("TEMPLATE_MODELS", "").split(",") if item.strip()]
 TEMPLATE_REPAIR_MODEL = os.getenv("TEMPLATE_REPAIR_MODEL", "").strip()
+# Если клиент указал model в submit, она идёт первой, а остальные модели TEMPLATE_MODELS остаются запасными
+# (раньше указанная модель шла единственной: 503/429 на ней не давал перейти на следующую). 0 = строго одна модель.
+TEMPLATE_PINNED_FALLBACK = os.getenv("TEMPLATE_PINNED_FALLBACK", "1").strip().lower() not in {"0", "false", "no", "off"}
 TEMPLATE_MAX_CONCURRENCY = _template_int("TEMPLATE_MAX_CONCURRENCY", 3, 1)
 TEMPLATE_RESERVE_KEYS_FOR_OCR = _template_int("TEMPLATE_RESERVE_KEYS_FOR_OCR", 5, 0)
 TEMPLATE_YIELD_TO_OCR = os.getenv("TEMPLATE_YIELD_TO_OCR", "1").strip().lower() not in {"0", "false", "no"}
