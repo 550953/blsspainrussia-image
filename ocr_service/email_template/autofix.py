@@ -916,9 +916,21 @@ def apply(source: str):
         source = "<!DOCTYPE html>" + source
         fixes.append("AF01")
     for name in ALLOWED_VARS:
-        updated = re.sub(r"\{\{\s*" + re.escape(name) + r"\s*\}\}", "{{" + name + "}}", source)
+        # Регистр и пробелы: {{ Name }} -> {{name}}.
+        updated = re.sub(r"\{\{\s*" + re.escape(name) + r"\s*\}\}", "{{" + name + "}}", source, flags=re.I)
         if updated != source: fixes.append("AF02")
         source = updated
+    # Близкие написания известных переменных: {{transactionid}}, {{transaction_id}}, {{product_name}} (главный источник V02 в прогонах).
+    canon = {re.sub(r"[^a-z0-9]", "", name.lower()): name for name in ALLOWED_VARS}
+    canon["transactionid"] = "transactionalId"
+
+    def _canonical(match):
+        key = re.sub(r"[^a-z0-9]", "", match.group(1).lower())
+        return "{{" + canon[key] + "}}" if key in canon else match.group(0)
+
+    updated = re.sub(r"\{\{\s*([A-Za-z][A-Za-z0-9_\-]*)\s*\}\}", _canonical, source)
+    if updated != source: fixes.append("AF02")
+    source = updated
     updated = re.sub(r"<!--\s*Здесь\s+вставляется\s+тело\s+письма\s*-->", MARKER, source, flags=re.I)
     if updated != source: fixes.append("AF03")
     source = updated

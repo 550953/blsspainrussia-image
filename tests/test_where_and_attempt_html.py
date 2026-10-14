@@ -49,3 +49,37 @@ def test_document_level_rule_still_gets_nonempty_where():
 def test_attempt_html_flag_is_off_by_default():
     from ocr_service import config
     assert config.TEMPLATE_KEEP_ATTEMPT_HTML is False
+
+
+def test_autofix_normalizes_placeholder_case_so_v02_is_not_raised():
+    from ocr_service.email_template import autofix
+    base = Path(FIXTURES[0]).read_text(encoding="utf-8")
+    broken = base.replace("{{transactionalId}}", "{{transactionid}}", 1).replace("{{name}}", "{{Name }}", 1)
+    assert any(i.rule == "V02" for i in validator.validate(broken).errors)
+    fixed, ids = autofix.apply(broken)
+    assert "AF02" in ids
+    assert not any(i.rule == "V02" for i in validator.validate(fixed).errors)
+    again, ids2 = autofix.apply(fixed)
+    assert again == fixed and "AF02" not in ids2
+
+
+def test_product_name_in_preheader_does_not_break_block_order():
+    html = Path(FIXTURES[0]).read_text(encoding="utf-8")
+    html = re.sub(r'(mso-hide:all;[^>]*>)', r'\1Заказ {{productName}} принят. ', html, count=1)
+    assert "{{productName}} принят" in html
+    assert not any(i.rule == "L01" for i in validator.validate(html).errors)
+
+
+def test_l01_still_fires_when_details_lose_product_and_has_where():
+    html = Path(FIXTURES[0]).read_text(encoding="utf-8")
+    head, sep, body = html.partition("<body")
+    bad = head + sep + body.replace("{{productName}}", "товар")
+    l01 = [i for i in validator.validate(bad).errors if i.rule == "L01"]
+    assert l01 and l01[0].where
+
+
+def test_placeholder_near_misses_are_canonicalised():
+    from ocr_service.email_template import autofix
+    html = "<p>{{ transaction_id }} {{TransactionID}} {{product_name}} {{unknownVar}}</p>"
+    fixed, ids = autofix.apply(html)
+    assert "{{transactionalId}} {{transactionalId}} {{productName}} {{unknownVar}}" in fixed

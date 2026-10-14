@@ -910,7 +910,8 @@ def validate(source: str, currency_method: Optional[int] = None) -> Report:
         )
         brand_position = token_position("{{brandName}}")
         name_position = token_position("{{name}}", max(body_pos, brand_position))
-        product_position = token_position("{{productName}}", body_pos)
+        # Прехедер идёт до блока деталей и может упоминать товар: порядок блоков считаем после прехедера.
+        product_position = token_position("{{productName}}", max(body_pos, preheader.end() if preheader else 0))
         transactional_position = token_position("{{transactionalId}}", product_position + 1)
         price_position = token_position("{{price}}", transactional_position + 1)
         h2_position = tag_position("h2", marker_pos)
@@ -939,12 +940,14 @@ def validate(source: str, currency_method: Optional[int] = None) -> Report:
                 culprit = next(
                     (kept[i + 1][0] for i in range(len(kept) - 1) if kept[i][1] > kept[i + 1][1]), None,
                 )
+            culprit_pos = next((pos for label, pos in kept if label == culprit), -1)
             _issue(
                 report, "L01", "E",
                 "Нарушен порядок блоков. Нужно строго сверху вниз: шапка {{brandName}} → приветствие {{name}} → "
                 "детали: товар {{productName}}, затем номер заказа {{transactionalId}}, затем сумма {{price}} → "
                 "индикатор → маркер → h2 → ul → hr → курсивная подпись → {{supportEmail}} → {{email}}."
                 + (" Сейчас не на своём месте: " + culprit + "." if culprit else ""),
+                _fragment(source, culprit_pos, None, _WHERE_LIMIT) if culprit_pos >= 0 else "",
             )
     for tag in ("table", "tr", "td", "ul", "li", "p", "h1", "h2", "h3", "a", "html", "head", "body"):
         opened = len(re.findall(r"<" + tag + r"\b", source, re.I))
