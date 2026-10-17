@@ -64,7 +64,7 @@ async def health():
         "gemini_pool_overloaded": overloaded,
         "gemini_pool_overloaded_seconds_left": round(remaining, 1) if overloaded else 0,
         "gemini_proxy_channels": len(GEMINI_PROXIES),
-        "gemini_proxy_mode": "proxied+direct_fallback" if _configured_proxies else "direct_only",
+        "gemini_proxy_mode": "proxied+direct_fallback" if len(GEMINI_PROXIES) > 1 else "direct_only",
         "gemini_proxy_source": _proxy_source,
         "gemini_sheet_chunk_size": GEMINI_SHEET_CHUNK_SIZE,
         "gemini_sheet_max_concurrent_chunks": GEMINI_SHEET_MAX_CONCURRENT_CHUNKS,

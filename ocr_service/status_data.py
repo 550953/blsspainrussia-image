@@ -120,17 +120,17 @@ def build_status() -> dict:
 
     # --- прокси ---
     proxies = []
-    for route in smart_proxy_pool.routes:
+    for route in list(smart_proxy_pool.routes):
         label = _proxy_label(route)
         p = per_proxy.get(label, {"n": 0, "ok": 0, "n429": 0, "perr": 0, "lat": []})
-        left = max(0.0, smart_proxy_pool.cooldown_until[route] - mono)
+        left = max(0.0, smart_proxy_pool.cooldown_until.get(route, 0.0) - mono)
         reason = smart_proxy_pool.block_reason.get(route, "") if left > 0 else ""
         proxies.append({
             "label": label,
             "state": ("quarantine" if reason == "geo" else "cooldown") if left > 0 else "ready",
             "reason": reason, "geo_hits": smart_proxy_pool.geo_hits.get(route, 0),
             "cooldown_left": round(left, 1),
-            "failures": smart_proxy_pool.failures[route], "attempts": p["n"],
+            "failures": smart_proxy_pool.failures.get(route, 0), "attempts": p["n"],
             "ok_pct": round(100.0 * p["ok"] / p["n"], 1) if p["n"] else None,
             "n429": p["n429"], "proxy_err": p["perr"],
             "p50_ms": _percentile(p["lat"], 0.5), "p95_ms": _percentile(p["lat"], 0.95),
@@ -253,7 +253,7 @@ def build_status() -> dict:
         "clients": clients,
         "models": models,
         "proxies": {
-            "mode": "proxied+direct_fallback" if _configured_proxies else "direct_only",
+            "mode": "proxied+direct_fallback" if len(smart_proxy_pool.routes) > 1 else "direct_only",
             "source": _proxy_source, "channels": len(smart_proxy_pool.routes), "list": proxies,
             "quarantined": sum(1 for x in proxies if x["state"] == "quarantine"),
         },

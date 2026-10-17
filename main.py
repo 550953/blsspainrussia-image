@@ -39,6 +39,7 @@ from ocr_service import jobs, telemetry
 from ocr_service.dddd_ocr import EXECUTOR
 from ocr_service.gemini_client import close_http_clients
 from ocr_service.key_pool import GEMINI_KEYS
+from ocr_service.proxies import smart_proxy_pool
 from ocr_service.routers import health, ocr, status
 
 app = FastAPI(title="Digit OCR Service", version="4.7")
@@ -68,6 +69,8 @@ async def on_startup():
     except Exception as e:
         print(f"[startup_timing] Не удалось записать файл замера: {e}")
 
+    if hasattr(smart_proxy_pool, "start"):      # только если включён proxy_manager; иначе пул как раньше
+        await smart_proxy_pool.start()
     jobs.start_cleanup_loop()
     jobs.start_watchdog()
     telemetry.start_betterstack()
@@ -88,6 +91,8 @@ async def on_startup():
 async def on_shutdown():
     jobs.stop_cleanup_loop()
     jobs.stop_watchdog()
+    if hasattr(smart_proxy_pool, "stop"):
+        await smart_proxy_pool.stop()
     await telemetry.stop_betterstack()
     EXECUTOR.shutdown(wait=False)
     await close_http_clients()

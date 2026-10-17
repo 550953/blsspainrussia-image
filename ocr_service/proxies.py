@@ -9,7 +9,8 @@ import time
 from typing import List, Optional
 from urllib.parse import urlsplit
 
-from .config import _read_infisical_secrets_once
+from .config import _config_secret, _read_infisical_secrets_once
+from .proxy_manager import ManagedPoolMixin, load_manager_config
 
 
 def _load_gemini_proxies() -> tuple:
@@ -132,4 +133,23 @@ class GeminiSmartProxyPool:
         print(f"[pid={os.getpid()}][gemini_proxy] {_proxy_label(route)} cooldown {cooldown:.1f} сек")
 
 
-smart_proxy_pool = GeminiSmartProxyPool(_configured_proxies)
+class ManagedGeminiProxyPool(ManagedPoolMixin, GeminiSmartProxyPool):
+    """Тот же пул, но список каналов берётся из проксимена (см. proxy_manager.py)."""
+    GEO_EXC = (ProxyGeoBlocked,)
+    FAULT_EXC = (ProxyUnavailable,)
+
+
+def _sync_gemini_proxies(urls: List[str]) -> None:
+    """Держим GEMINI_PROXIES (его читает /health) в соответствии с текущим снапшотом."""
+    GEMINI_PROXIES[:] = [*urls, None]
+
+
+_manager_cfg = load_manager_config(_config_secret)
+if _manager_cfg is None:
+    smart_proxy_pool = GeminiSmartProxyPool(_configured_proxies)
+else:
+    smart_proxy_pool = ManagedGeminiProxyPool(_configured_proxies)
+    smart_proxy_pool._managed_init(_configured_proxies, _manager_cfg, on_change=_sync_gemini_proxies)
+    _proxy_source = f"proxy_manager (запасной: {_proxy_source})"
+    print(f"[pid={os.getpid()}][proxy_manager] включён: {_manager_cfg.url}, "
+          f"refresh={_manager_cfg.refresh_s:.0f}с report={_manager_cfg.report_s:.0f}с stale={_manager_cfg.stale_s:.0f}с")
