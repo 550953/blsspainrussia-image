@@ -45,7 +45,7 @@ async def preflight_template_proxy(proxy_url: Optional[str], timeout: Optional[f
 def _get_http_client(proxy_url: Optional[str], profile: str = "short") -> httpx.AsyncClient:
     key = (proxy_url, profile)
     client = _HTTPX_CLIENTS.get(key)
-    if client is None:
+    if client is None or client.is_closed:  # закрытый клиент (shutdown/сброс) не переиспользуем
         if profile == "long":
             from .config import TEMPLATE_CONNECT_TIMEOUT, TEMPLATE_HTTP_READ_TIMEOUT
             timeout = httpx.Timeout(TEMPLATE_HTTP_READ_TIMEOUT, connect=TEMPLATE_CONNECT_TIMEOUT, write=30.0, pool=10.0)
@@ -350,22 +350,29 @@ async def _call_gemini_rest(
         "generationConfig": {"temperature": 0.0, "maxOutputTokens": 10, **(generation_config or {})},
     }
     url = GEMINI_REST_URL.format(model=model)
-    http_client = _get_http_client(proxy_url)
-
-    try:
-        response = await asyncio.wait_for(
-            http_client.post(url, json=payload, headers={"x-goog-api-key": api_key}),
-            timeout=GEMINI_HARD_TIMEOUT,
-        )
-    except asyncio.TimeoutError as e:
-        raise ProxyUnavailable(f"HardTimeout>{GEMINI_HARD_TIMEOUT:.0f}s: канал завис, ответа нет") from e
-    except httpx.RequestError as e:
-        raise ProxyUnavailable(f"{type(e).__name__}: {e}") from e
-    except Exception as e:
-        msg = str(e).lower()
-        if "socksio" in msg or "unsupported proxy" in msg or "sockshandler" in msg:
+    response = None
+    for _closed_retry in (True, False):
+        http_client = _get_http_client(proxy_url)
+        try:
+            response = await asyncio.wait_for(
+                http_client.post(url, json=payload, headers={"x-goog-api-key": api_key}),
+                timeout=GEMINI_HARD_TIMEOUT,
+            )
+            break
+        except asyncio.TimeoutError as e:
+            raise ProxyUnavailable(f"HardTimeout>{GEMINI_HARD_TIMEOUT:.0f}s: канал завис, ответа нет") from e
+        except httpx.RequestError as e:
             raise ProxyUnavailable(f"{type(e).__name__}: {e}") from e
-        raise
+        except Exception as e:
+            msg = str(e).lower()
+            if "client has been closed" in msg and _closed_retry:
+                # Общий клиент закрыли (close_http_clients при остановке), пока запрос был в пути.
+                # Это не вина ключа/канала: убираем клиент из кэша и один раз повторяем на свежем.
+                _HTTPX_CLIENTS.pop((proxy_url, "short"), None)
+                continue
+            if "socksio" in msg or "unsupported proxy" in msg or "sockshandler" in msg:
+                raise ProxyUnavailable(f"{type(e).__name__}: {e}") from e
+            raise
 
     try:
         data = response.json()

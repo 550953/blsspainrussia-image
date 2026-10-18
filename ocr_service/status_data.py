@@ -116,6 +116,7 @@ def build_status() -> dict:
             "used_ago": ago(last.get("used")), "ok_ago": ago(last.get("ok")), "err_ago": ago(last.get("err")),
             "err_cat": last.get("err_cat", ""), "err_http": last.get("err_http"), "err_msg": last.get("err_msg", ""),
             "ok_1h": stats["ok"], "err_1h": stats["err"],
+            "quarantine": gemini_pool.quarantine_info(idx, mono),
         })
 
     # --- прокси ---

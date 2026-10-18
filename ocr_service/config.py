@@ -125,6 +125,14 @@ for _part in os.getenv("GEMINI_MODEL_KEYS", "").split(";"):
 # На сколько секунд модель считается перегруженной после 503/500/504.
 GEMINI_MODEL_COOLDOWN = float(os.getenv("GEMINI_MODEL_COOLDOWN", "30"))
 GEMINI_ACQUIRE_POLL = 0.15
+# Карантин пары «ключ+модель» после 429. Если Google назвал время сброса («retry in 17h»), карантин
+# ставится сразу и ровно до сброса (+ запас). Если времени нет: после N подряд 429 без единого успеха
+# пара уходит в карантин на BASE секунд, каждый следующий раз вдвое дольше, но не больше MAX.
+GEMINI_429_QUARANTINE_AFTER = max(1, int(os.getenv("GEMINI_429_QUARANTINE_AFTER", "2")))
+GEMINI_429_QUARANTINE_SECONDS = float(os.getenv("GEMINI_429_QUARANTINE_SECONDS", "900"))
+GEMINI_429_QUARANTINE_MAX = float(os.getenv("GEMINI_429_QUARANTINE_MAX", "14400"))
+GEMINI_QUOTA_RESET_MARGIN = float(os.getenv("GEMINI_QUOTA_RESET_MARGIN", "90"))
+GEMINI_429_STRIKE_TTL = float(os.getenv("GEMINI_429_STRIKE_TTL", "7200"))
 
 # ---------------------------------------------------------------------------
 # Генерация HTML-писем (функция отключена по умолчанию)

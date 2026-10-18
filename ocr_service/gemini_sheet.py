@@ -7,6 +7,7 @@ from typing import List, Optional
 
 from .config import (
     GEMINI_ACQUIRE_POLL,
+    GEMINI_MODELS,
     GEMINI_VARIANT_RETRY_BLUR_KSIZE,
     GEMINI_VARIANT_RETRY_COLS,
     GEMINI_VARIANT_RETRY_ENABLED,
@@ -42,7 +43,7 @@ async def recognize_gemini_sheet_async(
     key_groups = gemini_pool.grouped_keys()
     if not key_groups["ready"] and not key_groups["in_use"] and not key_groups["cooldown"]:
         all_invalid = bool(key_groups["invalid_key"]) and not (
-            key_groups["billing_hold"] or key_groups["project_hold"]
+            key_groups["billing_hold"] or key_groups["project_hold"] or key_groups["quarantine"]
         )
         category = "ALL_KEYS_INVALID" if all_invalid else "ALL_KEYS_ON_HOLD"
         source = "gemini_sheet_keys_invalid" if all_invalid else "gemini_sheet_keys_held"
@@ -54,6 +55,7 @@ async def recognize_gemini_sheet_async(
             invalid_key_count=len(key_groups["invalid_key"]),
             billing_hold_count=sum(len(names) for names in key_groups["billing_hold"].values()),
             project_hold_count=sum(len(names) for names in key_groups["project_hold"].values()),
+            quarantine_count=sum(len(names) for names in key_groups["quarantine"].values()),
         )
         return [{"text": "0", "source": source} for _ in images]
 
@@ -73,7 +75,7 @@ async def recognize_gemini_sheet_async(
     attempt_no = 0
 
     for _ in range(max_attempts):
-        idx, key_name = gemini_pool.acquire()
+        idx, key_name = gemini_pool.acquire(model_chain=GEMINI_MODELS, respect_key_cooldown=True)
         if idx is None:
             current_groups = gemini_pool.grouped_keys()
             if not current_groups["ready"] and not current_groups["in_use"] and not current_groups["cooldown"]:
@@ -90,7 +92,7 @@ async def recognize_gemini_sheet_async(
         attempted_routes.add(route_key)
         attempt_no += 1
 
-        model = gemini_pool.pick_model(idx)
+        model = gemini_pool.pick_model(idx, respect_key_cooldown=True)
         t0 = time.monotonic()
         try:
             text, response_metadata = await _call_gemini_rest(
@@ -107,7 +109,7 @@ async def recognize_gemini_sheet_async(
             )
             values = parse_gemini_sheet_result(text, len(images))
             smart_proxy_pool.mark_ok(proxy_url)
-            gemini_pool.release(idx, None)
+            gemini_pool.release(idx, None, model=model)
             usage = response_metadata.get("usage_metadata") or {}
             _job_log(
                 "gemini_attempt",
@@ -167,7 +169,7 @@ async def recognize_gemini_sheet_async(
                 gemini_pool.mark_model_overloaded(model)
                 state = gemini_pool.release(idx, None)
             else:
-                state = gemini_pool.release(idx, exc)
+                state = gemini_pool.release(idx, exc, model=model)
             _job_log(
                 "gemini_api_error",
                 key_profile=key_name,
@@ -184,6 +186,28 @@ async def recognize_gemini_sheet_async(
                 key_state=state["state"],
                 image_count=len(images),
                 api_message=exc.message,
+            )
+        except ValueError as exc:
+            # Модель вернула не JSON/битый JSON (JSONDecodeError - подкласс ValueError): ключ и канал
+            # исправны, штрафовать нечего. Освобождаем ключ без паузы, следующая попытка пойдёт дальше.
+            last_error = f"{type(exc).__name__}: {_safe_gemini_message(str(exc))}"
+            smart_proxy_pool.mark_ok(proxy_url)
+            state = gemini_pool.release(idx, None)
+            _job_log(
+                "gemini_api_error",
+                key_profile=key_name,
+                model=model,
+                proxy=_proxy_label(proxy_url),
+                attempt=attempt_no,
+                latency_ms=round((time.monotonic() - t0) * 1000),
+                http_status=0,
+                provider_status="CLIENT_RESPONSE_ERROR",
+                category="MODEL_RESPONSE_INVALID",
+                action="key_released_without_cooldown; response is not valid JSON",
+                cooldown_seconds=0.0,
+                key_state=state["state"],
+                image_count=len(images),
+                api_message=last_error,
             )
         except Exception as exc:
             last_error = f"{type(exc).__name__}: {_safe_gemini_message(str(exc))}"

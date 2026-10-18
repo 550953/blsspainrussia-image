@@ -202,8 +202,8 @@ function table(head,rows){
   if(!rows.length)return '<div class="sub">пусто</div>';
   return '<table><tr>'+head.map(h=>'<th>'+h+'</th>').join('')+'</tr>'+rows.map(r=>'<tr>'+r.map(c=>'<td'+(c&&c.w?' class="wrap"':'')+'>'+(c&&c.w?c.h:c)+'</td>').join('')+'</tr>').join('')+'</table>';
 }
-const KEY_STATE={ready:['готов','ok'],in_use:['в работе','use'],cooldown:['пауза','warn'],billing:['блок биллинг','bad'],project:['блок проект','bad'],invalid:['мёртв','bad']};
-const KEY_ORDER={billing:0,project:1,invalid:2,cooldown:3,in_use:4,ready:5};
+const KEY_STATE={ready:['готов','ok'],in_use:['в работе','use'],cooldown:['пауза','warn'],quarantine:['карантин','bad'],billing:['блок биллинг','bad'],project:['блок проект','bad'],invalid:['мёртв','bad']};
+const KEY_ORDER={billing:0,project:1,invalid:2,quarantine:2.5,cooldown:3,in_use:4,ready:5};
 const STAGE={processing:['обработка','use'],done:['готово','ok'],error:['ошибка','bad']};
 const CAT={PROXY_UNAVAILABLE:'обрыв канала',RATE_LIMIT_OR_QUOTA:'429 лимит/квота',UPSTREAM_UNAVAILABLE:'503 модель занята'};
 
@@ -243,7 +243,7 @@ function render(d){
   $('banner').innerHTML=ban;
   const okCh=P.list.filter(p=>p.state==='ready').length;
   $('kpis').innerHTML=
-    kpi('Ключи готовы',K.usable+' / '+K.total,(K.by_state.cooldown||0)+' пауза · '+((K.by_state.billing||0)+(K.by_state.project||0))+' блок · '+(K.by_state.invalid||0)+' мёртв',K.usable<K.total?'warn':'ok','key')+
+    kpi('Ключи готовы',K.usable+' / '+K.total,(K.by_state.cooldown||0)+' пауза · '+(K.by_state.quarantine||0)+' карантин · '+((K.by_state.billing||0)+(K.by_state.project||0))+' блок · '+(K.by_state.invalid||0)+' мёртв',K.usable<K.total?'warn':'ok','key')+
     kpi('Очередь',Z.pending+' ждут',Z.running+' идёт · старейшее '+Z.oldest_pending_s+' с · лимит '+Z.max_concurrency,'','queue')+
     kpi('Успех попыток Gemini',A.ok_pct==null?'—':A.ok_pct+'%',A.ok+' из '+A.total+' за час · 429: '+A.n429,A.ok_pct!=null&&A.ok_pct<60?'warn':'ok','ok')+
     kpi('Посл. успех Gemini',ago(A.last_ok_ago),'посл. ошибка: '+ago(A.last_err_ago),'','clock')+
@@ -274,11 +274,13 @@ function render(d){
     d.clients.map(c=>[esc(c.id),ago(c.submit_ago),ago(c.poll_ago),ago(c.delivered_ago),c.jobs,c.errors,c.zero_jobs,c.undelivered,chip(c.status,CS[c.status]||'use')]));
   const kl=K.list.slice().sort((a,b)=>KEY_ORDER[a.state]-KEY_ORDER[b.state]);
   $('keysN').textContent=K.usable+'/'+K.total;
-  $('keysT').innerHTML=table(['Ключ','Состояние','Взят','Посл. успех','Посл. ошибка','За час ок / ошибок','Что случилось'],
+  $('keysT').innerHTML=table(['Ключ','Состояние','Взят','Посл. успех','Посл. ошибка','За час ок / ошибок','Карантин моделей','Что случилось'],
     cut(kl,'keys').map(k=>{
       let why='';
-      if(k.err_cat)why=esc(k.err_cat)+(k.err_http!=null?' · HTTP '+k.err_http:'')+(k.state==='cooldown'?' · пауза ещё ~'+Math.round(k.cooldown_left)+' с':'')+(k.state==='invalid'?' · ключ надо заменить':'')+(k.state==='billing'||k.state==='project'?' · нужен рестарт':'')+(k.err_msg?'<span class="x"><br><span class="sub">'+esc(k.err_msg)+'</span></span>':'');
-      return [esc(short(k.name)),chip(...KEY_STATE[k.state]),ago(k.used_ago),ago(k.ok_ago),ago(k.err_ago),k.ok_1h+' / '+(k.err_1h?'<span class="w">'+k.err_1h+'</span>':0),{w:1,h:why}];
+      if(k.err_cat)why=esc(k.err_cat)+(k.err_http!=null?' · HTTP '+k.err_http:'')+(k.state==='cooldown'?' · пауза ещё ~'+Math.round(k.cooldown_left)+' с':'')+(k.state==='quarantine'?' · все модели в карантине ещё '+left(k.cooldown_left):'')+(k.state==='invalid'?' · ключ надо заменить':'')+(k.state==='billing'||k.state==='project'?' · нужен рестарт':'')+(k.err_msg?'<span class="x"><br><span class="sub">'+esc(k.err_msg)+'</span></span>':'');
+      const QR={daily_quota:'дневная квота',repeated_429:'повторные 429'};
+      const qh=(k.quarantine||[]).map(q=>'<div><span class="b">'+esc(q.model)+'</span> · ещё '+left(q.left)+'<span class="sub"> · '+(QR[q.reason]||esc(q.reason))+(q.strikes?', 429 подряд: '+q.strikes:'')+'</span></div>').join('');
+      return [esc(short(k.name)),chip(...KEY_STATE[k.state]),ago(k.used_ago),ago(k.ok_ago),ago(k.err_ago),k.ok_1h+' / '+(k.err_1h?'<span class="w">'+k.err_1h+'</span>':0),{w:1,h:qh||'<span class="sub">—</span>'},{w:1,h:why}];
     }))+more(kl,'keys');
   $('modelsT').innerHTML=table(['Модель','Состояние','Попыток','Успех','503/5xx','429','p50'],
     d.models.map(m=>[esc(m.name)+(m.in_chain?'':' <span class="sub">(не в цепочке)</span>'),

@@ -6,6 +6,8 @@ from typing import List, Optional
 from .config import (
     GEMINI_MODEL, GEMINI_MODELS, GEMINI_MODEL_COOLDOWN, GEMINI_MODEL_KEYS,
     TEMPLATE_MODEL_COOLDOWN, TEMPLATE_QUOTA_BLOCK_SECONDS, _read_infisical_secrets_once,
+    GEMINI_429_QUARANTINE_AFTER, GEMINI_429_QUARANTINE_SECONDS, GEMINI_429_QUARANTINE_MAX,
+    GEMINI_QUOTA_RESET_MARGIN, GEMINI_429_STRIKE_TTL,
 )
 from .gemini_errors import GeminiAPIError, set_known_keys
 
@@ -43,6 +45,8 @@ class GeminiKeyPool:
         self.model_unavailable: set = set()   # (idx, model): модель закрыта для этого ключа (404)
         self.key_model_blocked: dict = {}     # (idx, model) -> monotonic deadline
         self.key_model_daily_blocked: dict = {}  # (idx, model) -> daily quota deadline (template calls)
+        self.key_model_strikes: dict = {}     # (idx, model) -> {"n": подряд 429 без успеха, "last": monotonic}
+        self.quarantine: dict = {}            # (idx, model) -> {"until","reason","strikes","since","retry_after"}
 
     def init_from_env(self, prefix: str = "GEMINI_API_KEY") -> None:
         seen = set()
@@ -198,27 +202,67 @@ class GeminiKeyPool:
                 reaped.append((self.key_names[idx], float(effective_age)))
         return reaped
 
+    def _rate_limit_hold(self, idx: int, model: str, error: GeminiAPIError) -> dict:
+        """429 на паре ключ+модель. Время сброса известно (daily/«retry in 17h») - карантин сразу и ровно до
+        него. Неизвестно - пауза, а после GEMINI_429_QUARANTINE_AFTER подряд 429 без успеха - карантин
+        с удвоением срока. Блокируется только пара ключ+модель: другие модели ключа продолжают работать."""
+        now = time.monotonic()
+        k = (idx, model)
+        st = self.key_model_strikes.get(k)
+        if st is None or now - st["last"] > GEMINI_429_STRIKE_TTL:
+            st = {"n": 0, "last": now}
+        st["n"] += 1
+        st["last"] = now
+        self.key_model_strikes[k] = st
+        retry_after = float(getattr(error, "retry_delay_seconds", 0.0) or 0.0)
+        daily = bool(getattr(error, "daily_quota", False))
+        reason = ""
+        if daily:
+            reason = "daily_quota"
+            hold = min(93600.0, retry_after + GEMINI_QUOTA_RESET_MARGIN) if retry_after > 0 else float(TEMPLATE_QUOTA_BLOCK_SECONDS)
+            self.key_model_daily_blocked[k] = max(self.key_model_daily_blocked.get(k, 0.0), now + hold)
+        elif st["n"] >= GEMINI_429_QUARANTINE_AFTER:
+            reason = "repeated_429"
+            hold = min(GEMINI_429_QUARANTINE_MAX, max(GEMINI_429_QUARANTINE_SECONDS, retry_after)
+                       * 2 ** (st["n"] - GEMINI_429_QUARANTINE_AFTER))
+        else:
+            hold = max(TEMPLATE_MODEL_COOLDOWN, retry_after)
+        self.key_model_blocked[k] = max(self.key_model_blocked.get(k, 0.0), now + hold)
+        if reason:
+            prev = self.quarantine.get(k)
+            if prev is None or now + hold > prev["until"]:
+                self.quarantine[k] = {"until": now + hold, "reason": reason, "strikes": st["n"],
+                                      "since": time.time(), "retry_after": retry_after}
+                print(f"[pid={os.getpid()}][gemini_quarantine] {self.key_names[idx]} / {model}: {reason}, "
+                      f"429 подряд={st['n']}, карантин {hold:.0f}s", flush=True)
+        return {
+            "state": "QUARANTINE" if reason else "MODEL_COOLDOWN", "cooldown_seconds": hold,
+            "model": model, "daily_quota": daily, "quarantine_reason": reason, "strikes": st["n"],
+        }
+
+    def _model_hold_left(self, idx: int, model: str, now: float) -> float:
+        return max(self.key_model_daily_blocked.get((idx, model), 0.0),
+                   self.key_model_blocked.get((idx, model), 0.0)) - now
+
+    def quarantine_info(self, idx: int, now: Optional[float] = None) -> list:
+        """Активные карантины пар ключ+модель для панели: [{model, left, reason, strikes}]."""
+        now = time.monotonic() if now is None else now
+        out = []
+        for (i, model), q in list(self.quarantine.items()):
+            left = q["until"] - now
+            if i == idx and left > 0:
+                out.append({"model": model, "left": round(left, 1), "reason": q["reason"], "strikes": q["strikes"]})
+        return sorted(out, key=lambda x: x["model"])
+
     def release(self, idx: int, error: Optional[GeminiAPIError] = None, model: Optional[str] = None) -> dict:
         self.reserved[idx] = False
         key_name = self.key_names[idx] if idx < len(self.key_names) else f"key_{idx}"
         if error is not None and model and error.category == "RATE_LIMIT_OR_QUOTA":
-            now = time.monotonic()
-            if getattr(error, "daily_quota", False):
-                hold = TEMPLATE_QUOTA_BLOCK_SECONDS
-                self.key_model_daily_blocked[(idx, model)] = max(
-                    self.key_model_daily_blocked.get((idx, model), 0.0), now + hold
-                )
-            else:
-                hold = max(TEMPLATE_MODEL_COOLDOWN, getattr(error, "retry_delay_seconds", 0.0))
-            self.key_model_blocked[(idx, model)] = max(
-                self.key_model_blocked.get((idx, model), 0.0),
-                now + hold,
-            )
-            return {
-                "state": "MODEL_COOLDOWN", "cooldown_seconds": hold,
-                "model": model, "daily_quota": bool(getattr(error, "daily_quota", False)),
-            }
+            return self._rate_limit_hold(idx, model, error)
         if error is None:
+            if model:  # реальный успех на этой модели: 429-счётчик и карантин пары сняты
+                self.key_model_strikes.pop((idx, model), None)
+                self.quarantine.pop((idx, model), None)
             self.blocked[idx] = 0.0
             self.dead[idx] = False
             self.last_error[idx] = None
@@ -286,6 +330,11 @@ class GeminiKeyPool:
             return "project", category, 0.0
         if now < self.blocked[idx]:
             return "cooldown", category, round(self.blocked[idx] - now, 1)
+        # Все допустимые ключу модели закрыты 429: ключ не годится вообще (карантин) или ненадолго (пауза).
+        usable = [m for m in GEMINI_MODELS if self.model_allowed(idx, m)]
+        if usable and all(self._model_hold_left(idx, m, now) > 0 for m in usable):
+            left = round(min(self._model_hold_left(idx, m, now) for m in usable), 1)
+            return ("quarantine" if self.quarantine_info(idx, now) else "cooldown"), "RATE_LIMIT_OR_QUOTA", left
         return "ready", category, 0.0
 
     def grouped_keys(self, now: Optional[float] = None) -> dict:
@@ -293,7 +342,7 @@ class GeminiKeyPool:
         now = time.monotonic() if now is None else now
         groups = {
             "ready": [], "in_use": [], "cooldown": {},
-            "billing_hold": {}, "project_hold": {}, "invalid_key": [],
+            "billing_hold": {}, "project_hold": {}, "invalid_key": [], "quarantine": {},
         }
         for idx, key_name in enumerate(self.key_names):
             state, category, _ = self.key_state(idx, now)
@@ -305,6 +354,8 @@ class GeminiKeyPool:
                 groups["billing_hold"].setdefault(category, []).append(key_name)
             elif state == "project":
                 groups["project_hold"].setdefault(category, []).append(key_name)
+            elif state == "quarantine":
+                groups["quarantine"].setdefault(category or "RATE_LIMIT_OR_QUOTA", []).append(key_name)
             elif state == "cooldown":
                 groups["cooldown"].setdefault(category or "TEMPORARY_BLOCK", []).append(key_name)
             else:

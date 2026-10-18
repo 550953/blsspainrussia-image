@@ -4,6 +4,10 @@ import re
 from typing import List
 
 _RETRY_DELAY_RE = re.compile(r'retry[_\s\-]?delay[^0-9]*(\d+(?:\.\d+)?)', re.IGNORECASE)
+# «Please retry in 17h24m17.5s» / «retry in 62.4s»: Google называет точное время до сброса квоты.
+_RETRY_IN_RE = re.compile(r'retry(?:ing)?\s+in\s+((?:\d+(?:\.\d+)?\s*[hms]\s*)+)', re.IGNORECASE)
+_DURATION_PART_RE = re.compile(r'(\d+(?:\.\d+)?)\s*([hms])', re.IGNORECASE)
+_DURATION_UNITS = {"h": 3600.0, "m": 60.0, "s": 1.0}
 
 # Список ключей для вычёркивания из сообщений. Заполняется из key_pool.py
 # (раньше здесь использовался globals().get("GEMINI_KEYS"), теперь явная регистрация).
@@ -33,6 +37,12 @@ def is_geo_blocked(http_status: int, message: str) -> bool:
 
 
 def _parse_retry_delay(err_text: str) -> float:
+    """Секунды до разрешённого повтора: из «retryDelay: 62s» или «retry in 17h24m17s»."""
+    m = _RETRY_IN_RE.search(err_text)
+    if m:
+        total = sum(float(n) * _DURATION_UNITS[u.lower()] for n, u in _DURATION_PART_RE.findall(m.group(1)))
+        if total > 0:
+            return total
     m = _RETRY_DELAY_RE.search(err_text)
     return float(m.group(1)) if m else 0.0
 
@@ -78,7 +88,7 @@ def _classify_gemini_http_error(http_status: int, provider_status: str, message:
             "category": "RATE_LIMIT_OR_QUOTA",
             "cooldown_seconds": max(30.0, retry_after) + random.uniform(0.0, 3.0),
             "retry_delay_seconds": retry_after,
-            "daily_quota": retry_after > 120 or "per day" in text or "daily" in text,
+            "daily_quota": retry_after > 120 or "per day" in text or "perday" in text or "daily" in text,
             "permanent_key_failure": False,
             "hold_until_restart": False,
             "action": "temporary_key_pause; no proxy cooldown",

@@ -5,6 +5,8 @@ import time
 import types
 from pathlib import Path
 
+import pytest
+
 from fastapi import HTTPException
 from starlette.requests import Request
 
@@ -436,7 +438,9 @@ def test_rate_limit_quota_is_model_scoped_and_daily_quota_does_not_block_ocr(mon
                            _classify_gemini_http_error(429, "RESOURCE_EXHAUSTED", daily_message))
     result = pool.release(0, error=daily, model="daily-model")
     assert result["daily_quota"]
-    assert pool.key_model_daily_blocked[(0, "daily-model")] - now == 900
+    # Google назвал срок (retryDelay 3600s): блок ровно до сброса + запас, а не фиксированные 900 с.
+    from ocr_service.config import GEMINI_QUOTA_RESET_MARGIN
+    assert pool.key_model_daily_blocked[(0, "daily-model")] - now == pytest.approx(3600 + GEMINI_QUOTA_RESET_MARGIN)
     assert pool.blocked[0] == 0
     assert pool.model_allowed(0, "daily-model", respect_key_cooldown=False)
 

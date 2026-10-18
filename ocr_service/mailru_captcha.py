@@ -17,7 +17,7 @@ from .gemini_errors import GeminiAPIError, _safe_gemini_message
 from .key_pool import GEMINI_KEYS, gemini_model_name, gemini_pool
 from .proxies import ProxyUnavailable, _proxy_label, smart_proxy_pool
 from .telemetry import _job_log
-from .config import GEMINI_ACQUIRE_POLL
+from .config import GEMINI_ACQUIRE_POLL, GEMINI_MODELS
 
 MAILRU_CAPTCHA_PROMPT = """
 На картинке капча mail.ru: ровно 6 символов (заглавные латинские буквы A-Z и цифры 0-9).
@@ -73,7 +73,7 @@ async def recognize_mailru_captcha(image_bytes: bytes) -> Tuple[str, str]:
     attempt_no = 0
 
     for _ in range(max_attempts):
-        idx, key_name = gemini_pool.acquire()
+        idx, key_name = gemini_pool.acquire(model_chain=GEMINI_MODELS, respect_key_cooldown=True)
         if idx is None:
             current = gemini_pool.grouped_keys()
             if not current["ready"] and not current["in_use"] and not current["cooldown"]:
@@ -90,7 +90,7 @@ async def recognize_mailru_captcha(image_bytes: bytes) -> Tuple[str, str]:
         attempted_routes.add(route_key)
         attempt_no += 1
 
-        model = gemini_pool.pick_model(idx)
+        model = gemini_pool.pick_model(idx, respect_key_cooldown=True)
         t0 = time.monotonic()
         try:
             raw_text, response_metadata = await _call_gemini_rest(
@@ -107,7 +107,7 @@ async def recognize_mailru_captcha(image_bytes: bytes) -> Tuple[str, str]:
             )
             parsed = _parse_mailru_text(raw_text)
             smart_proxy_pool.mark_ok(proxy_url)
-            gemini_pool.release(idx, None)
+            gemini_pool.release(idx, None, model=model)
 
             usage = response_metadata.get("usage_metadata") or {}
             _job_log(
@@ -175,7 +175,7 @@ async def recognize_mailru_captcha(image_bytes: bytes) -> Tuple[str, str]:
                 gemini_pool.mark_model_overloaded(model)
                 state = gemini_pool.release(idx, None)
             else:
-                state = gemini_pool.release(idx, exc)
+                state = gemini_pool.release(idx, exc, model=model)
             _job_log(
                 "gemini_api_error",
                 key_profile=key_name,
@@ -192,6 +192,29 @@ async def recognize_mailru_captcha(image_bytes: bytes) -> Tuple[str, str]:
                 key_state=state["state"],
                 image_count=1,
                 api_message=exc.message,
+                captcha_type="mailru",
+            )
+        except ValueError as exc:
+            # Модель вернула не JSON/битый JSON (JSONDecodeError - подкласс ValueError): ключ и канал
+            # исправны, штрафовать нечего. Освобождаем ключ без паузы, следующая попытка пойдёт дальше.
+            last_error = f"{type(exc).__name__}: {_safe_gemini_message(str(exc))}"
+            smart_proxy_pool.mark_ok(proxy_url)
+            state = gemini_pool.release(idx, None)
+            _job_log(
+                "gemini_api_error",
+                key_profile=key_name,
+                model=model,
+                proxy=_proxy_label(proxy_url),
+                attempt=attempt_no,
+                latency_ms=round((time.monotonic() - t0) * 1000),
+                http_status=0,
+                provider_status="CLIENT_RESPONSE_ERROR",
+                category="MODEL_RESPONSE_INVALID",
+                action="key_released_without_cooldown; response is not valid JSON",
+                cooldown_seconds=0.0,
+                key_state=state["state"],
+                image_count=1,
+                api_message=last_error,
                 captcha_type="mailru",
             )
         except Exception as exc:
