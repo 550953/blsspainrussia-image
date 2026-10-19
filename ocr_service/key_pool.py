@@ -1,6 +1,9 @@
 """Пул ключей Gemini: round-robin + per-key cooldown + глобальный blackout."""
+import hashlib
+import json
 import os
 import time
+from datetime import datetime, timedelta
 from typing import List, Optional
 
 from .config import (
@@ -14,6 +17,24 @@ from .gemini_errors import GeminiAPIError, set_known_keys
 
 # Аренда ключа на ОДНУ попытку. Должна быть больше GEMINI_HARD_TIMEOUT (45с).
 KEY_LEASE_TTL = float(os.getenv("GEMINI_KEY_LEASE_TTL", "60"))
+
+# Карантин ключ+модель переживает перезапуск процесса: дедлайны пишутся в файл как
+# абсолютное (epoch) время. Для хостинга с эфемерной ФС (Render) путь нужно вести на
+# постоянный диск, либо заменить _persist/_restore на запись в БД (см. _persist).
+QUOTA_STATE_FILE = os.getenv("GEMINI_QUOTA_STATE_FILE") or os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "gemini_quota_state.json"
+)  # по умолчанию - корень проекта (рядом с main.py), не зависит от cwd
+
+
+def _seconds_to_next_pacific_midnight() -> float:
+    """Дневная квота Gemini сбрасывается в полночь по Pacific Time."""
+    try:
+        from zoneinfo import ZoneInfo
+        now = datetime.now(ZoneInfo("America/Los_Angeles"))
+        nxt = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+        return max(60.0, (nxt - now).total_seconds())
+    except Exception:
+        return 6 * 3600.0
 
 
 class GeminiKeyPool:
@@ -82,6 +103,7 @@ class GeminiKeyPool:
         self.blackout_until = 0.0
         self.rr_index = 0
         print(f"[pid={os.getpid()}] Gemini pool: инициализирован, {len(keys)} ключ(ей)")
+        self._restore_quota_state()
 
     def is_overloaded(self) -> tuple:
         now = time.monotonic()
@@ -219,7 +241,8 @@ class GeminiKeyPool:
         reason = ""
         if daily:
             reason = "daily_quota"
-            hold = min(93600.0, retry_after + GEMINI_QUOTA_RESET_MARGIN) if retry_after > 0 else float(TEMPLATE_QUOTA_BLOCK_SECONDS)
+            hold = (min(93600.0, retry_after + GEMINI_QUOTA_RESET_MARGIN) if retry_after > 0
+                    else _seconds_to_next_pacific_midnight() + GEMINI_QUOTA_RESET_MARGIN)
             self.key_model_daily_blocked[k] = max(self.key_model_daily_blocked.get(k, 0.0), now + hold)
         elif st["n"] >= GEMINI_429_QUARANTINE_AFTER:
             reason = "repeated_429"
@@ -235,10 +258,74 @@ class GeminiKeyPool:
                                       "since": time.time(), "retry_after": retry_after}
                 print(f"[pid={os.getpid()}][gemini_quarantine] {self.key_names[idx]} / {model}: {reason}, "
                       f"429 подряд={st['n']}, карантин {hold:.0f}s", flush=True)
+        if reason or daily:
+            self._persist_quota_state()
         return {
             "state": "QUARANTINE" if reason else "MODEL_COOLDOWN", "cooldown_seconds": hold,
             "model": model, "daily_quota": daily, "quarantine_reason": reason, "strikes": st["n"],
         }
+
+    def _key_id(self, idx: int) -> str:
+        return hashlib.sha256(self.keys[idx].encode("utf-8")).hexdigest()[:12]
+
+    def _persist_quota_state(self) -> None:
+        """Сохранить активные дедлайны (ключ+модель) на диск. Ключи - только по хешу.
+        Для БД: заменить тело на upsert строк {key_id, model, kind, until_epoch}."""
+        try:
+            mono, wall = time.monotonic(), time.time()
+            rows = []
+            for kind, table in (("daily", self.key_model_daily_blocked), ("cooldown", self.key_model_blocked)):
+                for (idx, model), until in list(table.items()):
+                    if until > mono and idx < len(self.keys):
+                        rows.append({"key": self._key_id(idx), "model": model, "kind": kind,
+                                     "until": wall + (until - mono)})
+            quarantine = []
+            for (idx, model), q in list(self.quarantine.items()):
+                if q["until"] > mono and idx < len(self.keys):
+                    quarantine.append({"key": self._key_id(idx), "model": model, "reason": q["reason"],
+                                       "strikes": q["strikes"], "retry_after": q.get("retry_after", 0.0),
+                                       "since": q.get("since", wall), "until": wall + (q["until"] - mono)})
+            tmp = QUOTA_STATE_FILE + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump({"saved_at": wall, "holds": rows, "quarantine": quarantine}, fh)
+            os.replace(tmp, QUOTA_STATE_FILE)
+        except Exception as exc:  # персист не должен ронять запрос
+            print(f"[pid={os.getpid()}][gemini_quota] не удалось сохранить состояние: {exc}", flush=True)
+
+    def _restore_quota_state(self) -> None:
+        """После рестарта вернуть незаконченные карантины: не тратим запросы на ключи, чей срок ещё не прошёл."""
+        try:
+            with open(QUOTA_STATE_FILE, encoding="utf-8") as fh:
+                data = json.load(fh)
+        except FileNotFoundError:
+            return
+        except Exception as exc:
+            print(f"[pid={os.getpid()}][gemini_quota] состояние не прочитано: {exc}", flush=True)
+            return
+        by_id = {self._key_id(i): i for i in range(len(self.keys))}
+        mono, wall = time.monotonic(), time.time()
+        restored = 0
+        for row in data.get("holds", []):
+            idx = by_id.get(row.get("key"))
+            left = float(row.get("until", 0.0)) - wall
+            if idx is None or left <= 0:
+                continue
+            table = self.key_model_daily_blocked if row.get("kind") == "daily" else self.key_model_blocked
+            k = (idx, row["model"])
+            table[k] = max(table.get(k, 0.0), mono + left)
+            restored += 1
+        for row in data.get("quarantine", []):
+            idx = by_id.get(row.get("key"))
+            left = float(row.get("until", 0.0)) - wall
+            if idx is None or left <= 0:
+                continue
+            self.quarantine[(idx, row["model"])] = {
+                "until": mono + left, "reason": row.get("reason", "restored"),
+                "strikes": int(row.get("strikes", 0)), "since": row.get("since", wall),
+                "retry_after": float(row.get("retry_after", 0.0)),
+            }
+        if restored:
+            print(f"[pid={os.getpid()}][gemini_quota] восстановлено {restored} блокировок ключ+модель после рестарта", flush=True)
 
     def _model_hold_left(self, idx: int, model: str, now: float) -> float:
         return max(self.key_model_daily_blocked.get((idx, model), 0.0),
@@ -262,7 +349,10 @@ class GeminiKeyPool:
         if error is None:
             if model:  # реальный успех на этой модели: 429-счётчик и карантин пары сняты
                 self.key_model_strikes.pop((idx, model), None)
-                self.quarantine.pop((idx, model), None)
+                if self.quarantine.pop((idx, model), None) is not None:
+                    self.key_model_daily_blocked.pop((idx, model), None)
+                    self.key_model_blocked.pop((idx, model), None)
+                    self._persist_quota_state()
             self.blocked[idx] = 0.0
             self.dead[idx] = False
             self.last_error[idx] = None
