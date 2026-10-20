@@ -124,6 +124,14 @@ for _part in os.getenv("GEMINI_MODEL_KEYS", "").split(";"):
             GEMINI_MODEL_KEYS[_m.strip()] = _plist
 # На сколько секунд модель считается перегруженной после 503/500/504.
 GEMINI_MODEL_COOLDOWN = float(os.getenv("GEMINI_MODEL_COOLDOWN", "30"))
+# OCR: «мысли» thinking-моделей входят в maxOutputTokens. Без явного thinkingConfig и с малым лимитом
+# модель тратит все токены на размышления и отдаёт пустой ответ (finishReason=MAX_TOKENS).
+OCR_THINKING_LEVEL = os.getenv("OCR_THINKING_LEVEL", "minimal").strip().lower()
+if OCR_THINKING_LEVEL not in {"minimal", "low", "medium", "high"}:
+    OCR_THINKING_LEVEL = "minimal"
+OCR_MAX_OUTPUT_TOKENS = int(os.getenv("OCR_MAX_OUTPUT_TOKENS", "2048"))
+# На сколько секунд обходить модель, которая вернула пустой ответ / MAX_TOKENS.
+GEMINI_EMPTY_RESPONSE_COOLDOWN = float(os.getenv("GEMINI_EMPTY_RESPONSE_COOLDOWN", "60"))
 GEMINI_ACQUIRE_POLL = 0.15
 # Карантин пары «ключ+модель» после 429. Если Google назвал время сброса («retry in 17h»), карантин
 # ставится сразу и ровно до сброса (+ запас). Если времени нет: после N подряд 429 без единого успеха

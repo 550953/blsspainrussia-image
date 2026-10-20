@@ -7,7 +7,10 @@ from typing import List, Optional
 
 from .config import (
     GEMINI_ACQUIRE_POLL,
+    GEMINI_EMPTY_RESPONSE_COOLDOWN,
     GEMINI_MODELS,
+    OCR_MAX_OUTPUT_TOKENS,
+    OCR_THINKING_LEVEL,
     GEMINI_VARIANT_RETRY_BLUR_KSIZE,
     GEMINI_VARIANT_RETRY_COLS,
     GEMINI_VARIANT_RETRY_ENABLED,
@@ -28,6 +31,23 @@ from .proxies import ProxyUnavailable, _proxy_label, smart_proxy_pool
 from .telemetry import _job_log
 from .utils import _score
 from .variants import make_variants_for_retry
+
+
+def ocr_thinking_config(model: str) -> Optional[dict]:
+    """thinkingConfig для OCR: минимум размышлений, чтобы они не съели лимит ответа.
+    lite-модели не трогаем: у них thinking и так почти выключен, и они уже работают."""
+    name = (model or "").lower().split("/")[-1]
+    if "lite" in name:
+        return None
+    if name.startswith("gemini-2.5-"):
+        return {"thinkingBudget": 128 if "pro" in name else 0}
+    level = OCR_THINKING_LEVEL
+    if name == "gemini-4-argon" or name.startswith(("gemini-3.8-flash", "gemini-3.7-flash")):
+        # эти модели не умеют minimal
+        return {"thinkingLevel": "low" if level == "minimal" else level}
+    if name.startswith(("gemini-3.", "gemini-3-")):
+        return {"thinkingLevel": level}
+    return None
 
 
 async def recognize_gemini_sheet_async(
@@ -94,18 +114,23 @@ async def recognize_gemini_sheet_async(
 
         model = gemini_pool.pick_model(idx, respect_key_cooldown=True)
         t0 = time.monotonic()
+        response_metadata: dict = {}
         try:
+            generation_config = {
+                "temperature": 0.0,
+                "responseMimeType": "application/json",
+                "maxOutputTokens": max(OCR_MAX_OUTPUT_TOKENS, len(images) * 12),
+            }
+            thinking_config = ocr_thinking_config(model)
+            if thinking_config is not None:
+                generation_config["thinkingConfig"] = thinking_config
             text, response_metadata = await _call_gemini_rest(
                 png_bytes,
                 effective_prompt,
                 model,
                 gemini_pool.keys[idx],
                 proxy_url,
-                generation_config={
-                    "temperature": 0.0,
-                    "responseMimeType": "application/json",
-                    "maxOutputTokens": max(256, len(images) * 12),
-                },
+                generation_config=generation_config,
             )
             values = parse_gemini_sheet_result(text, len(images))
             smart_proxy_pool.mark_ok(proxy_url)
@@ -193,6 +218,11 @@ async def recognize_gemini_sheet_async(
             last_error = f"{type(exc).__name__}: {_safe_gemini_message(str(exc))}"
             smart_proxy_pool.mark_ok(proxy_url)
             state = gemini_pool.release(idx, None)
+            usage = response_metadata.get("usage_metadata") or {}
+            empty_reply = not response_metadata.get("text_chars", 0)
+            if response_metadata and (empty_reply or response_metadata.get("finish_reason") == "MAX_TOKENS"):
+                # Модель отвечает, но пусто/обрезанно: повторять на ней бессмысленно, уводим трафик на другие.
+                gemini_pool.mark_model_overloaded(model, GEMINI_EMPTY_RESPONSE_COOLDOWN)
             _job_log(
                 "gemini_api_error",
                 key_profile=key_name,
@@ -208,6 +238,17 @@ async def recognize_gemini_sheet_async(
                 key_state=state["state"],
                 image_count=len(images),
                 api_message=last_error,
+                usage={
+                    field: int(usage[field])
+                    for field in ("promptTokenCount", "candidatesTokenCount", "totalTokenCount", "thoughtsTokenCount")
+                    if isinstance(usage, dict) and isinstance(usage.get(field), (int, float))
+                },
+                response_state={
+                    "finish_reason": response_metadata.get("finish_reason", ""),
+                    "prompt_block_reason": response_metadata.get("prompt_block_reason", ""),
+                    "candidate_count": response_metadata.get("candidate_count", 0),
+                    "text_chars": response_metadata.get("text_chars", 0),
+                },
             )
         except Exception as exc:
             last_error = f"{type(exc).__name__}: {_safe_gemini_message(str(exc))}"
