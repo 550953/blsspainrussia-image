@@ -17,6 +17,7 @@ from .jobs import JOB_RESULT_TTL_SECONDS, JOBS, _cleanup_expired_jobs
 from .config import GEMINI_MODELS
 from .key_pool import GEMINI_KEYS, gemini_model_name, gemini_pool
 from .pipeline import GEMINI_SHEET_MAX_CONCURRENT_CHUNKS
+from . import pressure
 from .proxies import _configured_proxies, _proxy_label, _proxy_source, smart_proxy_pool
 from .telemetry import (
     ACCOUNTS,
@@ -247,7 +248,10 @@ def build_status() -> dict:
             "cells": q["cells"], "first_pass_zero": q["missing"], "variant_saved": q["variant_saved"],
             "dddd_used": q["dddd_used"], "dddd_saved": q["dddd_saved"], "final_zero": q["final_zero"],
             "all_zero_jobs_total": JOB_STATS["all_zero_jobs"],
+            "hedge_start": q["hedge_start"], "hedge_cut": q["hedge_cut"], "hedge_used": q["hedge_used"],
+            "hedge_cmp": q["hedge_cmp"], "hedge_agree": q["hedge_agree"],
         },
+        "pressure": pressure.snapshot(),
         "timeline": timeline,
         "recent_errors": recent_errors,
         "jobs": jobs,

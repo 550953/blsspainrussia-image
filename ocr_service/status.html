@@ -247,6 +247,7 @@ function render(d){
     kpi('Очередь',Z.pending+' ждут',Z.running+' идёт · старейшее '+Z.oldest_pending_s+' с · лимит '+Z.max_concurrency,'','queue')+
     kpi('Успех попыток Gemini',A.ok_pct==null?'—':A.ok_pct+'%',A.ok+' из '+A.total+' за час · 429: '+A.n429,A.ok_pct!=null&&A.ok_pct<60?'warn':'ok','ok')+
     kpi('Посл. успех Gemini',ago(A.last_ok_ago),'посл. ошибка: '+ago(A.last_err_ago),'','clock')+
+    kpi('Давление на Gemini',(d.pressure?d.pressure.index:'—')+' / 100',d.pressure?((d.pressure.hedge_on?'ddddocr рядом включён':'ddddocr в резерве')+' · порог '+d.pressure.on_at+'/'+d.pressure.off_at+' · ошибок '+Math.round(100*d.pressure.fail_rate)+'% за 2 мин · возраст чанков '+d.pressure.median_age_s+' с'):'',d.pressure&&d.pressure.hedge_on?'warn':'ok','ok')+
     kpi('Каналы',okCh+' / '+P.channels,P.quarantined?P.quarantined+' в карантине (гео)':'без карантина',P.quarantined?'warn':'ok','globe')+
     kpi('Задания в памяти',Z.in_memory,'результат хранится '+Math.round(Z.result_ttl_s/60)+' мин','','mem');
   $('chart').innerHTML=chart(d.timeline||[]);
@@ -255,6 +256,7 @@ function render(d){
     kpi('Нулей с первого прохода',pct(Q.first_pass_zero,Q.cells),Q.first_pass_zero+' ячеек','','zero')+
     kpi('Спасено точечным повтором',Q.variant_saved,'из '+Q.first_pass_zero,'','fix')+
     kpi('Ушло в ddddocr',Q.dddd_used,'спасено '+Q.dddd_saved,'','fix')+
+    kpi('Параллельный ddddocr',Q.hedge_start+' чанков','взято ячеек '+Q.hedge_used+' · переключений '+Q.hedge_cut+(Q.hedge_cmp?' · совпал с Gemini '+pct(Q.hedge_agree,Q.hedge_cmp):''),'','fix')+
     kpi('Итоговых нулей',pct(Q.final_zero,Q.cells),Q.final_zero+' ячеек',fz>10?'warn':'ok','zero')+
     kpi('Задания со всеми нулями',Q.all_zero_jobs_total,'с запуска',Q.all_zero_jobs_total?'bad':'ok','zero');
   $('jobsN').textContent=d.jobs.length;
