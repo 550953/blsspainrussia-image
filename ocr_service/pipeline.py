@@ -8,7 +8,7 @@ from typing import List, Optional
 
 from .config import GEMINI_SHEET_CHUNK_SIZE
 from .contact_sheet import _chunk
-from .dddd_ocr import EXECUTOR, recognize_one_sync_part
+from .dddd_ocr import EXECUTOR, HEDGE_EXECUTOR, recognize_dddd_light, recognize_one_sync_part
 from .gemini_sheet import recognize_gemini_sheet_async, recognize_gemini_variant_retry
 from .key_pool import GEMINI_KEYS
 from . import pressure
@@ -62,7 +62,7 @@ def _dddd_cell(image: bytes, stop: threading.Event) -> Optional[str]:
     """Одна ячейка в потоке; если чанк уже закрыт (Gemini успел), ячейку даже не начинаем."""
     if stop.is_set():
         return None
-    return recognize_one_sync_part(image)
+    return recognize_dddd_light(image)
 
 
 async def _dddd_chunk(images: List[bytes], stop: threading.Event) -> List[Optional[str]]:
@@ -70,7 +70,7 @@ async def _dddd_chunk(images: List[bytes], stop: threading.Event) -> List[Option
     async with _HEDGE_SEM:
         loop = asyncio.get_running_loop()
         return list(await asyncio.gather(*[
-            loop.run_in_executor(EXECUTOR, _dddd_cell, img, stop) for img in images
+            loop.run_in_executor(HEDGE_EXECUTOR, _dddd_cell, img, stop) for img in images
         ]))
 
 
@@ -116,7 +116,12 @@ async def _recognize_chunk(chunk: List[bytes]) -> tuple:
                 if elapsed >= pressure.HEDGE_DEADLINE_S or grace_over:
                     cutover = True
                     break
+                t_wait = time.monotonic()
                 await asyncio.wait({g_task}, timeout=0.5)
+                if not g_task.done():
+                    pressure.note_lag(time.monotonic() - t_wait - 0.5)
+                if d_task is not None and pressure.overloaded():
+                    stop.set()   # сервис задыхается: невзятые ячейки не начинаем, живём на Gemini
 
             if cutover:
                 # Gemini не уложился: отменяем (ключ вернётся через finally), добираем ddddocr.

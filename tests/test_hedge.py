@@ -77,7 +77,7 @@ def _run(coro):
 
 def test_gemini_wins_and_dddd_fills_zero(monkeypatch):
     monkeypatch.setattr(pressure, "should_hedge", lambda elapsed: True)
-    monkeypatch.setattr(pipeline, "recognize_one_sync_part", lambda img: {b"a": "111", b"b": "222"}[img])
+    monkeypatch.setattr(pipeline, "recognize_dddd_light", lambda img: {b"a": "111", b"b": "222"}[img])
     g = [{"text": "999", "source": "gemini_sheet"}, {"text": "0", "source": "gemini_sheet"}]
     monkeypatch.setattr(pipeline, "recognize_gemini_sheet_async", _gemini(g, delay=0.6))
     res, tried = _run(pipeline._recognize_chunk([b"a", b"b"]))
@@ -98,10 +98,19 @@ def test_cutover_when_gemini_hangs(monkeypatch):
     monkeypatch.setattr(pressure, "should_hedge", lambda elapsed: True)
     monkeypatch.setattr(pressure, "HEDGE_DEADLINE_S", 5.0)
     monkeypatch.setattr(pressure, "HEDGE_GRACE_S", 0.3)
-    monkeypatch.setattr(pipeline, "recognize_one_sync_part", lambda img: "777")
+    monkeypatch.setattr(pipeline, "recognize_dddd_light", lambda img: "777")
     monkeypatch.setattr(pipeline, "recognize_gemini_sheet_async", _gemini([{"text": "1", "source": "x"}], delay=30))
     t0 = time.monotonic()
     res, tried = _run(pipeline._recognize_chunk([b"a", b"b"]))
     assert time.monotonic() - t0 < 4
     assert tried and [r["text"] for r in res] == ["777", "777"]
     assert res[0]["source"] == "ddddocr_hedge_cutover"
+
+
+def test_overload_blocks_hedge(monkeypatch):
+    pressure._lags.clear()
+    pressure.note_lag(1.5)
+    assert pressure.overloaded()
+    monkeypatch.setattr(pressure, "snapshot", lambda: {"hedge_on": True})
+    assert pressure.should_hedge(30.0) is False
+    pressure._lags.clear()
