@@ -19,6 +19,9 @@ JOB_TASKS: dict = {}            # job_id -> asyncio.Task (для сторожа)
 # Клиент (браузер) ждёт ~1 минуту и шлёт задание заново, поэтому всё, что живёт дольше,
 # уже никому не нужно. Сторож принудительно отменяет такие задания и возвращает ключи.
 JOB_MAX_SECONDS = float(os.getenv("OCR_JOB_MAX_SECONDS", "60"))
+# Запас до JOB_MAX_SECONDS: к этому моменту конвейер отдаёт частичный результат сам,
+# не дожидаясь, пока wait_for/сторож убьют задание целиком.
+JOB_SAFETY_SECONDS = max(0.5, float(os.getenv("OCR_JOB_SAFETY_SECONDS", "3")))
 WATCHDOG_INTERVAL_SECONDS = max(2.0, float(os.getenv("OCR_WATCHDOG_INTERVAL_SECONDS", "10")))
 _WATCHDOG_TASK: Optional[asyncio.Task] = None
 JOB_RESULT_TTL_SECONDS = max(60, int(os.getenv("OCR_JOB_RESULT_TTL_SECONDS", "300")))
@@ -242,7 +245,11 @@ async def _run_job_inner(job_id: str, images: List[str]) -> None:
             **_job_queue_metrics(job_id, job, started_at),
         )
         try:
-            results = await asyncio.wait_for(process_images_gemini_sheet(images), timeout=JOB_MAX_SECONDS)
+            queued_s = max(0.0, started_at - float(job.get("created_at") or started_at))
+            deadline = time.monotonic() + max(1.0, JOB_MAX_SECONDS - queued_s - JOB_SAFETY_SECONDS)
+            results = await asyncio.wait_for(
+                process_images_gemini_sheet(images, deadline=deadline), timeout=JOB_MAX_SECONDS,
+            )
             finished_at = time.time()
             zero_count = sum(1 for r in results if r.get("text") == "0")
             job["status"] = "done"

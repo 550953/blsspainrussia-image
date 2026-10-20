@@ -225,7 +225,8 @@ function chart(tl){
 
 function render(d){
   const A=d.attempts,Q=d.quality,K=d.keys,Z=d.queue,P=d.proxies;
-  $('model').textContent=(d.model||'—')+' · pid '+d.pid+' · аптайм '+up(d.uptime_s);
+  const am=d.active_model,mn=am?am+(d.model&&am!==d.model?' (основная '+d.model+' закрыта квотой)':''):(d.model||'—')+(d.model?' · свободной модели нет':'');
+  $('model').textContent=mn+' · pid '+d.pid+' · аптайм '+up(d.uptime_s);
   let cls='ok',t='Работает',s=K.usable+' из '+K.total+' ключей доступны, очередь пуста';
   const bump=(c,tt,ss)=>{if(c==='bad'||(c==='warn'&&cls==='ok')){cls=c;t=tt;s=ss}};
   const fz=Q.cells?100*Q.final_zero/Q.cells:0;
@@ -245,7 +246,7 @@ function render(d){
   $('kpis').innerHTML=
     kpi('Ключи готовы',K.usable+' / '+K.total,(K.by_state.cooldown||0)+' пауза · '+(K.by_state.quarantine||0)+' карантин · '+((K.by_state.billing||0)+(K.by_state.project||0))+' блок · '+(K.by_state.invalid||0)+' мёртв',K.usable<K.total?'warn':'ok','key')+
     kpi('Очередь',Z.pending+' ждут',Z.running+' идёт · старейшее '+Z.oldest_pending_s+' с · лимит '+Z.max_concurrency,'','queue')+
-    kpi('Успех попыток Gemini',A.ok_pct==null?'—':A.ok_pct+'%',A.ok+' из '+A.total+' за час · 429: '+A.n429,A.ok_pct!=null&&A.ok_pct<60?'warn':'ok','ok')+
+    kpi('Успех попыток Gemini',A.ok_pct==null?'—':A.ok_pct+'%',A.ok+' из '+A.total+' за час · 429: '+A.n429+(A.n_daily_quota?' · дневная квота: '+A.n_daily_quota+' (не в счёт)':''),A.ok_pct!=null&&A.ok_pct<60?'warn':'ok','ok')+
     kpi('Посл. успех Gemini',ago(A.last_ok_ago),'посл. ошибка: '+ago(A.last_err_ago),'','clock')+
     kpi('Давление на Gemini',(d.pressure?d.pressure.index:'—')+' / 100',d.pressure?((d.pressure.hedge_on?'ddddocr рядом включён':'ddddocr в резерве')+' · порог '+d.pressure.on_at+'/'+d.pressure.off_at+' · ошибок '+Math.round(100*d.pressure.fail_rate)+'% за 2 мин · возраст чанков '+d.pressure.median_age_s+' с'):'',d.pressure&&d.pressure.hedge_on?'warn':'ok','ok')+
     kpi('Каналы',okCh+' / '+P.channels,P.quarantined?P.quarantined+' в карантине (гео)':'без карантина',P.quarantined?'warn':'ok','globe')+
@@ -254,8 +255,8 @@ function render(d){
   $('quality').innerHTML=
     kpi('Ячеек обработано',Q.cells,'','','cell')+
     kpi('Нулей с первого прохода',pct(Q.first_pass_zero,Q.cells),Q.first_pass_zero+' ячеек','','zero')+
-    kpi('Спасено точечным повтором',Q.variant_saved,'из '+Q.first_pass_zero,'','fix')+
-    kpi('Ушло в ddddocr',Q.dddd_used,'спасено '+Q.dddd_saved,'','fix')+
+    kpi('Спасено точечным повтором',Q.variant_saved,'из '+Q.first_pass_zero+(Q.variant_skipped_deadline?' · пропущено по дедлайну '+Q.variant_skipped_deadline:''),'','fix')+
+    kpi('Ушло в ddddocr',Q.dddd_used,'спасено '+Q.dddd_saved+(Q.deadline_partial?' · частичных ответов по дедлайну '+Q.deadline_partial:''),'','fix')+
     kpi('Параллельный ddddocr',Q.hedge_start+' чанков','взято ячеек '+Q.hedge_used+' · переключений '+Q.hedge_cut+(Q.hedge_cmp?' · совпал с Gemini '+pct(Q.hedge_agree,Q.hedge_cmp):''),'','fix')+
     kpi('Итоговых нулей',pct(Q.final_zero,Q.cells),Q.final_zero+' ячеек',fz>10?'warn':'ok','zero')+
     kpi('Задания со всеми нулями',Q.all_zero_jobs_total,'с запуска',Q.all_zero_jobs_total?'bad':'ok','zero');
@@ -279,14 +280,16 @@ function render(d){
   $('keysT').innerHTML=table(['Ключ','Состояние','Взят','Посл. успех','Посл. ошибка','За час ок / ошибок','Карантин моделей','Что случилось'],
     cut(kl,'keys').map(k=>{
       let why='';
-      if(k.err_cat)why=esc(k.err_cat)+(k.err_http!=null?' · HTTP '+k.err_http:'')+(k.state==='cooldown'?' · пауза ещё ~'+Math.round(k.cooldown_left)+' с':'')+(k.state==='quarantine'?' · все модели в карантине ещё '+left(k.cooldown_left):'')+(k.state==='invalid'?' · ключ надо заменить':'')+(k.state==='billing'||k.state==='project'?' · нужен рестарт':'')+(k.err_msg?'<span class="x"><br><span class="sub">'+esc(k.err_msg)+'</span></span>':'');
+      if(k.err_cat)why=(k.err_cat==='DAILY_QUOTA'?'дневная квота':esc(k.err_cat))+(k.err_http!=null?' · HTTP '+k.err_http:'')+(k.state==='cooldown'?' · пауза ещё ~'+Math.round(k.cooldown_left)+' с':'')+(k.state==='quarantine'?' · все модели в карантине ещё '+left(k.cooldown_left):'')+(k.state==='invalid'?' · ключ надо заменить':'')+(k.state==='billing'||k.state==='project'?' · нужен рестарт':'')+(k.err_msg?'<span class="x"><br><span class="sub">'+esc(k.err_msg)+'</span></span>':'');
       const QR={daily_quota:'дневная квота',repeated_429:'повторные 429'};
-      const qh=(k.quarantine||[]).map(q=>'<div><span class="b">'+esc(q.model)+'</span> · ещё '+left(q.left)+'<span class="sub"> · '+(QR[q.reason]||esc(q.reason))+(q.strikes?', 429 подряд: '+q.strikes:'')+'</span></div>').join('');
+      // Одинаковая причина и срок у нескольких моделей ключа: одна строка, а не по строке на модель.
+      const QG={};(k.quarantine||[]).forEach(q=>{const g=q.reason+'|'+Math.round(q.left/60);(QG[g]=QG[g]||{q:q,ms:[]}).ms.push(q.model)});
+      const qh=Object.values(QG).map(({q,ms})=>'<div><span class="b" title="'+esc(ms.join(', '))+'">'+esc(ms.length>1?ms.map(x=>x.replace(/^gemini-/,'')).join(', '):ms[0])+'</span> · ещё '+left(q.left)+'<span class="sub"> · '+(QR[q.reason]||esc(q.reason))+(q.reason!=='daily_quota'&&q.strikes?', 429 подряд: '+q.strikes:'')+'</span></div>').join('');
       return [esc(short(k.name)),chip(...KEY_STATE[k.state]),ago(k.used_ago),ago(k.ok_ago),ago(k.err_ago),k.ok_1h+' / '+(k.err_1h?'<span class="w">'+k.err_1h+'</span>':0),{w:1,h:qh||'<span class="sub">—</span>'},{w:1,h:why}];
     }))+more(kl,'keys');
   $('modelsT').innerHTML=table(['Модель','Состояние','Попыток','Успех','503/5xx','429','p50'],
     d.models.map(m=>[esc(m.name)+(m.in_chain?'':' <span class="sub">(не в цепочке)</span>'),
-      m.state==='bypass'?chip('обход ещё '+Math.round(m.bypass_left)+' с','warn'):chip('работает','ok'),
+      m.state==='quota'?chip('закрыта на всех ключах · ещё '+left(m.quota_left),'warn'):m.state==='bypass'?chip('обход ещё '+Math.round(m.bypass_left)+' с','warn'):chip('работает','ok'),
       m.attempts,m.ok_pct==null?'—':m.ok_pct+'%',m.n5xx?'<span class="w">'+m.n5xx+'</span>':0,m.n429,dur(m.p50_ms)]));
   const p50s=P.list.map(p=>p.p50_ms).filter(x=>x!=null).sort((a,b)=>a-b);
   const med=p50s.length?p50s[Math.floor(p50s.length/2)]:null;

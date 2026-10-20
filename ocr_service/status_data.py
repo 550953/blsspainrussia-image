@@ -22,6 +22,7 @@ from .proxies import _configured_proxies, _proxy_label, _proxy_source, smart_pro
 from .telemetry import (
     ACCOUNTS,
     ATTEMPTS,
+    DAILY_QUOTA,
     JOB_STATS,
     KEY_LAST,
     LAST_EVENT,
@@ -51,9 +52,18 @@ def build_status() -> dict:
     per_key: dict = {}
     per_proxy: dict = {}
     per_model: dict = {}
-    win = {"ok": 0, "api_err": 0, "n429": 0, "proxy_err": 0}
+    win = {"ok": 0, "api_err": 0, "n429": 0, "proxy_err": 0, "n_daily_quota": 0}
     for ts, key, proxy, category, latency, _images, _zeros, model in ATTEMPTS:
         if ts < cutoff:
+            continue
+        if category == DAILY_QUOTA:
+            # Ожидаемый отказ «квота на сегодня всё»: модели засчитываем 429, ключу ошибку,
+            # но в общий процент успеха и в статистику канала не берём (канал тут ни при чём).
+            win["n_daily_quota"] += 1
+            per_key.setdefault(key, {"ok": 0, "err": 0})["err"] += 1
+            m = per_model.setdefault(model, {"n": 0, "ok": 0, "n429": 0, "n5xx": 0, "lat": []})
+            m["n"] += 1
+            m["n429"] += 1
             continue
         k = per_key.setdefault(key, {"ok": 0, "err": 0})
         p = per_proxy.setdefault(proxy, {"n": 0, "ok": 0, "n429": 0, "perr": 0, "lat": []})
@@ -140,13 +150,24 @@ def build_status() -> dict:
 
     # --- модели: цепочка + всё, что реально отвечало за окно ---
     models = []
+    active_model = None
     names = list(GEMINI_MODELS) + [m for m in per_model if m not in GEMINI_MODELS and m != "?"]
     for name in names:
         m = per_model.get(name, {"n": 0, "ok": 0, "n429": 0, "n5xx": 0, "lat": []})
         left = max(0.0, gemini_pool.model_blocked_until.get(name, 0.0) - mono)
+        allowed, held, soonest = gemini_pool.model_hold_summary(name, mono)
+        if allowed and held >= allowed:
+            state = "quota"             # закрыта на всех ключах (квота/пауза 429)
+        elif left > 0:
+            state = "bypass"
+        else:
+            state = "ready"
+        if active_model is None and name in GEMINI_MODELS and state == "ready" and allowed:
+            active_model = name
         models.append({
             "name": name, "in_chain": name in GEMINI_MODELS,
-            "state": "bypass" if left > 0 else "ready", "bypass_left": round(left, 1),
+            "state": state, "bypass_left": round(left, 1),
+            "keys_allowed": allowed, "keys_held": held, "quota_left": round(soonest, 1),
             "attempts": m["n"], "ok_pct": round(100.0 * m["ok"] / m["n"], 1) if m["n"] else None,
             "n5xx": m["n5xx"], "n429": m["n429"], "p50_ms": _percentile(m["lat"], 0.5),
         })
@@ -223,6 +244,7 @@ def build_status() -> dict:
         "pid": os.getpid(),
         "uptime_s": round(wall - PROCESS_START_TIME),
         "model": gemini_model_name,
+        "active_model": active_model,
         "window_s": STATS_WINDOW_SECONDS,
         "keys": {
             "total": len(keys),
@@ -250,6 +272,7 @@ def build_status() -> dict:
             "all_zero_jobs_total": JOB_STATS["all_zero_jobs"],
             "hedge_start": q["hedge_start"], "hedge_cut": q["hedge_cut"], "hedge_used": q["hedge_used"],
             "hedge_cmp": q["hedge_cmp"], "hedge_agree": q["hedge_agree"],
+            "variant_skipped_deadline": q["variant_skipped_deadline"], "deadline_partial": q["deadline_partial"],
         },
         "pressure": pressure.snapshot(),
         "timeline": timeline,

@@ -13,7 +13,7 @@ import time
 from contextlib import contextmanager
 from typing import Optional
 
-from .telemetry import ATTEMPTS
+from .telemetry import ATTEMPTS, DAILY_QUOTA
 
 HEDGE_ENABLED = os.getenv("OCR_HEDGE_ENABLED", "1").strip().lower() not in {"0", "false", "no", "off"}
 HEDGE_ON = float(os.getenv("OCR_HEDGE_ON", "50"))
@@ -93,6 +93,8 @@ def compute(now_wall: Optional[float] = None, now_mono: Optional[float] = None) 
     for row in reversed(ATTEMPTS):          # новые записи в конце: идём с хвоста и выходим рано
         if row[0] < cutoff:
             break
+        if row[3] == DAILY_QUOTA:           # мгновенный ожидаемый отказ, не признак перегрузки Gemini
+            continue
         total += 1
         ok += row[3] == "SUCCESS"
     fail_rate = (1.0 - ok / total) if total >= HEDGE_MIN_SAMPLES else 0.0

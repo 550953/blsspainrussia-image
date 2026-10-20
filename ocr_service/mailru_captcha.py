@@ -192,6 +192,7 @@ async def recognize_mailru_captcha(image_bytes: bytes) -> Tuple[str, str]:
                 key_state=state["state"],
                 image_count=1,
                 api_message=exc.message,
+                daily_quota=bool(getattr(exc, "daily_quota", False)),
                 captcha_type="mailru",
             )
         except ValueError as exc:

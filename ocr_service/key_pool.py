@@ -331,6 +331,22 @@ class GeminiKeyPool:
         return max(self.key_model_daily_blocked.get((idx, model), 0.0),
                    self.key_model_blocked.get((idx, model), 0.0)) - now
 
+    def model_hold_summary(self, model: str, now: Optional[float] = None) -> tuple:
+        """Для панели: (живых ключей с доступом к модели, из них закрыто 429-паузой/квотой,
+        через сколько секунд освободится первый закрытый). Ничего не меняет."""
+        now = time.monotonic() if now is None else now
+        allowed = held = 0
+        soonest = 0.0
+        for idx in range(len(self.keys)):
+            if self.dead[idx] or not self.model_allowed(idx, model, respect_key_cooldown=False):
+                continue
+            allowed += 1
+            left = self._model_hold_left(idx, model, now)
+            if left > 0:
+                held += 1
+                soonest = left if soonest == 0.0 else min(soonest, left)
+        return allowed, held, soonest
+
     def quarantine_info(self, idx: int, now: Optional[float] = None) -> list:
         """Активные карантины пар ключ+модель для панели: [{model, left, reason, strikes}]."""
         now = time.monotonic() if now is None else now

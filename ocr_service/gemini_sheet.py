@@ -211,6 +211,7 @@ async def recognize_gemini_sheet_async(
                 key_state=state["state"],
                 image_count=len(images),
                 api_message=exc.message,
+                daily_quota=bool(getattr(exc, "daily_quota", False)),
             )
         except ValueError as exc:
             # Модель вернула не JSON/битый JSON (JSONDecodeError - подкласс ValueError): ключ и канал
